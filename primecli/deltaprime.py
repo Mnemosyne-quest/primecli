@@ -1118,25 +1118,30 @@ def _pool_json_shape(data: dict) -> dict:
     d = cfg["decimals"]
     ts_raw, tb_raw = raw.get("totalSupply"), raw.get("totalBorrowed")
     dr_raw, br_raw = raw.get("getDepositRate"), raw.get("getBorrowingRate")
-    ts = (ts_raw or 0) / 10**d
-    tb = (tb_raw or 0) / 10**d
-    util = (tb / ts * 100) if ts > 0 else 0.0
     out = {
         "symbol": cfg["symbol"],
         "proxy": cfg["proxy"],
         "token": cfg["token"],
         "decimals": d,
-        "totalSupply": _compact_num(ts),
-        "totalBorrowed": _compact_num(tb),
-        "utilization": _compact_num(util),
     }
+    # Omit any field whose multicall leg returned None (revert / decode failure).
+    # Lets a downstream consumer tell "this pool's read failed" from "this pool is
+    # at literally 0".
+    if ts_raw is not None:
+        out["totalSupply"] = _compact_num(ts_raw / 10**d)
+    if tb_raw is not None:
+        out["totalBorrowed"] = _compact_num(tb_raw / 10**d)
+    if ts_raw is not None and tb_raw is not None:
+        ts = ts_raw / 10**d
+        util = (tb_raw / 10**d / ts * 100) if ts > 0 else 0.0
+        out["utilization"] = _compact_num(util)
     if dr_raw is not None:
         out["depositRate"] = _compact_num(dr_raw / 1e18 * 100)
     if br_raw is not None:
         out["borrowingRate"] = _compact_num(br_raw / 1e18 * 100)
-    if price:
+    if price and ts_raw is not None:
         out["tokenPrice"] = _compact_num(price, places=4)
-        out["tvl"] = _compact_num(ts * price)
+        out["tvl"] = _compact_num(ts_raw / 10**d * price)
     my_bal = raw.get("balanceOf")
     if my_bal is not None and my_bal > 0:
         out["myDeposit"] = _compact_num(my_bal / 10**d, places=6)

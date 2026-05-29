@@ -5,7 +5,7 @@ Integration patterns for letting an LLM-driven agent operate `primecli` on a use
 ## Why primecli is agent-friendly
 
 - **Preview by default.** No state-changing command broadcasts a transaction unless `--execute` is passed. An agent can call any command speculatively, parse the preview, and only re-run with `--execute` after a deliberate authorisation step.
-- **Predictable stdout.** Read-only commands print fixed-format tables (humans and agents both parse them). `deltaprime defi --json` emits a full positions snapshot as JSON for one-shot ingestion.
+- **Predictable stdout.** Read-only commands print fixed-format tables that humans and agents both parse. `pool-info --json` (both chains) emits a single JSON object per pool. `deltaprime defi --json` and `degenprime summary --json` emit a full positions snapshot as JSON for one-shot ingestion. JSON outputs drop null, empty-list, and empty-dict keys, plus the decorative `url` key, to keep agent context lean; numeric `0` and boolean `false` are preserved.
 - **No stack traces on config errors.** A missing key prints `deltaprime: No signing key found. ...` to stderr and exits 1. Agents can detect the failure mode without scraping a traceback.
 - **Hand-curated ABIs, no Etherscan key required.** The tool ships its own pinned ABIs and resolves proxy implementations via the EIP-1967 storage slot, so it works in any environment with just an EVM RPC.
 
@@ -43,7 +43,7 @@ A lending/leverage protocol on Avalanche C-chain. Two layers: **savings pools** 
 ## Commands
 
 Lending:
-- `deltaprime pool-info [usdc|wavax|weth|btc|usdt|all]` — read-only.
+- `deltaprime pool-info [usdc|wavax|weth|btc|usdt|all] [--json]` — read-only.
 - `deltaprime my-positions` — read-only.
 - `deltaprime deposit --pool X --amount Y [--execute]`
 - `deltaprime withdraw --pool X --amount Y [--execute]`
@@ -55,7 +55,7 @@ Prime Account:
 - `deltaprime create-prime-account [--execute]` (alias `create-account`)
 - `deltaprime create-prime-account --fund-pool X --fund-amount Y [--execute]`
 - `deltaprime prime-summary` — read-only.
-- `deltaprime defi --json` — full positions snapshot as JSON.
+- `deltaprime defi --json` — full positions snapshot as JSON (trimmed: drops null / empty / `url` keys).
 - `deltaprime withdraw-collateral --pool X --amount Y [--execute]`
 - `deltaprime withdrawal-intents` — read-only.
 - `deltaprime execute-withdrawal --pool X [--index N] [--execute]`

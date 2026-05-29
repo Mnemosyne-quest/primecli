@@ -65,6 +65,14 @@ If RedStone rotates and the tool starts returning `SignerNotAuthorised` (`0xec45
 
 The on-chain payload encoding is also load-bearing: prices are reconstructed exactly as RedStone signs them (`parseUnits(Number(v).toFixed(8), 8)`). If anyone "tidies" the encoder back to plain `int(round(v * 1e8))`, half-boundary values re-derive a different body, `ecrecover` returns a wrong signer, and the contract reverts intermittently across every RedStone-gated path (lending, swaps, GMX, LB, PRIME, solvency views). `tests/test_redstone_encoding.py` is a regression test pinning this.
 
+## Multicall3 dependency
+
+The tool batches read-only RPC calls (per-pool reads, per-asset balances, RedStone-gated solvency views) through **Multicall3** at `0xcA11bde05977b3631167028862bE2a173976CA11`. This is the canonical mds1 / OpenZeppelin Multicall3 deployment, present at the same address on Avalanche C-chain and Base (and most other EVM chains) via deterministic deployer (`CREATE2`). The contract is immutable, has no admin, no upgrade path, and no token transfer surface — it only forwards `staticcall`s.
+
+The tool calls Multicall3's `aggregate3` with `allowFailure=true` per leg, so a single reverting view does not blow up the batch. Decoded results are checked per-leg.
+
+If your RPC is a custom fork or a chain where Multicall3 has not been deployed, the batched reads will revert. All write paths bypass Multicall3 entirely — broadcasts go directly to the target contract — so trust in Multicall3 is read-only and bounded to "the contract correctly forwards staticcalls".
+
 ## Slippage caps
 
 Both protocols enforce **on-chain slippage caps** on top of the user-specified `--slippage`:

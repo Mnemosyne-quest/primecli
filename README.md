@@ -106,7 +106,7 @@ Full per-command reference: [docs/deltaprime-reference.md](docs/deltaprime-refer
 | Group | Commands |
 |-------|----------|
 | Lending core | `pool-info [--json]`, `my-positions`, `deposit`, `withdraw`, `borrow`, `repay`, `fund` |
-| Degen Account | `create-account`, `summary`, `withdraw-collateral`, `withdrawal-intents`, `execute-withdrawal`, `cancel-withdrawal` |
+| Degen Account | `create-account`, `summary [--json]`, `withdraw-collateral`, `withdrawal-intents`, `execute-withdrawal`, `cancel-withdrawal` |
 | Swaps | `swap --from S --to S --amount N [--slippage P]` (ParaSwap v6), `swap-debt --from S --to S --amount N` |
 | Aerodrome (read-only in v1) | `aerodrome-positions` |
 

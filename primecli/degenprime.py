@@ -694,25 +694,30 @@ def _pool_json_shape(data: dict) -> dict:
     d = cfg["decimals"]
     ts_raw, tb_raw = raw.get("totalSupply"), raw.get("totalBorrowed")
     dr_raw, br_raw = raw.get("getDepositRate"), raw.get("getBorrowingRate")
-    ts = (ts_raw or 0) / 10**d
-    tb = (tb_raw or 0) / 10**d
-    util = (tb / ts * 100) if ts > 0 else 0.0
     out = {
         "symbol": cfg["symbol"],
         "proxy": cfg["proxy"],
         "token": cfg["token"],
         "decimals": d,
-        "totalSupply": _compact_num(ts),
-        "totalBorrowed": _compact_num(tb),
-        "utilization": _compact_num(util),
     }
+    # Omit any field whose multicall leg returned None (revert / decode failure).
+    # That lets a downstream consumer tell "this pool's read failed" from "this
+    # pool is at literally 0".
+    if ts_raw is not None:
+        out["totalSupply"] = _compact_num(ts_raw / 10**d)
+    if tb_raw is not None:
+        out["totalBorrowed"] = _compact_num(tb_raw / 10**d)
+    if ts_raw is not None and tb_raw is not None:
+        ts = ts_raw / 10**d
+        util = (tb_raw / 10**d / ts * 100) if ts > 0 else 0.0
+        out["utilization"] = _compact_num(util)
     if dr_raw is not None:
         out["depositRate"] = _compact_num(dr_raw / 1e18 * 100)
     if br_raw is not None:
         out["borrowingRate"] = _compact_num(br_raw / 1e18 * 100)
-    if price:
+    if price and ts_raw is not None:
         out["tokenPrice"] = _compact_num(price, places=4)
-        out["tvl"] = _compact_num(ts * price)
+        out["tvl"] = _compact_num(ts_raw / 10**d * price)
     my_bal = raw.get("balanceOf")
     if my_bal is not None and my_bal > 0:
         out["myDeposit"] = _compact_num(my_bal / 10**d, places=6)
@@ -1074,13 +1079,19 @@ def _prices_usd(w3, account, symbols: list, payload: bytes) -> dict:
     except Exception:
         return {}
 
-def cmd_summary():
+def cmd_summary(as_json: bool = False):
     """Read-only Degen Account view: in-account collateral, debts, and live
     RedStone-gated solvency (getTotalValue/getDebt/getHealthRatio/isSolvent). Falls
     back to balances-only if the RedStone gateway is unreachable or a view reverts.
     Note: per-asset USD is best-effort - only symbols with a RedStone primary-prod
     feed are priced here. Symbols sourced on-chain from BaseOracle TWAP show as
     balance-only (the SolvencyFacet still values them for the total/debt figures).
+
+    With --json: emits a single JSON object covering wallet, account, native
+    balance, per-asset supplied/borrowed with optional USD, total/debt/health-ratio/
+    solvent flags. Null fields, empty lists, and empty dicts are dropped (same
+    trim contract as `deltaprime defi --json`). Numeric 0 and boolean false are
+    preserved.
 
     Multicall: stage A batches getAllOwnedAssets + getDebts (2 -> 1 RPC). Stage B
     batches one getBalance per owned asset (N -> 1 RPC). Stage C batches the four
@@ -1089,14 +1100,20 @@ def cmd_summary():
     w3 = get_w3()
     acct = get_account()
     pa = get_prime_account(w3, acct.address)
-    print(f"Wallet: {acct.address}")
+    if not as_json:
+        print(f"Wallet: {acct.address}")
     if not pa:
-        print("No Degen Account yet. Create one with: degenprime create-account --execute")
+        if as_json:
+            print(json.dumps({"wallet": acct.address, "account": None}, indent=2))
+        else:
+            print("No Degen Account yet. Create one with: degenprime create-account --execute")
         return
 
-    print(f"Degen Account: {pa}")
     pa_eth = w3.eth.get_balance(pa) / 1e18
-    print(f"  Native ETH (gas):  {pa_eth:.6f}")
+    if not as_json:
+        print(f"Degen Account: {pa}")
+        if pa_eth >= 1e-9:
+            print(f"  Native ETH (gas):  {pa_eth:.6f}")
 
     account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
     pa_cs = account.address
@@ -1178,6 +1195,32 @@ def cmd_summary():
         solvency["prices"] = prices
     except Exception as e:
         solvency["error"] = type(e).__name__
+
+    if as_json:
+        def _asset_row(r):
+            row = {"symbol": r["symbol"], "amount": r["raw"] / 10**r["decimals"]}
+            usd = solvency["prices"].get(r["symbol"])
+            if usd is not None:
+                row["usd"] = round(row["amount"] * usd, 2)
+            return row
+
+        out = {
+            "wallet": acct.address,
+            "account": pa,
+            "nativeBalance": pa_eth if pa_eth >= 1e-9 else None,
+            "supplied": [_asset_row(r) for r in supplied],
+            "borrowed": [_asset_row(r) for r in borrowed],
+            "totalValueUsd": solvency["total"],
+            "debtUsd": solvency["debt"],
+            "healthRatio": solvency["ratio"],
+            "solvent": solvency["solvent"],
+            "solvencyError": solvency["error"],
+        }
+        # Drop None / empty list / empty dict; preserve 0 and False.
+        out = {k: v for k, v in out.items()
+               if not (v is None or v == [] or v == {})}
+        print(json.dumps(out, indent=2))
+        return
 
     print("  Assets:")
     if supplied:
@@ -2000,7 +2043,7 @@ def _dispatch():
             return
         cmd_create_account("--execute" in args, fund_pool, fund_amount)
     elif cmd == "summary":
-        cmd_summary()
+        cmd_summary(as_json="--json" in args)
     elif cmd == "fund":
         pool, amount = None, None
         execute = "--execute" in args
