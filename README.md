@@ -2,8 +2,9 @@
 
 > Command-line tools for the **DeltaPrime** (Avalanche) and **DegenPrime** (Base) lending and leverage protocols.
 
+[![PyPI](https://img.shields.io/pypi/v/primecli.svg)](https://pypi.org/project/primecli/)
+[![Python](https://img.shields.io/pypi/pyversions/primecli.svg)](https://pypi.org/project/primecli/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
 `primecli` is two `pip`-installable console commands — `deltaprime` and `degenprime` — that drive the lending and leverage protocols by the DeltaPrimeLabs team on Avalanche C-chain and Base. It exposes the full surface most people use day to day: savings pools, per-user Prime / Degen Accounts, ParaSwap and YieldYak swaps, debt refinancing, GMX V2 LP, TraderJoe V2 LB, sJOE staking, PRIME leverage tiers, delayed collateral withdrawals, and a leveraged-long zap macro.
 
@@ -25,6 +26,12 @@ Full threat model and trust assumptions: [docs/security.md](docs/security.md).
 Requires Python 3.10+.
 
 ```bash
+pip install primecli
+```
+
+From the latest `main` (ahead of the most recent release):
+
+```bash
 pip install git+https://github.com/Mnemosyne-quest/primecli.git
 ```
 
@@ -35,8 +42,6 @@ git clone https://github.com/Mnemosyne-quest/primecli.git
 cd primecli
 pip install -e .
 ```
-
-A PyPI release (`pip install primecli`) will follow once the project has been smoke-tested in the wild for a bit. Track [#1](https://github.com/Mnemosyne-quest/primecli/issues/1) if you want a ping.
 
 ## Quickstart
 

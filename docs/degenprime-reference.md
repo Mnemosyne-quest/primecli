@@ -243,7 +243,7 @@ These are the non-obvious bits. They are the reason naïve approaches fail.
 
 ## 9. The tool: `degenprime`
 
-- Installed by `pip install git+https://github.com/Mnemosyne-quest/primecli.git` (or `pip install primecli` once the package ships on PyPI); entry point is the `degenprime` console script.
+- Installed by `pip install primecli`; entry point is the `degenprime` console script.
 - Default RPC: `https://base.publicnode.com` (Base, chainId 8453). Override with `DEGENPRIME_RPC` (paid Alchemy/QuickNode/Infura recommended for heavy use). Public fallback: `mainnet.base.org`.
 - Signing: only under `--execute`, with the key resolved per the precedence below. Real wallet, real funds.
 
