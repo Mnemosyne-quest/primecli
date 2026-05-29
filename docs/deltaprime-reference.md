@@ -221,7 +221,7 @@ The PRIME debt formula (from protocol docs): `accruedPrimeDebt = totalBorrowedVa
 
 ## 10. The tool: `deltaprime`
 
-- Installed by `pip install primecli`; entry point is the `deltaprime` console script.
+- Installed by `pip install git+https://github.com/Mnemosyne-quest/primecli.git` (or `pip install primecli` once the package ships on PyPI); entry point is the `deltaprime` console script.
 - Default RPC: `https://api.avax.network/ext/bc/C/rpc`. Override with `DELTAPRIME_RPC` (paid Alchemy/QuickNode/Infura recommended for heavy use).
 - Signing: only under `--execute`, with the key resolved per the precedence below. Real wallet, real funds.
 
