@@ -31,11 +31,14 @@ Full threat model and trust assumptions: [docs/security.md](docs/security.md).
 
 ## Install
 
-Requires Python 3.10+.
-
 ```bash
 pip install primecli
 ```
+
+Requires Python 3.10+. Step-by-step install + first-use walkthroughs:
+
+- **Humans** new to Python CLI tools: [docs/install-humans.md](docs/install-humans.md).
+- **AI agents** integrating the tool: [docs/install-agents.md](docs/install-agents.md).
 
 From the latest `main` (ahead of the most recent release):
 
