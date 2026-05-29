@@ -1,24 +1,24 @@
 # Using primecli from an AI agent
 
-This document collects integration patterns for letting an LLM-driven agent operate `primecli` on a user's behalf, plus the trust/guardrail model that goes with it.
+Integration patterns for letting an LLM-driven agent operate `primecli` on a user's behalf, plus the trust and guardrail model that goes with it. Audience: agent builders. Read [README.md](../README.md) first for the tool's basic shape.
 
 ## Why primecli is agent-friendly
 
 - **Preview by default.** No state-changing command broadcasts a transaction unless `--execute` is passed. An agent can call any command speculatively, parse the preview, and only re-run with `--execute` after a deliberate authorisation step.
-- **Predictable stdout.** Read-only commands print fixed-format tables (humans + agents both parse them). `deltaprime defi --json` emits a full positions snapshot as JSON for one-shot ingestion.
-- **No stack traces on config errors.** Missing key → `deltaprime: No signing key found. ...` to stderr, exit 1. Agents can detect the failure mode without scraping a traceback.
+- **Predictable stdout.** Read-only commands print fixed-format tables (humans and agents both parse them). `deltaprime defi --json` emits a full positions snapshot as JSON for one-shot ingestion.
+- **No stack traces on config errors.** A missing key prints `deltaprime: No signing key found. ...` to stderr and exits 1. Agents can detect the failure mode without scraping a traceback.
 - **Hand-curated ABIs, no Etherscan key required.** The tool ships its own pinned ABIs and resolves proxy implementations via the EIP-1967 storage slot, so it works in any environment with just an EVM RPC.
 
 ## Shell-tooled agents (Claude Code, Cursor, Aider, OpenAI Codex CLI)
 
-If the agent can run shell commands, you're done after install:
+If the agent can run shell commands, you are done after install:
 
 ```bash
-pip install git+https://github.com/Mnemosyne-quest/primecli.git
+pip install primecli
 export DELTAPRIME_PRIVATE_KEY=0x...
 ```
 
-The agent calls `deltaprime pool-info usdc`, `deltaprime my-positions`, etc., parses the stdout, and decides on next steps. For writes, it runs the command WITHOUT `--execute` first to get the preview, surfaces the preview to the operator, and only adds `--execute` after explicit go-ahead.
+The agent calls `deltaprime pool-info usdc`, `deltaprime my-positions`, and so on, parses the stdout, and decides on next steps. For writes, run the command WITHOUT `--execute` first to get the preview, surface the preview to the operator, and only add `--execute` after explicit go-ahead.
 
 ## Claude Code skill
 
@@ -81,19 +81,19 @@ Not shipped in v0.1. If you have a use case (Claude Desktop, Claude Code's MCP p
 ## Recommended guardrails when an agent drives primecli
 
 1. **Never store `--execute` in a model-controlled string.** Treat `--execute` as a separate authorisation step the operator (or a deliberate policy layer) attaches after seeing the preview.
-2. **Cap daily spend externally.** primecli has no built-in spending caps — that's the operator's responsibility. Wrap it with a budget check.
+2. **Cap daily spend externally.** `primecli` has no built-in spending caps. That is the operator's responsibility. Wrap it with a budget check.
 3. **Log the preview before broadcasting.** If the agent decided to swap 100 USDC and the preview says 100,000 USDC, the operator needs to see that. Don't swallow stdout.
-4. **Don't let the model paste recipient addresses.** Swap routing is internal (Prime/Degen Account → Prime/Degen Account) so this is mostly moot for the standard flows, but if you ever wire a custom send/withdraw flow, the destination address must be allowlisted out of band.
-5. **Watch for RPC tampering.** A compromised RPC can return false pool/account state and fool a preview. Use a trusted RPC (your own node, or a reputable provider) for high-stakes operations. The tool defaults to public RPCs which are fine for reading but worth replacing for serious money.
-6. **Verify the wallet line.** Every command prints `Wallet: 0x...`. A misconfigured key resolution (e.g. agent loaded the wrong env file) will silently operate the wrong wallet. The agent — and ideally the operator on the other side of the preview — should sanity-check this every time.
+4. **Don't let the model paste recipient addresses.** Swap routing is internal (Prime / Degen Account → Prime / Degen Account), so this is mostly moot for the standard flows. If you wire a custom send or withdraw flow, the destination address must be allowlisted out of band.
+5. **Watch for RPC tampering.** A compromised RPC can return false pool / account state and fool a preview. Use a trusted RPC (your own node, or a reputable provider) for high-stakes operations. The default public RPCs are fine for reading but worth replacing for serious money.
+6. **Verify the `Wallet:` line.** Every state-changing command prints `Wallet: 0x...`. A misconfigured key resolution (e.g. the agent loaded the wrong env file) will silently operate the wrong wallet. The agent (and ideally the operator on the other side of the preview) should sanity-check this every time.
 
 ## What primecli intentionally does NOT do
 
-- It does not implement key management beyond reading the configured key. Use a hardware wallet, an HSM, or an agent-side signing service if your threat model requires it.
-- It does not protect against smart-contract bugs in DeltaPrime / DegenPrime themselves.
-- It does not protect against oracle manipulation if RedStone is compromised at the signer level.
-- It does not implement transaction simulation beyond the preview's call construction (no full eth_call against a forked chain). For high-stakes operations, simulate the tx in a fork (Tenderly, Foundry's `cast`) before broadcasting.
+- Key management beyond reading the configured key. Use a hardware wallet, an HSM, or an agent-side signing service if your threat model requires it.
+- Protection against smart-contract bugs in DeltaPrime or DegenPrime themselves.
+- Protection against oracle manipulation if RedStone is compromised at the signer level.
+- Transaction simulation beyond the preview's call construction. There is no full `eth_call` against a forked chain. For high-stakes operations, simulate the tx in a fork (Tenderly, Foundry's `cast`) before broadcasting.
 
 ## Feedback
 
-If you wire primecli into an agent and hit rough edges — output formats that didn't parse, error messages that confused your agent, missing JSON shapes, anything — file an issue. The agent-friendliness goals are a v1 commitment, not a marketing line.
+If you wire `primecli` into an agent and hit rough edges (output formats that didn't parse, error messages that confused your agent, missing JSON shapes), file an issue. The agent-friendliness goals are a v1 commitment, not a marketing line.

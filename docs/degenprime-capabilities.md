@@ -1,10 +1,12 @@
 # DegenPrime Capabilities — Build Spec
 
-Per-capability build spec for the DegenPrime capability surface on Base (chainId 8453), precise enough to (re)wire each one into the `degenprime` CLI command. Verified on-chain 2026-05-29 against the live diamond beacon. Sibling to `degenprime-reference.md` (which carries the high-level model, pools, facet map, and the differences from DeltaPrime).
+Per-capability build spec for the DegenPrime surface on Base (chainId 8453), precise enough to (re)wire each one into the `degenprime` CLI. Verified on-chain 29-05-2026 against the live diamond beacon.
 
-**Build status (v1, 2026-05-29):** the RedStone payload wrap is shipped and all 17 commands in §1–§9 below are tooled — including the universal 24h delayed collateral withdrawal (§7) and read-only Aerodrome (§9). Deferred to v2: Aerodrome write paths (claim, decrease, add, stake) and Aerodrome position composition decoding.
+**Audience:** contributors (human or agent) who need to extend, debug, or audit the tool's implementation. Pair with [`degenprime-reference.md`](degenprime-reference.md) for the protocol model, pool list, facet map, and the differences from DeltaPrime.
 
-**Everything in §3 onwards runs on the Degen Account** (the per-user EIP-2535 diamond). All functions are reached by calling the diamond at the Degen Account's own address — the facet logic is shared via the `SmartLoanDiamondBeacon` at `0x85c2BAA28C1d7A07bFC5C5c9903FFf4c39ae5151`. Call from the EOA owner; the diamond enforces `onlyOwner` (= the EOA that created the account).
+**Build status (v1, 29-05-2026).** The RedStone payload wrap is shipped and all 17 commands in §1–§9 below are tooled, including the universal 24h delayed collateral withdrawal (§7) and read-only Aerodrome (§9). Deferred to v2: Aerodrome write paths (claim, decrease, add, stake) and Aerodrome position composition decoding.
+
+**Where the calls go.** Everything from §3 onwards runs on the Degen Account (the per-user EIP-2535 diamond). Functions are reached by calling the diamond at the Degen Account's own address; the facet logic is shared via the `SmartLoanDiamondBeacon` at `0x85c2BAA28C1d7A07bFC5C5c9903FFf4c39ae5151`. Calls originate from the EOA owner; the diamond enforces `onlyOwner` (the EOA that created the account).
 
 ---
 

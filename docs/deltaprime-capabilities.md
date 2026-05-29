@@ -1,10 +1,12 @@
 # DeltaPrime Capabilities — Build Spec
 
-Per-capability build spec for the full DeltaPrime capability surface on Avalanche C-chain (chainId 43114), precise enough to wire each one into the `deltaprime` CLI command. Verified on-chain 23-05-2026 against the live diamond beacon and `DeltaPrimeLabs/deltaprime-contracts-v2` source. Sibling to `deltaprime-reference.md` (which has the high-level model, pools, and the full command table).
+Per-capability build spec for the full DeltaPrime surface on Avalanche C-chain (chainId 43114), precise enough to wire each one into the `deltaprime` CLI. Verified on-chain 23-05-2026 against the live diamond beacon and the `DeltaPrimeLabs/deltaprime-contracts-v2` source.
 
-**Build status (24-05-2026):** the RedStone payload wrap is shipped, and most of this spec is now tooled — including zaps as tool-level macros (§7) and PRIME leverage tiers (§8). Section headers marked ✅ SHIPPED name the command(s) that implement them; the build detail below each is kept as the verified implementation record. Still untooled: Wombat liquid-staking LP (§6a), GLP (§6c), and PangolinDEX LP (§6d).
+**Audience:** contributors (human or agent) who need to extend, debug, or audit the tool's implementation. Pair with [`deltaprime-reference.md`](deltaprime-reference.md) for the protocol model, pool list, facet map, and the user-facing command table.
 
-**Everything below runs on the Prime Account** (the per-user EIP-2535 diamond). All functions are reached by calling the diamond at the Prime Account's own address — the facet logic is shared via the beacon `0x2916B3bf7C35bd21e63D01C93C62FB0d4994e56D`. Call from the EOA owner; the diamond enforces `onlyOwner` (= `DiamondStorageLib.contractOwner()` = the EOA that created the account).
+**Build status (24-05-2026).** The RedStone payload wrap is shipped, and most capabilities below are tooled. Section headers marked ✅ SHIPPED name the implementing command(s); the build detail under each is the verified implementation record. Still untooled: Wombat liquid-staking LP (§6a), GLP (§6c), and PangolinDEX LP (§6d).
+
+**Where the calls go.** Everything from §3 onwards runs on the Prime Account (the per-user EIP-2535 diamond). Functions are reached by calling the diamond at the Prime Account's own address; the facet logic is shared via the beacon at `0x2916B3bf7C35bd21e63D01C93C62FB0d4994e56D`. Calls originate from the EOA owner; the diamond enforces `onlyOwner` (i.e. `DiamondStorageLib.contractOwner()`, the EOA that created the account).
 
 ---
 

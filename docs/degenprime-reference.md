@@ -1,8 +1,10 @@
 # DegenPrime Reference
 
-Canonical, framework-agnostic reference for the DegenPrime protocol on Base and the `degenprime` CLI command that drives it. Single source of truth. All addresses and behaviours verified on-chain on 2026-05-29 (Base, chainId 8453).
+Canonical reference for the DegenPrime protocol on Base and the `degenprime` CLI command that drives it. All addresses and behaviours verified on-chain on 29-05-2026 (Base, chainId 8453).
 
-**Companion doc:** `degenprime-capabilities.md` — per-capability build spec (deposit, withdraw, fund, borrow, repay, swap, swap-debt, the three withdraw-collateral steps, aerodrome-positions) with exact function signatures, parameter encoding, approve targets, the RedStone requirement per call, and the gotchas the code-writer hit. This file (the reference) carries the high-level model, pools, facet map, and the differences from DeltaPrime. The tool drives the full v1 surface — lending core, swaps (ParaSwap only), swap-debt, universal 24h delayed collateral withdrawal, and a read-only Aerodrome position inventory.
+**Audience:** anyone (human or agent) who needs to understand the protocol surface on Base, the pool / facet addresses, and what each `degenprime` subcommand does. Pair with [`degenprime-capabilities.md`](degenprime-capabilities.md) when you need the exact function signatures, calldata encoding, approve targets, and per-call RedStone requirements.
+
+**What the tool covers today (v1):** lending core (deposit / withdraw / borrow / repay / fund), Degen Account create+fund, swaps (ParaSwap v6 / Velora), swap-debt, the universal 24h delayed collateral withdrawal (create / list / execute / cancel), and a read-only Aerodrome position inventory. The RedStone payload wrap is shipped. Aerodrome write paths and position-composition decoding are deferred to v2.
 
 ---
 
@@ -21,7 +23,7 @@ The DegenPrime brand leans into Base's memecoin culture: 32 collateral assets in
 
 ## 2. Architecture
 
-### Core addresses (verified on Base 2026-05-29)
+### Core addresses (verified on Base 29-05-2026)
 
 | Component | Address | Notes |
 |-----------|---------|-------|
@@ -58,7 +60,7 @@ DeltaPrime's diamond is the address directly. DegenPrime uses a **beacon proxy**
 
 ## 3. Active pools (USE THESE)
 
-Resolved from `TokenManager.getPoolAddress()` and verified live (totalSupply > 0, wired in TokenManager, 2026-05-29).
+Resolved from `TokenManager.getPoolAddress()` and verified live (totalSupply > 0, wired in TokenManager, 29-05-2026).
 
 | Pool key | bytes32 symbol | Active pool proxy | Underlying token | Decimals | Native |
 |----------|----------------|-------------------|------------------|----------|--------|
@@ -73,11 +75,11 @@ Resolved from `TokenManager.getPoolAddress()` and verified live (totalSupply > 0
 
 The `weth` pool is the native-ETH path: `deposit` accepts `value` and the pool wraps ETH → WETH internally (same pattern as DeltaPrime's `wavax` pool). All other pools take an explicit ERC20 approve + deposit.
 
-**TVL note (2026-05-29):** total deposits across all 8 pools are ~$29k. Some pools are basically empty — cbDOGE ~$4, cbXRP ~$9. A meaningful borrow on those would push utilization into the kink and skew rates. The blue-chip pools (USDC, ETH, cbBTC) carry most of the TVL.
+**TVL note (29-05-2026):** total deposits across all 8 pools are ~$29k. Some pools are basically empty — cbDOGE ~$4, cbXRP ~$9. A meaningful borrow on those would push utilization into the kink and skew rates. The blue-chip pools (USDC, ETH, cbBTC) carry most of the TVL.
 
 ### Collateral assets (32 total, beyond the pool set)
 
-A Degen Account can hold any of the 32 TokenManager-registered collateral tokens, enumerated via `TokenManager.getSupportedTokensAddresses()` and resolved to symbols via `tokenAddressToSymbol(address)`. Known symbols (2026-05-29):
+A Degen Account can hold any of the 32 TokenManager-registered collateral tokens, enumerated via `TokenManager.getSupportedTokensAddresses()` and resolved to symbols via `tokenAddressToSymbol(address)`. Known symbols (29-05-2026):
 
 `USDC, ETH, cbBTC, AERO, BRETT, AIXBT, TOSHI, VIRTUAL, MOG, SKI, DEGEN, KEYCAT, BASEDPEPE, KAITO, VVV, CLANKER, BNKR, DRB, COOKIE, ZORA, DINO, EUROC, weETH, ezETH, cbDOGE, cbXRP, SPX, LBTC, USDT, cbLTC, AVNT, GIZA.`
 
@@ -235,7 +237,7 @@ These are the non-obvious bits. They are the reason naïve approaches fail.
 
 8. **`getLoansForOwner` lag after createLoan.** The factory's owner→loans map can lag a beat behind the create-tx receipt. The tool polls every 2s for up to 12s after `--execute` to print the new account address; if it still hasn't propagated, it prints a "run `my-positions` shortly" hint rather than `None`.
 
-9. **TVL is tiny.** ~$29k total across 8 pools (2026-05-29). Small borrows can skew utilization rates; thin pools like cbDOGE / cbXRP wouldn't absorb meaningful borrow size. Quoted swap routes for non-stable, non-blue-chip assets can be thin too — preview the quote before executing.
+9. **TVL is tiny.** ~$29k total across 8 pools (29-05-2026). Small borrows can skew utilization rates; thin pools like cbDOGE / cbXRP wouldn't absorb meaningful borrow size. Quoted swap routes for non-stable, non-blue-chip assets can be thin too — preview the quote before executing.
 
 10. **Decimals matter:** USDC 6, USDT 6, cbXRP 6, cbBTC 8, cbDOGE 8, WETH 18, AERO 18, BRETT 18, KAITO 18. The tool handles scaling internally; this matters if you ever compute amounts by hand.
 

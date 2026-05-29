@@ -1,8 +1,10 @@
 # DeltaPrime Reference
 
-Canonical, framework-agnostic reference for the DeltaPrime protocol on Avalanche and the `deltaprime` CLI command that drives it. Single source of truth. All addresses and behaviours verified on-chain on 23-05-2026 (Avalanche C-chain, chainId 43114).
+Canonical reference for the DeltaPrime protocol on Avalanche C-chain and the `deltaprime` CLI command that drives it. All addresses and behaviours verified on-chain on 23-05-2026 (chainId 43114).
 
-**Companion doc:** `deltaprime-capabilities.md` — full per-capability build spec (swap, swap-debt, withdraw-collateral, GMX V2 LP, TraderJoe V2 LB, Wombat/sJOE/GLP staking, Pangolin LP, PRIME tiers, zaps) with exact function signatures, parameter encoding, approve targets, slippage/oracle/exec-fee requirements. This file (the reference) carries the high-level model, pools, facet map, and every command the tool ships. The tool drives the full surface — lending core, swaps (YieldYak + ParaSwap), swap-debt, delayed collateral withdrawal, GMX V2 GM/GM+ LP, TraderJoe V2 LB, sJOE staking, PRIME leverage tiers, and a leveraged-long `zap` macro — with the RedStone payload wrap shipped, so solvency-gated writes can `--execute`. Wombat/GLP staking and Pangolin LP remain documented-but-untooled in the capabilities doc.
+**Audience:** anyone (human or agent) who needs to understand the protocol surface, the pool / facet addresses, and what each `deltaprime` subcommand does. Pair with [`deltaprime-capabilities.md`](deltaprime-capabilities.md) when you need the exact function signatures, calldata encoding, approve targets, and oracle / exec-fee requirements.
+
+**What the tool covers today:** lending core (deposit / withdraw / borrow / repay / fund), Prime Account create+fund, swaps (YieldYak and ParaSwap / Velora), swap-debt, delayed collateral withdrawal, GMX V2 GM and GM+ LP, TraderJoe V2 LB, sJOE staking, PRIME leverage tiers, and a leveraged-long `zap` macro. The RedStone payload wrap is shipped, so every solvency-gated write can `--execute`. Wombat liquid-staking LP, legacy GLP, and Pangolin LP are documented in the capabilities spec but not yet tooled.
 
 ---
 
@@ -175,7 +177,7 @@ These are the non-obvious bits. They are the reason naïve approaches fail.
 2. **bytes32 asset symbols.** Prime Account functions identify assets by their symbol string encoded as bytes32, right-padded with zero bytes. Use the symbol, not the wrapped-token name:
    - `AVAX` (not `WAVAX`), `USDC`, `ETH` (not `WETH`), `BTC`, `USDT`.
 
-3. **RedStone oracle gating (`0xe7764c9e`, "missing oracle payload").** Functions that compute USD value or check solvency — `getHealthMeter()`, `getAllAssetsBalances()`, and **every state-changing facet function carrying `remainsSolvent` (so: all of swap, swap-debt, GMX LP, TraderJoe LP, staking writes, and the execute step of withdraw-collateral)** — revert on a plain `eth_call` because they need RedStone signed price calldata appended to the call. A real call requires wrapping the tx calldata with the RedStone EVM connector (append the signed price payload bytes after the normal ABI-encoded args). The oracle-free views (`getBalance`, `getDebts`, `getAllOwnedAssets`, `getAvailableBalance`, `getOwnedTraderJoeV2Bins`, Wombat/sJOE balance views) work fine without it. The tool now implements this RedStone wrapping (`build_redstone_payload` appends the signed price packages to the calldata tail), so `prime-summary` reports a real health ratio / total value / debt / solvent flag, and every solvency-gated write (swap, swap-debt, GMX LP, TraderJoe LP, sJOE stake/claim, execute-withdrawal) can `--execute`. It falls back to balances-only if the gateway is unreachable. See the "RedStone wrapping" section in `deltaprime-capabilities.md`.
+3. **RedStone oracle gating (`0xe7764c9e`, "missing oracle payload").** Functions that compute USD value or check solvency (`getHealthMeter()`, `getAllAssetsBalances()`, and **every state-changing facet function carrying `remainsSolvent`**, which covers all of swap, swap-debt, GMX LP, TraderJoe LP, staking writes, and the execute step of withdraw-collateral) revert on a plain `eth_call` because they need RedStone signed price calldata appended. A real call wraps the tx calldata with the RedStone EVM connector (append the signed price payload bytes after the normal ABI-encoded args). The oracle-free views (`getBalance`, `getDebts`, `getAllOwnedAssets`, `getAvailableBalance`, `getOwnedTraderJoeV2Bins`, Wombat / sJOE balance views) work without it. The tool implements the RedStone wrapping (`build_redstone_payload` appends the signed price packages to the calldata tail), so `prime-summary` reports a real health ratio / total value / debt / solvent flag, and every solvency-gated write (swap, swap-debt, GMX LP, TraderJoe LP, sJOE stake / claim, execute-withdrawal) can `--execute`. It falls back to balances-only if the gateway is unreachable. See the "RedStone wrapping" section in `deltaprime-capabilities.md`.
 
 4. **Borrow needs setup.** `createLoan()` makes an EMPTY Prime Account. You must `fund()` it with collateral before `borrow()` will succeed. The EOA needs AVAX for gas. `createAndFundLoan()` does create + fund in one tx.
 
@@ -217,7 +219,7 @@ Early models overestimated two key costs. The corrected figures:
 | PRIME rent debt | 4.5% of debt | **0.5% of debt** | Protocol docs: `tieredPrimeDebtRatio = 0.5e18` (0.5 PRIME/$100/yr), NO leverage multiplier |
 | Combined carry | 11.5% | **~6%** | 5.5% borrow + 0.5% PRIME |
 
-The PRIME debt formula (from protocol docs): `accruedPrimeDebt = totalBorrowedValueUSD * 0.5 * timeElapsed / (100 * 365 days)` — it is 0.5 PRIME per $100 of total borrow, at any leverage tier.
+The PRIME debt formula (from protocol docs): `accruedPrimeDebt = totalBorrowedValueUSD * 0.5 * timeElapsed / (100 * 365 days)`. That is 0.5 PRIME per $100 of total borrow, at any leverage tier.
 
 ## 10. The tool: `deltaprime`
 
@@ -227,7 +229,7 @@ The PRIME debt formula (from protocol docs): `accruedPrimeDebt = totalBorrowedVa
 
 ### Signing key resolution
 
-The Prime Account is derived on-chain from the wallet owner (`getLoanForOwner`), so each user automatically operates on their own Prime Account — no per-user addresses are hardcoded.
+The Prime Account is derived on-chain from the wallet owner (`getLoanForOwner`), so each user automatically operates on their own Prime Account. No per-user addresses are hardcoded.
 
 Key resolution order (first hit wins):
 
@@ -324,9 +326,9 @@ Every state-changing command **defaults to a PREVIEW** that prints what it would
 
 ### GMX deposits/withdrawals are async
 
-`gmx-deposit` / `gmx-withdraw` are payable and **asynchronous**: they pay a GMX execution fee as `msg.value`, queue the request on the GMX ExchangeRouter, and a GMX **keeper** executes it some blocks later via a callback. The position does not appear/disappear instantly, and the Prime Account is **frozen until the keeper callback fires** (the freeze is global per-account, not per-market — `DiamondStorageLib.freezeAccount` sets a single `SmartLoanStorage.frozenSince` timestamp; the keeper callback clears it).
+`gmx-deposit` / `gmx-withdraw` are payable and **asynchronous**: they pay a GMX execution fee as `msg.value`, queue the request on the GMX ExchangeRouter, and a GMX **keeper** executes it some blocks later via a callback. The position does not appear or disappear instantly, and the Prime Account is **frozen until the keeper callback fires**. The freeze is global per-account, not per-market (`DiamondStorageLib.freezeAccount` sets a single `SmartLoanStorage.frozenSince` timestamp; the keeper callback clears it).
 
-**On the freeze (not surfaced in the tool).** The freeze clears automatically when the GMX keeper callback fires, normally within minutes. The tool deliberately does not read or display the freeze flag: there is no external getter (`isAccountFrozen()` is `internal`, and reading the raw storage slot proved unreliable), and the manual `unfreezeAccount()` (`AssetsOperationsAvalancheFacet`, selector `0x7c5fc3fb`) is `onlyWhitelistedLiquidators` — an owner EOA cannot call it, so there is no self-recovery anyway. Practical rule: after a `gmx-deposit`/`gmx-withdraw`, wait and re-check `gmx-positions`. The EOA also needs AVAX for its own tx gas on top of the execution fee.
+**On the freeze (not surfaced in the tool).** The freeze clears automatically when the GMX keeper callback fires, normally within minutes. The tool deliberately does not read or display the freeze flag: there is no external getter (`isAccountFrozen()` is `internal`, and reading the raw storage slot proved unreliable), and the manual `unfreezeAccount()` (`AssetsOperationsAvalancheFacet`, selector `0x7c5fc3fb`) is `onlyWhitelistedLiquidators`, so an owner EOA cannot call it and there is no self-recovery. Practical rule: after a `gmx-deposit` / `gmx-withdraw`, wait and re-check `gmx-positions`. The EOA also needs AVAX for its own tx gas on top of the execution fee.
 
 ---
 
