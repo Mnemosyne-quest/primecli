@@ -247,7 +247,7 @@ The tool ships **32 commands**. State-changing commands default to a PREVIEW; ad
 
 | Command | Type | What it does |
 |---------|------|--------------|
-| `pool-info [usdc\|wavax\|weth\|btc\|usdt\|all]` | read-only | Pool supply / borrow / utilization / TVL. Defaults to `all`. |
+| `pool-info [usdc\|wavax\|weth\|btc\|usdt\|all] [--json]` | read-only | Pool supply / borrow / utilization / deposit APR / borrow APR / TVL. Defaults to `all`. With `--json`: emits a single JSON object for a named pool, or a `{name: {...}}` dict for `all` (same shape as `degenprime pool-info --json`). |
 | `my-positions` | read-only | Wallet balances + pool positions + Prime Account address. |
 | `deposit --pool X --amount Y [--execute]` | state-changing | Deposit into a savings pool. ERC20 approve handled automatically (approves the **pool**). |
 | `withdraw --pool X --amount Y [--execute]` | state-changing | Withdraw from a savings pool. |

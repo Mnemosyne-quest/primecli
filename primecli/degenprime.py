@@ -8,7 +8,7 @@ a per-user SmartLoan (diamond proxy) created via the SmartLoansFactory. The EOA 
 it; borrow/repay/fund run on the Degen Account, which itself talks to the pools.
 
 Usage:
-  degenprime pool-info [usdc|weth|cbbtc|aero|brett|kaito|cbdoge|cbxrp|all]
+  degenprime pool-info [usdc|weth|cbbtc|aero|brett|kaito|cbdoge|cbxrp|all] [--json]
   degenprime my-positions
   degenprime deposit --pool usdc --amount 100 [--execute]
   degenprime withdraw --pool usdc --amount 100 [--execute]
@@ -297,6 +297,45 @@ def get_pool_contract(pool_name: str):
     proxy = Web3.to_checksum_address(cfg["proxy"])
     w3 = get_w3()
     return w3.eth.contract(address=proxy, abi=POOL_ABI), cfg, w3
+
+# Multicall3 — deterministic deployment at the same address on every EVM chain
+# (Avalanche C-chain and Base both have it). aggregate3(Call3[]) batches read-only
+# calls into one eth_call; allowFailure=true per-call so a single revert returns
+# success=false for that leg instead of blowing up the whole batch. Used to collapse
+# per-pool / per-asset fan-out loops (cmd_pool_info("all"), cmd_summary, my-positions)
+# from N RPCs into 1. Same address as DeltaPrime's; verified on chainlist.org and
+# tested against the Base RPC.
+MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
+MULTICALL3_ABI = [
+    {"inputs": [{"components": [
+        {"name": "target", "type": "address"},
+        {"name": "allowFailure", "type": "bool"},
+        {"name": "callData", "type": "bytes"}], "type": "tuple[]", "name": "calls"}],
+     "name": "aggregate3",
+     "outputs": [{"components": [
+         {"name": "success", "type": "bool"},
+         {"name": "returnData", "type": "bytes"}], "type": "tuple[]", "name": "returnData"}],
+     "stateMutability": "view", "type": "function"},
+]
+
+def multicall(w3, calls):
+    """Batch read-only calls via Multicall3.aggregate3. Each call is a (target_address,
+    calldata_bytes) tuple. Returns a list of (success, return_bytes) tuples in input
+    order — the caller is responsible for decoding return_bytes against the original
+    function's output types and treating success=False as a missing/reverted value. Empty
+    input returns []. The whole batch round-trips in one eth_call; gas is paid by the
+    simulated caller (zero address by default) so no key is required.
+
+    For RedStone-gated views: append the RedStone payload to each leg's calldata before
+    putting it in `calls`. Multicall3 only delegate-calls the target with the bytes you
+    provide; the on-chain solvency parser still reads the payload from the calldata tail
+    per leg."""
+    if not calls:
+        return []
+    mc = w3.eth.contract(address=Web3.to_checksum_address(MULTICALL3), abi=MULTICALL3_ABI)
+    args = [(Web3.to_checksum_address(t), True, d) for t, d in calls]
+    raw = mc.functions.aggregate3(args).call()
+    return [(bool(ok), bytes(rd)) for ok, rd in raw]
 
 # Minimal Degen Account ABI: only the facet functions this tool calls. The diamond
 # beacon's own ABI is beacon-management only, so the borrow/repay/fund and view
@@ -595,85 +634,205 @@ def redstone_view_call(w3, account, fn_name: str, payload: bytes, args: list = N
 
 # ─── Commands ──────────────────────────────────────────────────────────────
 
-def cmd_pool_info(pool_name: str):
+def _pool_info_data(pool_name: str) -> dict:
+    """Read every pool-info field for one pool in a SINGLE Multicall3 eth_call:
+    totalSupply, totalBorrowed, getDepositRate, getBorrowingRate, and (when a signer is
+    configured) the EOA's pool balance. Returns the raw + decoded values plus the
+    off-chain KuCoin USD price. Shared by the human-facing print path and the --json
+    path. cb-prefixed pool symbols fall back to their bare ticker for the KuCoin probe
+    (cbBTC -> BTC, cbDOGE -> DOGE, etc.)."""
+    contract, cfg, w3 = get_pool_contract(pool_name)
+    proxy_cs = Web3.to_checksum_address(cfg["proxy"])
+    legs = [
+        ("totalSupply", contract.encode_abi("totalSupply", args=[])),
+        ("totalBorrowed", contract.encode_abi("totalBorrowed", args=[])),
+        ("getDepositRate", contract.encode_abi("getDepositRate", args=[])),
+        ("getBorrowingRate", contract.encode_abi("getBorrowingRate", args=[])),
+    ]
+    try:
+        acct = get_account()
+        signer_addr = acct.address
+        legs.append(("balanceOf", contract.encode_abi("balanceOf", args=[signer_addr])))
+    except RuntimeError:
+        signer_addr = None
+    results = multicall(w3, [(proxy_cs, bytes.fromhex(d[2:]) if d.startswith("0x") else bytes.fromhex(d))
+                             for _, d in legs])
+    out_types = {"totalSupply": ["uint256"], "totalBorrowed": ["uint256"],
+                 "getDepositRate": ["uint256"], "getBorrowingRate": ["uint256"],
+                 "balanceOf": ["uint256"]}
+    decoded = {}
+    for (name, _data), (ok, rd) in zip(legs, results):
+        if not ok or not rd:
+            decoded[name] = None
+            continue
+        try:
+            decoded[name] = w3.codec.decode(out_types[name], rd)[0]
+        except Exception:
+            decoded[name] = None
+    price_sym = cfg["symbol"].replace("cb", "") if cfg["symbol"].startswith("cb") else cfg["symbol"]
+    price = token_price(price_sym)
+    return {"name": pool_name, "cfg": cfg, "signer": signer_addr,
+            "raw": decoded, "price": price}
+
+
+def _compact_num(value: float, places: int = 2) -> float:
+    """Round to `places` decimal places, defaulting to 2. Compact enough for an LLM
+    consumer without lying about the underlying number. Used for amount/USD fields in
+    pool-info --json."""
+    if value is None:
+        return None
+    return round(float(value), places)
+
+
+def _pool_json_shape(data: dict) -> dict:
+    """Per-pool JSON object for `pool-info --json`. Same key names as deltaprime's
+    _pool_json_shape so an agent can consume both chains uniformly. Numbers are floats
+    rounded to 2 dp (amounts/USD/rates/utilization); proxy/token are full checksum
+    strings. Null-ish fields are omitted (no tokenPrice/tvl when KuCoin lookup fails,
+    no myDeposit without a key or with zero balance)."""
+    cfg, raw, price = data["cfg"], data["raw"], data["price"]
+    d = cfg["decimals"]
+    ts_raw, tb_raw = raw.get("totalSupply"), raw.get("totalBorrowed")
+    dr_raw, br_raw = raw.get("getDepositRate"), raw.get("getBorrowingRate")
+    ts = (ts_raw or 0) / 10**d
+    tb = (tb_raw or 0) / 10**d
+    util = (tb / ts * 100) if ts > 0 else 0.0
+    out = {
+        "symbol": cfg["symbol"],
+        "proxy": cfg["proxy"],
+        "token": cfg["token"],
+        "decimals": d,
+        "totalSupply": _compact_num(ts),
+        "totalBorrowed": _compact_num(tb),
+        "utilization": _compact_num(util),
+    }
+    if dr_raw is not None:
+        out["depositRate"] = _compact_num(dr_raw / 1e18 * 100)
+    if br_raw is not None:
+        out["borrowingRate"] = _compact_num(br_raw / 1e18 * 100)
+    if price:
+        out["tokenPrice"] = _compact_num(price, places=4)
+        out["tvl"] = _compact_num(ts * price)
+    my_bal = raw.get("balanceOf")
+    if my_bal is not None and my_bal > 0:
+        out["myDeposit"] = _compact_num(my_bal / 10**d, places=6)
+    return out
+
+
+def cmd_pool_info(pool_name: str, as_json: bool = False):
+    """Print pool supply / borrow / utilization / APR / TVL for one pool or all.
+
+    Human-facing output (default) is unchanged. With --json: emits a single JSON object
+    for a named pool, or a {pool_name: {...}} dict for `all`. JSON shape matches
+    deltaprime so an agent can consume both chains uniformly. Numbers are floats (no
+    decoration), `tokenPrice` / `tvl` are omitted when KuCoin lookup fails, `myDeposit`
+    is omitted when no key is configured or the balance is zero."""
     if pool_name == "all":
+        if as_json:
+            out = {name: _pool_json_shape(_pool_info_data(name)) for name in POOLS}
+            print(json.dumps(out, indent=2))
+            return
         for name in POOLS:
             cmd_pool_info(name)
             print()
         return
 
-    contract, cfg, w3 = get_pool_contract(pool_name)
+    data = _pool_info_data(pool_name)
+    if as_json:
+        print(json.dumps(_pool_json_shape(data), indent=2))
+        return
+
+    cfg, raw, price = data["cfg"], data["raw"], data["price"]
     p = cfg["proxy"][:12]
     d = cfg["decimals"]
-
-    ts = contract.functions.totalSupply().call()
-    tb = contract.functions.totalBorrowed().call()
+    ts = raw.get("totalSupply") or 0
+    tb = raw.get("totalBorrowed") or 0
     print(f"=== {cfg['symbol']} Pool ({p}...) ===")
     print(f"  Total Supply:   {ts / 10**d:>14,.2f} {cfg['symbol']}")
     print(f"  Total Borrowed: {tb / 10**d:>14,.2f} {cfg['symbol']}")
     util = tb / ts * 100 if ts > 0 else 0
     print(f"  Utilization:    {util:>14.2f}%")
     # getDepositRate / getBorrowingRate are 1e18-scaled annualised rates.
-    try:
-        dr = contract.functions.getDepositRate().call() / 1e18 * 100
-        br = contract.functions.getBorrowingRate().call() / 1e18 * 100
+    dr_raw, br_raw = raw.get("getDepositRate"), raw.get("getBorrowingRate")
+    if dr_raw is not None and br_raw is not None:
+        dr = dr_raw / 1e18 * 100
+        br = br_raw / 1e18 * 100
         print(f"  Deposit APR:    {dr:>14.2f}%")
         print(f"  Borrow APR:     {br:>14.2f}%")
-    except Exception:
-        pass
-    # KuCoin doesn't trade cbBTC/cbDOGE/cbXRP directly - the cb-prefixed variants are
-    # Coinbase wrapped versions; fall back to the underlying ticker for the price probe.
-    price_sym = cfg["symbol"].replace("cb", "") if cfg["symbol"].startswith("cb") else cfg["symbol"]
-    price = token_price(price_sym)
     if price:
         print(f"  Token Price:    ${price:>13,.2f}")
         print(f"  TVL:            ${ts / 10**d * price:>13,.2f}")
 
-    # Show the signer's pool deposit when a key is configured; pool-info should
-    # also work as a pure read-only command without one.
-    try:
-        acct = get_account()
-    except RuntimeError:
-        return
-    my_bal = contract.functions.balanceOf(acct.address).call()
-    if my_bal > 0:
+    # Show the signer's pool deposit when a key is configured; the balanceOf leg is
+    # read in the same multicall batch above — we just print it here.
+    my_bal = raw.get("balanceOf")
+    if my_bal is not None and my_bal > 0:
         print(f"  My Deposit:     {my_bal / 10**d:.4f} {cfg['symbol']}")
 
 def cmd_my_positions():
     acct = get_account()
     w3 = get_w3()
+    # The Wallet: line MUST always print so the operator can verify the resolved
+    # signer address even when every other line is suppressed.
     print(f"Wallet: {acct.address}")
 
-    # Wallet ETH (native Base asset, used for gas).
+    # Wallet ETH (native Base asset, used for gas). Suppress when below dust so a clean
+    # readout doesn't carry a noisy `ETH: 0.000000` line.
     eth = w3.eth.get_balance(acct.address) / 1e18
-    print(f"ETH: {eth:.6f}")
+    if eth >= 1e-9:
+        print(f"ETH: {eth:.6f}")
 
+    # Batch every per-pool read into ONE Multicall3 eth_call: for each pool, the wallet
+    # ERC20 balanceOf + the pool balanceOf (the EOA's deposit) + the pool getBorrowed.
+    # Previously 3 RPCs per pool × 8 pools = 24 sequential round-trips; now 1 round-trip
+    # regardless of pool count.
+    legs = []
+    pool_meta = []
     for name, cfg in POOLS.items():
+        contract, _, _ = get_pool_contract(name)
+        token_cs = Web3.to_checksum_address(cfg["token"])
+        token = w3.eth.contract(address=token_cs, abi=ERC20_ABI)
+        proxy_cs = Web3.to_checksum_address(cfg["proxy"])
+        legs.append((token_cs, bytes.fromhex(token.encode_abi("balanceOf", args=[acct.address])[2:])))
+        legs.append((proxy_cs, bytes.fromhex(contract.encode_abi("balanceOf", args=[acct.address])[2:])))
+        legs.append((proxy_cs, bytes.fromhex(contract.encode_abi("getBorrowed", args=[acct.address])[2:])))
+        pool_meta.append((name, cfg))
+    try:
+        results = multicall(w3, legs)
+    except Exception as e:
+        print(f"  pool reads failed via multicall: {type(e).__name__}: {e}")
+        results = [(False, b"")] * len(legs)
+    for i, (name, cfg) in enumerate(pool_meta):
+        wallet_ok, wallet_rd = results[i * 3]
+        pool_ok, pool_rd = results[i * 3 + 1]
+        borrow_ok, borrow_rd = results[i * 3 + 2]
         try:
-            contract, _, _ = get_pool_contract(name)
-            token_addr = Web3.to_checksum_address(cfg["token"])
-            token = w3.eth.contract(address=token_addr, abi=ERC20_ABI)
-            bal = token.functions.balanceOf(acct.address).call()
-            if bal > 0:
-                print(f"  Wallet {cfg['symbol']}: {bal / 10**cfg['decimals']:.4f}")
-
-            pool_bal = contract.functions.balanceOf(acct.address).call()
-            if pool_bal > 0:
-                print(f"  Pool Deposit {cfg['symbol']}: {pool_bal / 10**cfg['decimals']:.4f}")
-
-            borrowed = contract.functions.getBorrowed(acct.address).call()
-            if borrowed > 0:
-                print(f"  Borrowed {cfg['symbol']}: {borrowed / 10**cfg['decimals']:.4f}")
-
+            wallet_bal = w3.codec.decode(["uint256"], wallet_rd)[0] if wallet_ok and wallet_rd else 0
+            pool_bal = w3.codec.decode(["uint256"], pool_rd)[0] if pool_ok and pool_rd else 0
+            borrowed = w3.codec.decode(["uint256"], borrow_rd)[0] if borrow_ok and borrow_rd else 0
         except Exception as e:
-            print(f"  {name}: {e}")
+            print(f"  {name}: decode failed ({type(e).__name__})")
+            continue
+        if not wallet_ok:
+            print(f"  {name}: wallet balanceOf leg reverted in multicall")
+        if not pool_ok:
+            print(f"  {name}: pool balanceOf leg reverted in multicall")
+        if not borrow_ok:
+            print(f"  {name}: getBorrowed leg reverted in multicall")
+        if wallet_bal > 0:
+            print(f"  Wallet {cfg['symbol']}: {wallet_bal / 10**cfg['decimals']:.4f}")
+        if pool_bal > 0:
+            print(f"  Pool Deposit {cfg['symbol']}: {pool_bal / 10**cfg['decimals']:.4f}")
+        if borrowed > 0:
+            print(f"  Borrowed {cfg['symbol']}: {borrowed / 10**cfg['decimals']:.4f}")
 
     try:
         pa = get_prime_account(w3, acct.address)
         if pa:
             print(f"\nDegen Account: {pa}")
             pa_eth = w3.eth.get_balance(Web3.to_checksum_address(pa)) / 1e18
-            print(f"  ETH balance: {pa_eth:.6f}")
+            if pa_eth >= 1e-9:
+                print(f"  ETH balance: {pa_eth:.6f}")
         else:
             print("\nNo Degen Account yet. Create with: degenprime create-account --execute")
     except Exception as e:
@@ -921,7 +1080,12 @@ def cmd_summary():
     back to balances-only if the RedStone gateway is unreachable or a view reverts.
     Note: per-asset USD is best-effort - only symbols with a RedStone primary-prod
     feed are priced here. Symbols sourced on-chain from BaseOracle TWAP show as
-    balance-only (the SolvencyFacet still values them for the total/debt figures)."""
+    balance-only (the SolvencyFacet still values them for the total/debt figures).
+
+    Multicall: stage A batches getAllOwnedAssets + getDebts (2 -> 1 RPC). Stage B
+    batches one getBalance per owned asset (N -> 1 RPC). Stage C batches the four
+    RedStone-gated solvency views + getPrices (4-5 -> 1 RPC), each leg carrying the
+    same RedStone payload appended."""
     w3 = get_w3()
     acct = get_account()
     pa = get_prime_account(w3, acct.address)
@@ -935,13 +1099,27 @@ def cmd_summary():
     print(f"  Native ETH (gas):  {pa_eth:.6f}")
 
     account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
-    owned = [a.rstrip(b"\x00").decode(errors="replace") for a in account.functions.getAllOwnedAssets().call()]
+    pa_cs = account.address
+    stage_a_legs = [
+        ("getAllOwnedAssets", ["bytes32[]"], account.encode_abi("getAllOwnedAssets", args=[])),
+        ("getDebts", ["(bytes32,uint256)[]"], account.encode_abi("getDebts", args=[])),
+    ]
+    a_results = multicall(w3, [(pa_cs, bytes.fromhex(d[2:])) for _, _, d in stage_a_legs])
+    owned_raw = w3.codec.decode(["bytes32[]"], a_results[0][1])[0] if a_results[0][0] else []
+    debts_raw = w3.codec.decode(["(bytes32,uint256)[]"], a_results[1][1])[0] if a_results[1][0] else []
+    owned = [a.rstrip(b"\x00").decode(errors="replace") for a in owned_raw]
+    if owned:
+        bal_legs = [(pa_cs, bytes.fromhex(account.encode_abi("getBalance", args=[asset_b32(sym)])[2:]))
+                    for sym in owned]
+        bal_results = multicall(w3, bal_legs)
+    else:
+        bal_results = []
     supplied = []
-    for sym in owned:
-        bal = account.functions.getBalance(asset_b32(sym)).call()
+    for sym, (ok, rd) in zip(owned, bal_results):
+        bal = w3.codec.decode(["uint256"], rd)[0] if ok and rd else 0
         supplied.append({"symbol": sym, "raw": bal, "decimals": _asset_decimals(w3, sym)})
     borrowed = []
-    for n, v in account.functions.getDebts().call():
+    for n, v in debts_raw:
         sym = n.rstrip(b"\x00").decode(errors="replace")
         if v > 0:
             borrowed.append({"symbol": sym, "raw": v, "decimals": _asset_decimals(w3, sym)})
@@ -950,18 +1128,54 @@ def cmd_summary():
     # without signed price calldata appended. Fetch a fresh RedStone payload covering
     # every feed the solvency math touches (RedStone-feed symbols only - others come
     # from BaseOracle on-chain) and eth_call the views with it appended. No tx.
+    # Each leg in the multicall carries the same payload — redundant on the wire,
+    # but correct: the SolvencyFacet parses the payload from the calldata tail per leg.
     solvency = {"total": None, "debt": None, "ratio": None, "solvent": None, "error": None, "prices": {}}
     try:
         feeds = degen_account_price_feeds(account)
         payload = build_redstone_payload(feeds)
-        solvency["total"] = redstone_view_call(w3, account, "getTotalValue", payload)[0] / 1e18
-        solvency["debt"] = redstone_view_call(w3, account, "getDebt", payload)[0] / 1e18
-        ratio = redstone_view_call(w3, account, "getHealthRatio", payload)[0] / 1e18
-        # With negligible debt the ratio is astronomically large (e.g. 1e59) - render
-        # that as None and show ">1000" rather than a junk number.
-        solvency["ratio"] = None if ratio > 1000 else ratio
-        solvency["solvent"] = bool(redstone_view_call(w3, account, "isSolvent", payload)[0])
-        solvency["prices"] = _prices_usd(w3, account, [r["symbol"] for r in supplied + borrowed], payload)
+        payload_hex = payload.hex()
+        price_syms = [s for s in dict.fromkeys(r["symbol"] for r in supplied + borrowed)
+                      if s and s in REDSTONE_AVAILABLE_FEEDS]
+        solv_legs = [
+            ("getTotalValue", ["uint256"], account.encode_abi("getTotalValue", args=[])),
+            ("getDebt", ["uint256"], account.encode_abi("getDebt", args=[])),
+            ("getHealthRatio", ["uint256"], account.encode_abi("getHealthRatio", args=[])),
+            ("isSolvent", ["bool"], account.encode_abi("isSolvent", args=[])),
+        ]
+        if price_syms:
+            solv_legs.append(("getPrices", ["uint256[]"],
+                              account.encode_abi("getPrices",
+                                                 args=[[asset_b32(s) for s in price_syms]])))
+        solv_results = multicall(w3, [(pa_cs, bytes.fromhex(d[2:]) + bytes.fromhex(payload_hex))
+                                       for _, _, d in solv_legs])
+        decoded_solv = {}
+        for (name, out_types, _d), (ok, rd) in zip(solv_legs, solv_results):
+            if not ok or not rd:
+                decoded_solv[name] = None
+                continue
+            try:
+                decoded_solv[name] = w3.codec.decode(out_types, rd)[0]
+            except Exception:
+                decoded_solv[name] = None
+        if decoded_solv.get("getTotalValue") is not None:
+            solvency["total"] = decoded_solv["getTotalValue"] / 1e18
+        if decoded_solv.get("getDebt") is not None:
+            solvency["debt"] = decoded_solv["getDebt"] / 1e18
+        if decoded_solv.get("getHealthRatio") is not None:
+            ratio = decoded_solv["getHealthRatio"] / 1e18
+            # With negligible debt the ratio is astronomically large (e.g. 1e59) - render
+            # that as None and show ">1000" rather than a junk number.
+            solvency["ratio"] = None if ratio > 1000 else ratio
+        if decoded_solv.get("isSolvent") is not None:
+            solvency["solvent"] = bool(decoded_solv["isSolvent"])
+        prices = {}
+        if price_syms and decoded_solv.get("getPrices") is not None:
+            raw_prices = decoded_solv["getPrices"]
+            for i, s in enumerate(price_syms):
+                if i < len(raw_prices):
+                    prices[s] = raw_prices[i] / 1e8
+        solvency["prices"] = prices
     except Exception as e:
         solvency["error"] = type(e).__name__
 
@@ -1735,11 +1949,16 @@ def _dispatch():
 
     cmd = args[0]
     if cmd == "pool-info":
-        pool = args[1] if len(args) > 1 else "all"
+        # First positional after `pool-info` is the pool name; --json is an opt-in flag
+        # that switches output from human tables to a compact JSON shape (one object for
+        # a named pool, dict-of-objects for `all`).
+        as_json = "--json" in args
+        positional = [a for a in args[1:] if not a.startswith("--")]
+        pool = positional[0] if positional else "all"
         if pool != "all" and pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}, all")
             return
-        cmd_pool_info(pool)
+        cmd_pool_info(pool, as_json)
     elif cmd == "my-positions":
         cmd_my_positions()
     elif cmd == "deposit":

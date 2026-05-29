@@ -266,7 +266,7 @@ The tool ships **17 commands**. State-changing commands default to a PREVIEW; ad
 
 | Command | Type | What it does |
 |---------|------|--------------|
-| `pool-info [usdc\|weth\|cbbtc\|aero\|brett\|kaito\|cbdoge\|cbxrp\|all]` | read-only | Pool supply / borrow / utilization / deposit APR / borrow APR / TVL. Defaults to `all`. |
+| `pool-info [usdc\|weth\|cbbtc\|aero\|brett\|kaito\|cbdoge\|cbxrp\|all] [--json]` | read-only | Pool supply / borrow / utilization / deposit APR / borrow APR / TVL. Defaults to `all`. With `--json`: emits a single JSON object for a named pool, or a `{name: {...}}` dict for `all` (same shape as `deltaprime pool-info --json`). |
 | `my-positions` | read-only | Wallet ETH balance, per-pool wallet + deposit + borrow, Degen Account address. |
 | `deposit --pool X --amount Y [--execute]` | state-changing | Deposit into a savings pool. ERC20 approve handled automatically (approves the **pool**); native ETH (`weth`) sends `value` and skips the approve. |
 | `withdraw --pool X --amount Y [--execute]` | state-changing | **Instant** lender-side withdrawal from a savings pool. No time-lock (the lock is on the Degen Account collateral path, not on pool deposits). |

@@ -86,7 +86,7 @@ State-changing commands preview by default. Add `--execute` to broadcast.
 
 | Group | Commands |
 |-------|----------|
-| Lending core | `pool-info`, `my-positions`, `deposit`, `withdraw`, `borrow`, `repay`, `fund` |
+| Lending core | `pool-info [--json]`, `my-positions`, `deposit`, `withdraw`, `borrow`, `repay`, `fund` |
 | Prime Account | `create-prime-account` (alias `create-account`), `prime-summary`, `defi --json`, `withdraw-collateral`, `withdrawal-intents`, `execute-withdrawal` |
 | Swaps | `swap --from S --to S --amount N [--via yak\|paraswap] [--slippage P]`, `swap-debt --from S --to S --amount N [--slippage P]` |
 | GMX V2 LP (async, keeper-executed) | `gmx-positions`, `gmx-deposit --market M --amount N [--side long\|short]`, `gmx-withdraw --market M --amount N` |
@@ -97,7 +97,7 @@ State-changing commands preview by default. Add `--execute` to broadcast.
 
 Pools: `usdc`, `wavax`, `weth`, `btc`, `usdt`. GM markets: `avax-usdc`, `btc-usdc`, `eth-usdc` (two-sided GM); `avax+`, `btc+`, `eth+` (single-sided GM+). LB pairs: `avax-usdc`, `avax-usdc-20`, `btc-usdc`, `eth-avax`, `btc-avax`, `avax-btc`, `eurc-usdc`, `usdt-usdc`, `joe-avax`.
 
-`defi --json` emits a full positions snapshot in a DeBank-like shape. `zap` composes `fund` → `borrow` → optional `swap` → `gmx-deposit` into one preview-and-execute flow, stopping on the first failure.
+`defi --json` emits a full positions snapshot in a DeBank-like shape — `null`, empty-list, and empty-dict fields are stripped, and the decorative `url` key is dropped (numeric `0` and boolean `false` are preserved, since they carry real information). `pool-info --json` emits a single JSON object for a named pool, or a `{name: {...}}` dict for `all`. `zap` composes `fund` → `borrow` → optional `swap` → `gmx-deposit` into one preview-and-execute flow, stopping on the first failure.
 
 Full per-command reference: [docs/deltaprime-reference.md](docs/deltaprime-reference.md). Per-capability build spec: [docs/deltaprime-capabilities.md](docs/deltaprime-capabilities.md).
 
@@ -105,7 +105,7 @@ Full per-command reference: [docs/deltaprime-reference.md](docs/deltaprime-refer
 
 | Group | Commands |
 |-------|----------|
-| Lending core | `pool-info`, `my-positions`, `deposit`, `withdraw`, `borrow`, `repay`, `fund` |
+| Lending core | `pool-info [--json]`, `my-positions`, `deposit`, `withdraw`, `borrow`, `repay`, `fund` |
 | Degen Account | `create-account`, `summary`, `withdraw-collateral`, `withdrawal-intents`, `execute-withdrawal`, `cancel-withdrawal` |
 | Swaps | `swap --from S --to S --amount N [--slippage P]` (ParaSwap v6), `swap-debt --from S --to S --amount N` |
 | Aerodrome (read-only in v1) | `aerodrome-positions` |
@@ -178,7 +178,7 @@ A copy-paste template is at [examples/env.example](examples/env.example).
 `primecli` is built for autonomous and semi-autonomous use. Three properties matter:
 
 1. **Preview by default.** Every state-changing command prints a structured preview and stops unless `--execute` is passed. An agent can call any command speculatively, parse the preview, decide whether to broadcast, then re-run with `--execute`.
-2. **Predictable, parseable stdout.** Read-only commands (`pool-info`, `my-positions`, `prime-summary`, `summary`, `withdrawal-intents`, `lb-positions`, `gmx-positions`, `aerodrome-positions`, `sjoe-position`, `prime-tier`, `defi --json`) emit fixed-format tables or JSON. `defi --json` is a one-shot full positions snapshot.
+2. **Predictable, parseable stdout.** Read-only commands (`pool-info` (also `--json`), `my-positions`, `prime-summary`, `summary`, `withdrawal-intents`, `lb-positions`, `gmx-positions`, `aerodrome-positions`, `sjoe-position`, `prime-tier`, `defi --json`) emit fixed-format tables or JSON. `defi --json` is a one-shot full positions snapshot.
 3. **Clean failure modes.** Configuration errors do not print stack traces. A missing key prints `deltaprime: No signing key found. Set DELTAPRIME_PRIVATE_KEY ...` to stderr and exits 1.
 
 Full agent integration guide (Claude Code skill template, MCP notes, recommended guardrails): [docs/agent-integration.md](docs/agent-integration.md).
