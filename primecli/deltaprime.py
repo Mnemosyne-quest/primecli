@@ -224,7 +224,6 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 # The CLI key (#1) is set by main() before the command runs; the env vars (#2/#3)
 # are read lazily so read-only commands that don't sign never need a key at all.
 _CLI_KEY = None  # set by the --key CLI flag in main()
-SNOWTRACE = "https://api.snowtrace.io/api"
 FACTORY_PROXY = "0x3Ea9D480295A73fd2aF95b4D96c2afF88b21B03D"
 # On-chain registry of active pools. getPoolAddress(bytes32 asset) is the source
 # of truth — the docs/repo per-pool artifacts are stale and point at frozen pools.
@@ -493,13 +492,43 @@ PRIME_TOKEN = {"addr": "0x33c8036e99082b0c395374832fecf70c42c7f298", "symbol": "
 PRIME_TIERS = {"basic": 0, "premium": 1}
 PRIME_TIER_NAMES = {0: "BASIC", 1: "PREMIUM", 2: "_NON_EXISTENT"}
 
-_abi_cache = {}
-_impl_cache = {}
+# Minimal ERC20 ABI: balanceOf is the only function we read off arbitrary tokens (wallet
+# balances for cmd_my_positions). The approve selector is hot-loaded inline at write sites.
+ERC20_BALANCE_ABI = json.loads(
+    '[{"constant":true,"inputs":[{"name":"a","type":"address"}],"name":"balanceOf",'
+    '"outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}]'
+)
+
+# Pool ABI — hand-curated subset (totalSupply, totalBorrowed, balanceOf, getBorrowed,
+# deposit, withdraw). DeltaPrime's Pool implementation is the parent of DegenPrime's,
+# and every pool function this tool calls is in this subset. Previously deltaprime
+# fetched per-pool ABIs from Snowtrace (5 API hits per `pool-info all` on cold cache,
+# rate-limited); the hand-curated ABI removes that dependency entirely. Verified against
+# the DeltaPrime Pool contract on Snowtrace (2026-05-23).
+POOL_ABI = json.loads(
+    '['
+    '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"deposit","outputs":[],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[],"name":"totalSupply","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
+    '{"inputs":[],"name":"totalBorrowed","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
+    '{"inputs":[{"name":"_user","type":"address"}],"name":"balanceOf","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
+    '{"inputs":[{"name":"_user","type":"address"}],"name":"getBorrowed","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}'
+    ']'
+)
+
+# Process-local Web3 singleton. Each get_w3() call previously constructed a fresh
+# HTTPProvider — wasteful on multi-pool reads (cmd_pool_info("all"), gather_defi).
+_W3 = None
 
 def get_w3():
-    w3 = Web3(Web3.HTTPProvider(AVALANCHE_RPC))
-    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-    return w3
+    """Process-local Web3 client. Avalanche C-chain needs the POA middleware injected
+    once; subsequent callers share the same provider + middleware stack."""
+    global _W3
+    if _W3 is None:
+        w3 = Web3(Web3.HTTPProvider(AVALANCHE_RPC))
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        _W3 = w3
+    return _W3
 
 def _tx_gas_price(w3) -> int:
     """Gas price for broadcasts: 2x the current network price with a 1 gwei floor.
@@ -535,35 +564,14 @@ def resolve_private_key():
 def get_account() -> Account:
     return Account.from_key(resolve_private_key())
 
-def fetch_json(url, params):
-    r = requests.get(url, params=params, timeout=15)
-    return r.json()
-
-def get_pool_impl(pool_proxy: str) -> str:
-    p = pool_proxy.lower()
-    if p not in _impl_cache:
-        d = fetch_json(SNOWTRACE, {"module": "contract", "action": "getsourcecode", "address": pool_proxy})
-        impl = d["result"][0].get("Implementation", "")
-        _impl_cache[p] = impl or pool_proxy
-    return _impl_cache[p]
-
-def get_pool_abi(pool_proxy: str) -> list:
-    p = pool_proxy.lower()
-    if p not in _abi_cache:
-        impl = get_pool_impl(pool_proxy)
-        d = fetch_json(SNOWTRACE, {"module": "contract", "action": "getabi", "address": impl})
-        if d.get("status") == "1":
-            _abi_cache[p] = json.loads(d["result"])
-        else:
-            _abi_cache[p] = []
-    return _abi_cache[p]
-
 def get_pool_contract(pool_name: str):
+    """Pool proxy contract bound to the hand-curated POOL_ABI. Previously this fetched
+    the implementation ABI from Snowtrace per pool (1 API hit on cold cache, often
+    rate-limited); the hand-curated subset covers every function the tool calls."""
     cfg = POOLS[pool_name]
     proxy = Web3.to_checksum_address(cfg["proxy"])
-    abi = get_pool_abi(cfg["proxy"])
     w3 = get_w3()
-    return w3.eth.contract(address=proxy, abi=abi), cfg, w3
+    return w3.eth.contract(address=proxy, abi=POOL_ABI), cfg, w3
 
 # Minimal Prime Account ABI: only the facet functions this tool calls. The diamond
 # beacon's own ABI exposes beacon-management only, so the borrow/repay/fund and
@@ -807,11 +815,20 @@ YAK_ROUTER_ABI = [
 SWAP_ASSETS = {cfg["symbol"]: {"token": cfg["token"], "decimals": cfg["decimals"]}
                for cfg in POOLS.values()}
 
+# SmartLoansFactory ABI — hand-curated minimum surface. createLoan / createAndFundLoan
+# for writes; getLoanForOwner for the per-EOA Prime Account lookup. Previously fetched
+# from Snowtrace per session; the hand-curated subset removes that dependency. Verified
+# against the factory on Snowtrace (2026-05-23).
+FACTORY_ABI = json.loads(
+    '['
+    '{"inputs":[],"name":"createLoan","outputs":[{"type":"address"}],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[{"name":"_fundedAsset","type":"bytes32"},{"name":"_amount","type":"uint256"}],"name":"createAndFundLoan","outputs":[{"type":"address"}],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[{"name":"_user","type":"address"}],"name":"getLoanForOwner","outputs":[{"type":"address"}],"stateMutability":"view","type":"function"}'
+    ']'
+)
+
 def get_factory_contract(w3):
-    abi = get_pool_abi(FACTORY_PROXY)  # proxy->impl resolution via the ABI cache
-    if not abi:
-        raise RuntimeError("Could not fetch SmartLoansFactory ABI from Snowtrace")
-    return w3.eth.contract(address=Web3.to_checksum_address(FACTORY_PROXY), abi=abi)
+    return w3.eth.contract(address=Web3.to_checksum_address(FACTORY_PROXY), abi=FACTORY_ABI)
 
 def get_prime_account(w3, owner: str) -> str:
     """Owner -> Prime Account address. Zero address means none exists yet."""
@@ -877,15 +894,28 @@ REDSTONE_AUTHORISED_SIGNERS = {
     "0x9c5ae89c4af6aa32ce58588dbaf90d18a855b6de",
 }
 
-def _redstone_fetch_packages() -> dict:
+# Per-run cache for the RedStone gateway response — a single command (prime-summary, defi
+# --json, gather_gmx looping markets, swap/lb-add write paths) hits the gateway once
+# instead of per-feed-symbol. Cleared implicitly when the process exits; safe within the
+# RedStone ~3-minute staleness window. Mirrors degenprime's pattern.
+_redstone_gateway_cache = None
+
+def _redstone_fetch_packages(use_cache: bool = True) -> dict:
     """Fetch the latest signed price packages from the RedStone gateway. Returns the
-    per-feed map: {feedSymbol: [package, ...]} with one package per signer."""
+    per-feed map: {feedSymbol: [package, ...]} with one package per signer. The per-run
+    cache lets repeat callers reuse the same snapshot — important for any command that
+    builds multiple payloads (defi --json, gmx multi-market sweeps, prime-activate's
+    two-payload deposit + activate flow)."""
+    global _redstone_gateway_cache
+    if use_cache and _redstone_gateway_cache is not None:
+        return _redstone_gateway_cache
     last_err = None
     for gw in REDSTONE_GATEWAYS:
         try:
             r = requests.get(f"{gw}/data-packages/latest/{REDSTONE_DATA_SERVICE}", timeout=20)
             if r.status_code == 200:
-                return r.json()
+                _redstone_gateway_cache = r.json()
+                return _redstone_gateway_cache
             last_err = f"HTTP {r.status_code}"
         except Exception as e:
             last_err = e
@@ -1036,12 +1066,8 @@ def cmd_my_positions():
     for name, cfg in POOLS.items():
         try:
             contract, _, _ = get_pool_contract(name)
-            token_addr = Web3.to_checksum_address(cfg["token"])
-            tok_abi = get_pool_abi(cfg["token"]) if cfg["proxy"] != cfg["token"] else []
-            if not tok_abi:
-                # Use minimal ERC20 ABI for balance check
-                tok_abi = json.loads('[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}]')
-            token = w3.eth.contract(address=token_addr, abi=tok_abi)
+            token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]),
+                                    abi=ERC20_BALANCE_ABI)
             bal = token.functions.balanceOf(acct.address).call()
             if bal > 0:
                 print(f"  Wallet {cfg['symbol']}: {bal / 10**cfg['decimals']:.4f}")
@@ -1306,22 +1332,37 @@ def gather_lending(w3, account):
     (getTotalValue/getDebt/getHealthRatio/isSolvent) plus best-effort per-asset USD via
     getPrices. Shared by cmd_prime_summary (print) and cmd_defi (--json). Solvency fields
     fall back to None if the RedStone gateway is unreachable or a view reverts."""
-    owned = [a.rstrip(b"\x00").decode(errors="replace") for a in account.functions.getAllOwnedAssets().call()]
+    # One read of getAllOwnedAssets + getDebts feeds both the supplied/borrowed lists
+    # AND the RedStone price feed set, so we inline the feeds derivation here rather
+    # than calling prime_account_price_feeds() (which would repeat both reads).
+    owned_raw = account.functions.getAllOwnedAssets().call()
+    debts_raw = account.functions.getDebts().call()
+    owned = [a.rstrip(b"\x00").decode(errors="replace") for a in owned_raw]
     supplied = []
     for sym in owned:
         bal = account.functions.getBalance(asset_b32(sym)).call()
         supplied.append({"symbol": sym, "raw": bal, "decimals": _asset_decimals(sym),
                          "balance": f"{bal / 10**_asset_decimals(sym):.6f}"})
     borrowed = []
-    for n, v in account.functions.getDebts().call():
+    for n, v in debts_raw:
         sym = n.rstrip(b"\x00").decode(errors="replace")
         if v > 0:
             borrowed.append({"symbol": sym, "raw": v, "decimals": _asset_decimals(sym),
                              "balance": f"{v / 10**_asset_decimals(sym):.6f}"})
+    # Derive the price feeds inline from the already-read assets/debts (mirrors
+    # prime_account_price_feeds but skips its two extra eth_calls). AVAX first.
+    feeds = ["AVAX"]
+    for sym in owned:
+        if sym and sym not in feeds:
+            feeds.append(sym)
+    for n, _v in debts_raw:
+        sym = n.rstrip(b"\x00").decode(errors="replace")
+        if sym and sym not in feeds:
+            feeds.append(sym)
     out = {"supplied": supplied, "borrowed": borrowed,
            "total_value_usd": None, "debt_usd": None, "health_ratio": None, "solvent": None}
     try:
-        payload = build_redstone_payload(prime_account_price_feeds(account))
+        payload = build_redstone_payload(feeds)
         out["total_value_usd"] = redstone_view_call(w3, account, "getTotalValue", payload)[0] / 1e18
         out["debt_usd"] = redstone_view_call(w3, account, "getDebt", payload)[0] / 1e18
         ratio = redstone_view_call(w3, account, "getHealthRatio", payload)[0] / 1e18

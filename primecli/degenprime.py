@@ -193,10 +193,17 @@ _impl_cache = {}
 # collateral too; symbol+decimals reads are pure but cheap to memoise).
 _asset_meta_cache = {}
 
+# Process-local Web3 singleton. Avoids reconstructing the HTTPProvider per command —
+# cmd_pool_info("all") and gather_defi (when added) make many sequential pool reads.
+_W3 = None
+
 def get_w3():
-    """Base RPC client. Base has no POA middleware - it's a standard EVM chain;
-    middleware injection is not needed (and would error on the Base block headers)."""
-    return Web3(Web3.HTTPProvider(BASE_RPC))
+    """Process-local Base RPC client. Base has no POA middleware - it's a standard EVM
+    chain; middleware injection is not needed (and would error on Base block headers)."""
+    global _W3
+    if _W3 is None:
+        _W3 = Web3(Web3.HTTPProvider(BASE_RPC))
+    return _W3
 
 def _tx_gas_price(w3) -> int:
     """Gas price for broadcasts: 2x the current network price with a 1 gwei floor.
