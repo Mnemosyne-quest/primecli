@@ -139,6 +139,7 @@ PARASWAP_EXECUTORS = {
     "0x000010036c0190e009a000d0fc3541100a07380a",
     "0x00c600b30fb0400701010f4b080409018b9006e0",
     "0xa0f408a000017007015e0f00320e470d00090a5b",
+    "0x8faa0000c10015610005ca010ee000d006e0e820",
 }
 
 # RedStone on-demand oracle config for DegenPrime on Base. Verified identical to
@@ -206,11 +207,11 @@ def get_w3():
     return _W3
 
 def _tx_gas_price(w3) -> int:
-    """Gas price for broadcasts: 2x the current network price with a 1 gwei floor.
-    Base's base fee is ~0.001 gwei, so an unfloored tx can strand if the base fee
-    ticks up after submission. The bump guarantees timely inclusion and gives
-    headroom to REPLACE a stranded same-nonce tx. Cost is negligible on Base."""
-    return max(int(w3.eth.gas_price * 2), 10**9)
+    """Gas price for broadcasts: 2x the current network price with a 0.01 gwei floor.
+    Base's base fee is ~0.001 gwei; a 1 gwei floor (Avalanche-level)
+    was 100x over market and priced out gas-heavy ops like create-account on
+    small ETH balances. 0.01 gwei still gives 10x headroom."""
+    return max(int(w3.eth.gas_price * 2), 10**7)
 
 def resolve_private_key():
     """Resolve the signing key per the documented precedence:
@@ -385,7 +386,7 @@ PRIME_ACCOUNT_ABI = [
      "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "isSolvent", "outputs": [{"type": "bool"}],
      "stateMutability": "view", "type": "function"},
-    # getPrices: 1e8-scaled USD prices for the given symbols. RedStone-gated, so a
+    # getPrices: 1e18-scaled USD prices for the given symbols. RedStone-gated, so a
     # payload is appended for the read. swap-debt uses it to value-match the borrow vs
     # repay leg against the facet's own 5% cap (the facet calls the same view internally).
     {"inputs": [{"name": "symbols", "type": "bytes32[]"}], "name": "getPrices",
@@ -546,6 +547,24 @@ def _redstone_fetch_packages(use_cache: bool = True) -> dict:
             last_err = e
     raise RuntimeError(f"RedStone gateway fetch failed: {last_err}")
 
+def _redstone_data_feed_id(sym: str) -> str:
+    """Map a DegenPrime token symbol to its RedStone gateway dataFeedId.
+
+    The Base SolvencyFacet strips the "cb" prefix from dataFeedIds when matching
+    against RedStone packages. So for cb-prefixed tokens (cbBTC, cbXRP, cbDOGE),
+    the correct gateway dataFeedId is the stripped symbol (BTC, XRP, DOGE).
+
+    Returns the mapped feed ID, or the original symbol if no mapping applies."""
+    if sym.startswith("cb") and len(sym) > 2:
+        stripped = sym[2:]
+        try:
+            gw = _redstone_fetch_packages()
+            if stripped in gw:
+                return stripped
+        except Exception:
+            pass
+    return sym
+
 def _redstone_scaled_value(value) -> int:
     """Reconstruct the signed uint256 exactly as RedStone does: parseUnits(Number(value)
     .toFixed(8), 8). See module docstring for why this is the only correct path."""
@@ -585,7 +604,8 @@ def build_redstone_payload(symbols: list) -> bytes:
     gateway = _redstone_fetch_packages()
     packages = []
     for sym in symbols:
-        feed_packages = gateway.get(sym)
+        mapped = _redstone_data_feed_id(sym)
+        feed_packages = gateway.get(mapped)
         if not feed_packages:
             raise RuntimeError(f"RedStone gateway has no feed for '{sym}'")
         authorised = [p for p in feed_packages
@@ -611,13 +631,13 @@ def degen_account_price_feeds(account) -> list:
     feeds = ["ETH"]
     for a in account.functions.getAllOwnedAssets().call():
         sym = a.rstrip(b"\x00").decode(errors="replace")
-        if sym and sym in REDSTONE_AVAILABLE_FEEDS and sym not in feeds:
+        if sym and sym in REDSTONE_AVAILABLE_FEEDS:
             feeds.append(sym)
     for name, _debt in account.functions.getDebts().call():
         sym = name.rstrip(b"\x00").decode(errors="replace")
-        if sym and sym in REDSTONE_AVAILABLE_FEEDS and sym not in feeds:
+        if sym and sym in REDSTONE_AVAILABLE_FEEDS:
             feeds.append(sym)
-    return feeds
+    return list(dict.fromkeys(feeds))
 
 def redstone_view_call(w3, account, fn_name: str, payload: bytes, args: list = None):
     """Read-only call of a RedStone-gated view on the Degen Account. The signed price
@@ -832,6 +852,33 @@ def cmd_my_positions():
             print(f"  Borrowed {cfg['symbol']}: {borrowed / 10**cfg['decimals']:.4f}")
 
     try:
+        # Show pending pool-side withdrawal intents
+        import time
+        intent_abi = [{"inputs":[{"name":"","type":"address"}],"name":"getUserIntents","outputs":[{"type":"tuple[]","components":[{"name":"amount","type":"uint256"},{"name":"actionableAt","type":"uint256"},{"name":"expiresAt","type":"uint256"},{"name":"isPending","type":"bool"},{"name":"isActionable","type":"bool"},{"name":"isExpired","type":"bool"}]}],"stateMutability":"view","type":"function"}]
+        total_abi = [{"inputs":[{"name":"","type":"address"}],"name":"getTotalIntentAmount","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}]
+        had_pool_intents = False
+        for name, cfg in POOLS.items():
+            pool_cs = Web3.to_checksum_address(cfg["proxy"])
+            try:
+                tc = w3.eth.contract(address=pool_cs, abi=total_abi)
+                total = tc.functions.getTotalIntentAmount(acct.address).call()
+                if total > 0:
+                    if not had_pool_intents:
+                        print("\nPool Withdrawal Intents:")
+                        had_pool_intents = True
+                    ic = w3.eth.contract(address=pool_cs, abi=intent_abi)
+                    intents = ic.functions.getUserIntents(acct.address).call()
+                    dec = cfg["decimals"]
+                    sym = cfg["symbol"]
+                    print(f"  {name.upper()} pool: {total / 10**dec:.6f} {sym} locked in {len(intents)} intent(s)")
+                    for j, intent in enumerate(intents):
+                        act = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(intent[1]))
+                        exp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(intent[2]))
+                        state = "READY" if intent[4] else ("EXPIRED" if intent[5] else "pending")
+                        print(f"    [{j}] {intent[0] / 10**dec:.6f} {sym} — {state} (actionable: {act}, expires: {exp})")
+            except Exception:
+                pass  # pool may not have intent views
+
         pa = get_prime_account(w3, acct.address)
         if pa:
             print(f"\nDegen Account: {pa}")
@@ -859,7 +906,7 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
         # ETH -> WETH internally). Same pattern as DeltaPrime's wavax pool.
         tx = contract.functions.deposit(amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 300000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID, "value": amount_wei,
+            "gas": 600000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID, "value": amount_wei,
         })
         signed = acct.sign_transaction(tx)
     else:
@@ -869,11 +916,13 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
             "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
         })
         signed_app = acct.sign_transaction(app_tx)
-        w3.eth.send_raw_transaction(signed_app.raw_transaction)
+        # Wait for approve to be mined before building the deposit tx (nonce race fix)
+        app_hash = w3.eth.send_raw_transaction(signed_app.raw_transaction)
+        w3.eth.wait_for_transaction_receipt(app_hash, timeout=120)
 
         dep_tx = contract.functions.deposit(amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 300000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 600000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
         })
         signed = acct.sign_transaction(dep_tx)
 
@@ -884,33 +933,108 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
     print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
-    """Pool-side (LENDER) withdraw. Instant, no time-lock - this is the savings-pool
-    side. The Degen Account collateral withdraw flow is separate (withdraw-collateral
-    -> 24h delay -> execute-withdrawal).
+    """Pool-side (LENDER) withdraw. DegenPrime uses a 24h time-locked intent
+    system for ALL withdrawals (both pool-side and Degen Account). Step 1 creates
+    a WithdrawalIntent via createWithdrawalIntent; after ~24h, instantWithdraw
+    executes it.
 
-    Always calls the pool's `withdraw()` (returns wrapped tokens to the wallet, even
-    for the WETH pool). The pool also exposes `withdrawNativeToken(uint256)` that
-    would unwrap to native ETH directly; a future --native flag could opt into it."""
+    Always withdraws the wrapped token (WETH for the weth pool, not native ETH).
+    The pool also exposes withdrawNativeToken — future --native flag could opt in."""
     contract, cfg, w3 = get_pool_contract(pool_name)
     acct = get_account()
     amount_wei = int(amount * 10**cfg["decimals"])
     print(f"Wallet: {acct.address}")
 
     if not execute:
-        print(f"Preview: Withdraw {amount} {cfg['symbol']} from {pool_name.upper()} pool")
-        print("  Instant withdrawal from the lending pool (no time-lock).")
+        print(f"Preview: Request withdrawal of {amount} {cfg['symbol']} from {pool_name.upper()} pool")
+        print("  Step 1: createWithdrawalIntent — registers the intent on-chain (no RedStone).")
+        print("  Wait ~24h for the intent to mature, then step 2: instantWithdraw.")
+        print("  Use withdrawal-intents to track pending intents.")
+        print("Run with --execute to broadcast (step 1 only — creates the intent).")
+        return
+
+    # Build createWithdrawalIntent(uint256) calldata
+    tx = {
+        "from": acct.address,
+        "to": contract.address,
+        "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 600000,
+        "gasPrice": _tx_gas_price(w3),
+        "chainId": CHAIN_ID,
+        "data": "0x" + Web3.keccak(text="createWithdrawalIntent(uint256)")[:4].hex() +
+                amount_wei.to_bytes(32, "big").hex(),
+    }
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    ok = receipt["status"] == 1
+    status = "confirmed" if ok else "failed"
+    print(f"{'✓' if ok else '✗'} Withdrawal intent {status}: {amount} {cfg['symbol']} from {pool_name.upper()} pool")
+    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+    if ok:
+        # Read the intent back to show timing
+        import time
+        intent_abi = [{"inputs":[{"name":"","type":"address"}],"name":"getUserIntents","outputs":[{"type":"tuple[]","components":[{"name":"amount","type":"uint256"},{"name":"actionableAt","type":"uint256"},{"name":"expiresAt","type":"uint256"},{"name":"isPending","type":"bool"},{"name":"isActionable","type":"bool"},{"name":"isExpired","type":"bool"}]}],"stateMutability":"view","type":"function"}]
+        ic = w3.eth.contract(address=contract.address, abi=intent_abi)
+        intents = ic.functions.getUserIntents(acct.address).call()
+        if intents:
+            last = intents[-1]
+            act = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(last[1]))
+            exp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(last[2]))
+            print(f"  Intent index: {len(intents)-1}")
+            print(f"  Actionable at: {act}")
+            print(f"  Expires at:    {exp}")
+            print(f"  After maturity, execute: degenprime execute-pool-withdrawal --pool {pool_name} --index {len(intents)-1} --execute")
+            print(f"  Or cancel: degenprime withdraw --pool {pool_name} --amount {amount} --cancel --index {len(intents)-1} --execute")
+
+def cmd_execute_pool_withdrawal(pool_name: str, index: int, execute: bool = False):
+    """Step 2 of pool-side withdrawal: execute a matured WithdrawalIntent via
+    instantWithdraw(uint256 index). The intent must be past its actionableAt
+    timestamp (~24h after creation) and before expiry (~72h). Not RedStone-gated."""
+    contract, cfg, w3 = get_pool_contract(pool_name)
+    acct = get_account()
+    print(f"Wallet: {acct.address}")
+
+    # Check intent status first
+    import time
+    intent_abi = [{"inputs":[{"name":"","type":"address"}],"name":"getUserIntents","outputs":[{"type":"tuple[]","components":[{"name":"amount","type":"uint256"},{"name":"actionableAt","type":"uint256"},{"name":"expiresAt","type":"uint256"},{"name":"isPending","type":"bool"},{"name":"isActionable","type":"bool"},{"name":"isExpired","type":"bool"}]}],"stateMutability":"view","type":"function"}]
+    ic = w3.eth.contract(address=contract.address, abi=intent_abi)
+    intents = ic.functions.getUserIntents(acct.address).call()
+    if index >= len(intents):
+        print(f"Intent index {index} not found — only {len(intents)} intent(s) exist.")
+        return
+    intent = intents[index]
+    amount_str = f"{intent[0] / 10**cfg['decimals']:.6f} {cfg['symbol']}"
+    act_str = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(intent[1]))
+    exp_str = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(intent[2]))
+    print(f"Intent {index}: {amount_str}, actionable={act_str}, expires={exp_str}")
+    if intent[5]:  # isExpired
+        print("  ✗ Intent has expired. Use cancel-withdrawal to clear it.")
+        return
+    if not intent[4]:  # not isActionable
+        print(f"  ✗ Not yet actionable. Wait until {act_str}.")
+        return
+
+    if not execute:
+        print(f"Preview: Execute withdrawal of {amount_str} via instantWithdraw({index})")
         print("Run with --execute to broadcast")
         return
 
-    tx = contract.functions.withdraw(amount_wei).build_transaction({
-        "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 300000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
-    })
+    tx = {
+        "from": acct.address,
+        "to": contract.address,
+        "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 600000,
+        "gasPrice": _tx_gas_price(w3),
+        "chainId": CHAIN_ID,
+        "data": "0x" + Web3.keccak(text="instantWithdraw(uint256)")[:4].hex() +
+                index.to_bytes(32, "big").hex(),
+    }
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Withdraw {amount} {cfg['symbol']} {'confirmed' if ok else 'failed'}")
+    print(f"{'✓' if ok else '✗'} Pool withdrawal {'confirmed' if ok else 'failed'}: {amount_str}")
     print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 # ─── Degen Account commands ──────────────────────────────────────────────────
@@ -971,7 +1095,9 @@ def cmd_create_account(execute: bool = False, fund_pool: str = None, fund_amount
             "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
         })
         signed_app = acct.sign_transaction(app_tx)
-        w3.eth.send_raw_transaction(signed_app.raw_transaction)
+        # Wait for approve to be mined before calling createAndFundLoan (nonce race fix)
+        app_hash = w3.eth.send_raw_transaction(signed_app.raw_transaction)
+        w3.eth.wait_for_transaction_receipt(app_hash, timeout=120)
 
         tx = factory.functions.createAndFundLoan(asset_b32(symbol), amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
@@ -1049,7 +1175,9 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
             "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
         })
         signed_app = acct.sign_transaction(app_tx)
-        w3.eth.send_raw_transaction(signed_app.raw_transaction)
+        # Wait for approve to be mined before building the fund tx (nonce race fix)
+        app_hash = w3.eth.send_raw_transaction(signed_app.raw_transaction)
+        w3.eth.wait_for_transaction_receipt(app_hash, timeout=120)
 
         fund_tx = account.functions.fund(asset_b32(symbol), amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
@@ -1066,7 +1194,7 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
 
 def _prices_usd(w3, account, symbols: list, payload: bytes) -> dict:
     """Best-effort per-symbol USD price map via the RedStone-gated getPrices view
-    (1e8-scaled). Reuses an already-built `payload`; returns {symbol: float}. Symbols
+    (1e18-scaled). Reuses an already-built `payload`; returns {symbol: float}. Symbols
     without a RedStone feed are filtered out before the call - the SolvencyFacet
     reverts on a getPrices request for a symbol whose feed isn't in the payload."""
     syms = [s for s in dict.fromkeys(symbols) if s and s in REDSTONE_AVAILABLE_FEEDS]
@@ -1075,7 +1203,7 @@ def _prices_usd(w3, account, symbols: list, payload: bytes) -> dict:
     try:
         raw = redstone_view_call(w3, account, "getPrices", payload,
                                  args=[[asset_b32(s) for s in syms]])[0]
-        return {s: raw[i] / 1e8 for i, s in enumerate(syms)}
+        return {s: raw[i] / 1e18 for i, s in enumerate(syms)}
     except Exception:
         return {}
 
@@ -1088,8 +1216,9 @@ def cmd_summary(as_json: bool = False):
     balance-only (the SolvencyFacet still values them for the total/debt figures).
 
     With --json: emits a single JSON object covering wallet, account, native
-    balance, per-asset supplied/borrowed with optional USD, total/debt/health-ratio/
-    solvent flags. Null fields, empty lists, and empty dicts are dropped (same
+    balance, per-asset supplied/borrowed with optional USD, poolDeposits (the EOA's
+    'Diamond Hands' lending-pool balances, emitted even with no Degen Account),
+    total/debt/health-ratio/solvent flags. Null fields, empty lists, and empty dicts are dropped (same
     trim contract as `deltaprime defi --json`). Numeric 0 and boolean false are
     preserved.
 
@@ -1102,11 +1231,45 @@ def cmd_summary(as_json: bool = False):
     pa = get_prime_account(w3, acct.address)
     if not as_json:
         print(f"Wallet: {acct.address}")
+
+    # Pool deposits ("Diamond Hands") are EOA balances independent of the Degen Account,
+    # so read them up front via one Multicall3 — they must surface even for a wallet with
+    # no Degen Account (e.g. a deposit made before creating one).
+    pool_deposits = []
+    dep_legs, dep_meta = [], []
+    for _pname, _pcfg in POOLS.items():
+        try:
+            _pc, _, _ = get_pool_contract(_pname)
+        except Exception:
+            continue
+        _proxy_cs = Web3.to_checksum_address(_pcfg["proxy"])
+        dep_legs.append((_proxy_cs, bytes.fromhex(_pc.encode_abi("balanceOf", args=[acct.address])[2:])))
+        dep_meta.append(_pcfg)
+    if dep_legs:
+        try:
+            dep_results = multicall(w3, dep_legs)
+        except Exception:
+            dep_results = [(False, b"")] * len(dep_legs)
+        for _pcfg, (_ok, _rd) in zip(dep_meta, dep_results):
+            _bal = w3.codec.decode(["uint256"], _rd)[0] if _ok and _rd else 0
+            if _bal > 0:
+                pool_deposits.append({"symbol": _pcfg["symbol"], "raw": _bal, "decimals": _pcfg["decimals"]})
+
     if not pa:
+        # No Degen Account: still surface Diamond Hands deposits (balance-only — the
+        # RedStone getPrices view lives on the Degen Account, absent here).
         if as_json:
-            print(json.dumps({"wallet": acct.address, "account": None}, indent=2))
+            out = {"wallet": acct.address, "account": None}
+            if pool_deposits:
+                out["poolDeposits"] = [{"symbol": r["symbol"], "amount": r["raw"] / 10**r["decimals"]}
+                                       for r in pool_deposits]
+            print(json.dumps(out, indent=2))
         else:
             print("No Degen Account yet. Create one with: degenprime create-account --execute")
+            if pool_deposits:
+                print("  Pool Deposits (Diamond Hands):")
+                for r in pool_deposits:
+                    print(f"    {r['symbol']:<8} {r['raw'] / 10**r['decimals']:,.6f}")
         return
 
     pa_eth = w3.eth.get_balance(pa) / 1e18
@@ -1150,9 +1313,14 @@ def cmd_summary(as_json: bool = False):
     solvency = {"total": None, "debt": None, "ratio": None, "solvent": None, "error": None, "prices": {}}
     try:
         feeds = degen_account_price_feeds(account)
+        # Pool-deposit assets need their feeds in the payload too, else getPrices reverts
+        # on any deposit symbol whose feed the Degen Account doesn't already carry.
+        for _dr in pool_deposits:
+            if _dr["symbol"] in REDSTONE_AVAILABLE_FEEDS and _dr["symbol"] not in feeds:
+                feeds.append(_dr["symbol"])
         payload = build_redstone_payload(feeds)
         payload_hex = payload.hex()
-        price_syms = [s for s in dict.fromkeys(r["symbol"] for r in supplied + borrowed)
+        price_syms = [s for s in dict.fromkeys(r["symbol"] for r in supplied + borrowed + pool_deposits)
                       if s and s in REDSTONE_AVAILABLE_FEEDS]
         solv_legs = [
             ("getTotalValue", ["uint256"], account.encode_abi("getTotalValue", args=[])),
@@ -1191,7 +1359,7 @@ def cmd_summary(as_json: bool = False):
             raw_prices = decoded_solv["getPrices"]
             for i, s in enumerate(price_syms):
                 if i < len(raw_prices):
-                    prices[s] = raw_prices[i] / 1e8
+                    prices[s] = raw_prices[i] / 1e18
         solvency["prices"] = prices
     except Exception as e:
         solvency["error"] = type(e).__name__
@@ -1210,6 +1378,7 @@ def cmd_summary(as_json: bool = False):
             "nativeBalance": pa_eth if pa_eth >= 1e-9 else None,
             "supplied": [_asset_row(r) for r in supplied],
             "borrowed": [_asset_row(r) for r in borrowed],
+            "poolDeposits": [_asset_row(r) for r in pool_deposits],
             "totalValueUsd": solvency["total"],
             "debtUsd": solvency["debt"],
             "healthRatio": solvency["ratio"],
@@ -1239,6 +1408,13 @@ def cmd_summary(as_json: bool = False):
             print(f"    {r['symbol']:<8} {r['raw'] / 10**r['decimals']:,.6f}{usd_str}")
     else:
         print("    (none)")
+
+    if pool_deposits:
+        print("  Pool Deposits (Diamond Hands):")
+        for r in pool_deposits:
+            usd = solvency["prices"].get(r["symbol"])
+            usd_str = f"  (~${r['raw'] / 10**r['decimals'] * usd:,.2f})" if usd is not None else ""
+            print(f"    {r['symbol']:<8} {r['raw'] / 10**r['decimals']:,.6f}{usd_str}")
 
     if solvency["error"] is None:
         print(f"  Total value:        ${solvency['total']:,.2f}")
@@ -1578,7 +1754,7 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
 _SYMBOL_TO_POOL = {cfg["symbol"]: name for name, cfg in POOLS.items()}
 
 def _read_prices_usd(w3, account, symbols, payload):
-    """RedStone-gated getPrices read for `symbols` (1e8-scaled USD), payload appended.
+    """RedStone-gated getPrices read for `symbols` (1e18-scaled USD), payload appended.
     Used by swap-debt to value-match the borrow vs repay leg against the facet's own
     5% cap (same numbers the contract sees). Symbols must all have RedStone feeds."""
     data = account.encode_abi("getPrices", args=[[asset_b32(s) for s in symbols]]) + payload.hex()
@@ -1642,8 +1818,8 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         print("Computed borrow amount rounds to zero - repay amount too small. Refusing.")
         return
 
-    repay_usd = price_from * repay_amount / 10**from_cfg["decimals"] / 1e8
-    borrow_usd = price_to * borrow_amount / 10**to_cfg["decimals"] / 1e8
+    repay_usd = price_from * repay_amount / 10**from_cfg["decimals"] / 1e18
+    borrow_usd = price_to * borrow_amount / 10**to_cfg["decimals"] / 1e18
     diff_bps = (abs(repay_usd - borrow_usd) / max(repay_usd, borrow_usd)) * 10000 if max(repay_usd, borrow_usd) else 0
 
     price_route = _paraswap_price_route(to_cfg["token"], to_cfg["decimals"],
@@ -1656,7 +1832,7 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     selector_hex, data_bytes = "0x" + full[:4].hex(), full[4:]
     _exec, _src, _dest, _swap_from_amt, swap_min_out = _paraswap_decode_and_check(
         selector_hex, data_bytes, to_cfg["token"], from_cfg["token"], borrow_amount, pa_cs)
-    if _exec.lower() not in PARASWAP_EXECUTORS:
+    if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
         fallback_bytes = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:])
         data_bytes = fallback_bytes + data_bytes[32:]
         print(f"  ⚠ Executor {_exec} not whitelisted; patching to {_PARASWAP_FALLBACK_EXECUTOR}")
@@ -1753,7 +1929,7 @@ def cmd_withdraw_collateral(pool_name: str, amount: float, execute: bool = False
     if amount_wei > available:
         print(f"  ✗ Requested {amount} {symbol} exceeds available balance. Refusing.")
         return
-    print(f"  Calls createWithdrawalIntent(bytes32 '{symbol}', {amount_wei}) - no RedStone payload needed.")
+    print(f"  Calls createWithdrawalIntent(bytes32 '{symbol}', {amount_wei}) — RedStone-gated on Base (known issue: facet rejects standard signers).")
     print("  Universal time-lock: becomes executable ~24h later, then has a 48h window (24h-72h total).")
     print("  Run `execute-withdrawal --pool <p>` after maturity to pull the funds to the wallet.")
 
@@ -2135,6 +2311,19 @@ def _dispatch():
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
             return
         cmd_cancel_withdrawal(pool, index, execute)
+    elif cmd == "execute-pool-withdrawal":
+        pool, index = None, None
+        execute = "--execute" in args
+        for i, a in enumerate(args):
+            if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
+            if a == "--index" and i + 1 < len(args): index = int(args[i + 1])
+        if not pool or index is None:
+            print("Usage: degenprime execute-pool-withdrawal --pool usdc --index N [--execute]")
+            return
+        if pool not in POOLS:
+            print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
+            return
+        cmd_execute_pool_withdrawal(pool, index, execute)
     elif cmd == "aerodrome-positions":
         cmd_aerodrome_positions()
     else:

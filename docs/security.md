@@ -43,9 +43,7 @@ PARASWAP_EXECUTORS = {
 }
 ```
 
-If the ParaSwap API returns an executor not in this set, the tool emits a warning and patches the calldata to the known-good fallback executor `0x000010036C0190E009a000d0fc3541100A07380A` (the canonical legacy executor whose calldata format is compatible with the current API's output). This stops on-chain `InvalidExecutor()` reverts when ParaSwap rotates its executor set.
-
-The fallback is best-effort. If the on-chain allowlist itself rotates (e.g. DeltaPrime or DegenPrime governance adds a new executor), the local mirror needs updating to match. Open an issue if you see persistent `InvalidExecutor` reverts.
+**Current status (v0.2.2, 2026-05-29) — ParaSwap path BLOCKED upstream.** The ParaSwap API now routinely emits router methods and executors that the on-chain facet does not decode or whitelist. The previous "executor patch" was always cosmetic and is removed in v0.2.2 — the tool now refuses cleanly at the entry point with a pointer to the tracking issue, rather than emit calldata that would revert on broadcast. Both `swap --via paraswap` and `swap-debt` are dead end-to-end until DeltaPrime governance refreshes `ParaSwapFacet.PARASWAP_SUPPORTED_SELECTORS` / `PARASWAP_EXECUTORS`. **Workarounds:** use `--via yak` for swaps (the default), and compose `borrow → swap --via yak → repay` manually as three txs for refinances. Tracking: https://github.com/Mnemosyne-quest/primecli/issues/2
 
 ## RedStone trust model
 
@@ -87,7 +85,7 @@ The tool refuses preview when a request would exceed these caps, with a clear me
 ## What this tool DOES protect against
 
 - **Malformed ParaSwap calldata.** The tool decodes the API's calldata client-side, validates `src` / `dest` / `from` / `beneficiary` / `partner` / `feeBps` against the on-chain facet's expectations, and refuses on mismatch.
-- **Non-whitelisted ParaSwap executors.** The tool warns and patches to the known-good fallback executor before broadcasting.
+- **Non-whitelisted ParaSwap executors / unsupported router methods.** As of v0.2.2 the tool refuses cleanly at the entry point with a pointer to https://github.com/Mnemosyne-quest/primecli/issues/2 rather than try to patch broken calldata. Use `--via yak` instead.
 - **Partial repays.** `repay` auto-caps to `min(requested, current debt, in-account balance)` so an overshoot doesn't revert.
 - **Bin-cap violations.** `lb-add` previews the projected total bin count and refuses if it would exceed 80.
 - **GMX execution-fee underfunding.** The tool floors the gas price at 25 gwei when estimating the GMX execution fee, so the keeper accepts the deposit.

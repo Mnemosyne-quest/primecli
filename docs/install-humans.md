@@ -157,6 +157,10 @@ deltaprime deposit --pool usdc --amount 100 --execute
 
 The preview tells you exactly which contract will be called and how the funds will move. **Always read it before adding `--execute`.**
 
+### Heads-up: lender withdraw is 24h-delayed
+
+Both `deltaprime withdraw` and `degenprime withdraw` register a **withdrawal intent** that becomes executable ~24h later for a 48h window (24h-72h total). You don't get the funds back in one tx. To pull a matured intent: `deltaprime withdrawal-requests` (lists pending intents) → wait for maturity → `deltaprime execute-withdrawal-request --pool <p> --execute`. To cancel before maturity: `deltaprime cancel-withdrawal-request --pool <p> --index N --execute`.
+
 ## Common gotchas
 
 - **"command not found: deltaprime"** — your venv isn't active. Run `source ~/primecli-env/bin/activate` again.

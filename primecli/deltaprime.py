@@ -10,7 +10,10 @@ Usage:
   deltaprime pool-info [usdc|wavax|weth|btc|usdt|all] [--json]
   deltaprime my-positions
   deltaprime deposit --pool usdc --amount 100 [--execute]
-  deltaprime withdraw --pool usdc --amount 100 [--execute]
+  deltaprime withdraw --pool usdc --amount 100 [--execute]                       (24h delayed; step 1)
+  deltaprime withdrawal-requests                                                 (lists pending lender intents)
+  deltaprime execute-withdrawal-request --pool usdc [--index N] [--execute]      (step 2; post-maturity)
+  deltaprime cancel-withdrawal-request --pool usdc --index N [--execute]
   deltaprime create-prime-account [--execute]   (alias: create-account)
   deltaprime create-prime-account --fund-pool usdc --fund-amount 100 [--execute]
   deltaprime prime-summary
@@ -52,13 +55,18 @@ prime-summary reports live solvency (health ratio, total value, debt, solvent fl
 SolvencyFacetProdAvalanche, read via eth_call with a RedStone price payload appended (falls
 back to balances-only if the gateway is unreachable).
 
-Collateral withdrawal is a two-step, time-delayed flow on the Prime Account (there is NO
-instant withdraw of in-account collateral; the savings-pool `withdraw` above is separate).
-withdraw-collateral registers a WithdrawalIntent (createWithdrawalIntent, no RedStone). The
-intent becomes executable ~24h later for a 48h window (24h-72h total); execute-withdrawal
-then pulls it to the wallet (executeWithdrawalIntent, RedStone-gated). withdrawal-intents
-lists pending intents + per-asset available balance (oracle-free reads). The maturity window
-and ready/expired state come straight off-chain from the IntentInfo struct.
+The savings-pool lender side `withdraw` is ALSO a two-step, time-delayed intent flow —
+the pool's plain `withdraw(uint256)` reverts. Step 1: `deltaprime withdraw --pool X
+--amount Y` calls the pool's `createWithdrawalIntent(uint256)`. Step 2 (after the 24h
+maturity, within the 48h execution window): `execute-withdrawal-request --pool X`
+calls `executeWithdrawalIntent(uint256[])`. `withdrawal-requests` lists pending lender
+intents per pool; `cancel-withdrawal-request --pool X --index N` cancels a pending one
+via `cancelWithdrawalIntent(uint256)`. Storage is per-EOA on the pool (NOT the Prime
+Account address). No RedStone on any of these.
+
+Collateral withdrawal on the Prime Account is the separate `WithdrawalIntentFacet` flow:
+withdraw-collateral / withdrawal-intents / execute-withdrawal. Same 24h-72h shape; the
+execute step is RedStone-gated (the create step is not).
 
 Leverage flow: create-prime-account -> fund (collateral) -> borrow -> repay -> withdraw.
 fund moves collateral from the wallet into the Prime Account; borrow needs a funded
@@ -251,6 +259,34 @@ YAK_ROUTER = "0xC4729E56b831d74bBc18797e0e17A295fA77488c"
 PARASWAP_API = "https://apiv5.paraswap.io"
 PARASWAP_AUGUSTUS = "0x6A000F20005980200259B80c5102003040001068"
 PARASWAP_SUPPORTED_SELECTORS = {"0xe3ead59e", "0x876a02f6"}
+
+# As of 2026-05-29 the ParaSwap API routinely emits router methods (directUniV3Swap,
+# simpleSwap, multiSwap, megaSwap…) and executors NOT in the on-chain ParaSwapFacet /
+# SwapDebtFacet allowlists below. This is an on-chain governance issue — the facets
+# need their PARASWAP_SUPPORTED_SELECTORS / PARASWAP_EXECUTORS allowlists refreshed
+# by DeltaPrime governance. Until then, any --via paraswap swap or swap-debt will
+# revert on broadcast. Tool refuses cleanly with a pointer to the tracking issue.
+PARASWAP_GOVERNANCE_ISSUE = "https://github.com/Mnemosyne-quest/primecli/issues/2"
+PARASWAP_BLOCKED_MESSAGE = (
+    "error: ParaSwap API currently emits router methods / executors that are not on\n"
+    "DeltaPrime's on-chain ParaSwapFacet allowlist. This is an on-chain governance\n"
+    "issue, not a tool issue. Use --via yak instead (the default), or wait for\n"
+    "DeltaPrime governance to refresh the allowlist.\n"
+    f"See: {PARASWAP_GOVERNANCE_ISSUE}"
+)
+SWAP_DEBT_BLOCKED_MESSAGE = (
+    "error: swap-debt routes through SwapDebtFacet.swapDebtParaSwap, which uses the\n"
+    "same ParaSwap allowlist as paraSwapV6 — and that allowlist is currently out of\n"
+    "date on-chain (the API emits router methods / executors the facet does not\n"
+    "decode or whitelist). swap-debt is therefore blocked until DeltaPrime governance\n"
+    "refreshes the facet allowlist.\n"
+    "Manual fallback: compose the refinance as three commands (will need ~$gas + a\n"
+    "moment of unfunded health while the leg is open):\n"
+    "  deltaprime borrow --pool <new> --amount N --execute\n"
+    "  deltaprime swap --via yak --from <new-symbol> --to <old-symbol> --amount N --execute\n"
+    "  deltaprime repay --pool <old> --amount N --execute\n"
+    f"See: {PARASWAP_GOVERNANCE_ISSUE}"
+)
 # Executors the facet whitelists (ParaSwapHelper._checkExecutorAddress). Lowercased.
 PARASWAP_EXECUTORS = {
     # Must match the ParaSwap executor whitelist on DeltaPrime's ParaSwapFacet and
@@ -262,6 +298,7 @@ PARASWAP_EXECUTORS = {
     "0x000010036c0190e009a000d0fc3541100a07380a",
     "0x00c600b30fb0400701010f4b080409018b9006e0",
     "0xa0f408a000017007015e0f00320e470d00090a5b",
+    # 0x8faa... (Velora) returned by API but NOT whitelisted on-chain — confirmed 2026-05-28 & 2026-05-29
 }
 
 # RedStone on-demand oracle config for DeltaPrime on Avalanche. The Prime Account's
@@ -506,10 +543,22 @@ ERC20_BALANCE_ABI = json.loads(
 # `pool-info all` on cold cache, rate-limited); the hand-curated ABI removes that
 # dependency entirely. Rates are 1e18-scaled annualised (same shape as DegenPrime's
 # pool, verified on Snowtrace 2026-05-23 / 2026-05-29).
+# Pool ABI. `withdraw(uint256)` is included for the historical/instant path BUT the
+# lender side now runs through the same delayed-intent flow as the Prime Account
+# collateral side: createWithdrawalIntent registers, executeWithdrawalIntent pulls
+# after the 24h maturity, cancelWithdrawalIntent kills a pending one. Intent storage
+# is per-EOA (the wallet address, NOT the Prime Account address). Confirmed on the
+# wavax pool 0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4 2026-05-29. Signatures match
+# the Prime Account WithdrawalIntentFacet's IntentInfo shape.
 POOL_ABI = json.loads(
     '['
     '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"deposit","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[{"name":"amount","type":"uint256"}],"name":"createWithdrawalIntent","outputs":[],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[{"name":"intentIndices","type":"uint256[]"}],"name":"executeWithdrawalIntent","outputs":[],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[{"name":"index","type":"uint256"}],"name":"cancelWithdrawalIntent","outputs":[],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[{"name":"user","type":"address"}],"name":"getUserIntents","outputs":[{"components":[{"name":"amount","type":"uint256"},{"name":"actionableAt","type":"uint256"},{"name":"expiresAt","type":"uint256"},{"name":"isPending","type":"bool"},{"name":"isActionable","type":"bool"},{"name":"isExpired","type":"bool"}],"type":"tuple[]"}],"stateMutability":"view","type":"function"},'
+    '{"inputs":[{"name":"user","type":"address"}],"name":"getTotalIntentAmount","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
     '{"inputs":[],"name":"totalSupply","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
     '{"inputs":[],"name":"totalBorrowed","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
     '{"inputs":[],"name":"getDepositRate","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
@@ -1311,25 +1360,195 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
     print(f"{'✓' if ok else '✗'} Deposit {amount} {cfg['symbol']} {'confirmed' if ok else 'failed'}")
     print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
+def _fmt_window(actionable_at: int, expires_at: int) -> str:
+    """Human one-liner for a withdrawal intent's maturity window, anchored to chain
+    time. Used for both pool-side (lender) and Prime Account (collateral) intents —
+    the IntentInfo shape is identical on both sides."""
+    now = int(time.time())
+    def rel(ts):
+        d = ts - now
+        sign = "in" if d >= 0 else "ago"
+        d = abs(d)
+        h, m = d // 3600, (d % 3600) // 60
+        span = f"{h}h{m:02d}m" if h else f"{m}m"
+        return f"{sign} {span}" if sign == "in" else f"{span} {sign}"
+    a = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(actionable_at))
+    e = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expires_at))
+    return f"actionable {a} ({rel(actionable_at)}), expires {e} ({rel(expires_at)})"
+
 def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
+    """Pool-side (LENDER) withdraw — step 1 of a 24h delayed flow.
+
+    Registers a WithdrawalIntent on the pool via createWithdrawalIntent(uint256).
+    The pool's own `withdraw(uint256)` reverts: the lender side has the SAME
+    delayed-intent flow as the Prime Account collateral side. The intent matures
+    24h after registration and is then executable for 48h (24h-72h total window).
+    Run `execute-withdrawal-request --pool <p>` after maturity to pull funds.
+    """
     contract, cfg, w3 = get_pool_contract(pool_name)
     acct = get_account()
     amount_wei = int(amount * 10**cfg["decimals"])
 
-    if not execute:
-        print(f"Preview: Withdraw {amount} {cfg['symbol']} from {pool_name.upper()} pool")
-        print("Run with --execute to broadcast")
+    # getBalanceOf is the lender's current deposit balance — sane upper bound for
+    # the intent amount. The pool reverts "Amount must be greater than zero" on 0,
+    # and reverts on amount > deposit.
+    balance = contract.functions.balanceOf(acct.address).call()
+    print(f"Create lender withdrawal intent: {amount} {cfg['symbol']} from {pool_name.upper()} pool")
+    print(f"  Wallet: {acct.address}")
+    print(f"  Current pool deposit: {balance / 10**cfg['decimals']:.6f} {cfg['symbol']}")
+    print(f"  Calls createWithdrawalIntent({amount_wei}) — no RedStone payload needed.")
+    print("  Delayed flow: becomes executable ~24h later, then has a 48h window (24h-72h total).")
+    print(f"  Run `execute-withdrawal-request --pool {pool_name}` after maturity to pull the funds to the wallet.")
+    if amount_wei == 0:
+        print(f"  ✗ Amount must be greater than zero. Refusing.")
+        return
+    if amount_wei > balance:
+        print(f"  ✗ Requested {amount} {cfg['symbol']} exceeds current pool deposit. Refusing.")
         return
 
-    tx = contract.functions.withdraw(amount_wei).build_transaction({
+    if not execute:
+        print("Run with --execute to broadcast (registers the intent on-chain).")
+        return
+
+    tx = contract.functions.createWithdrawalIntent(amount_wei).build_transaction({
         "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 200000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 400000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
     })
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Withdraw {amount} {cfg['symbol']} {'confirmed' if ok else 'failed'}")
+    print(f"{'✓' if ok else '✗'} Lender withdrawal intent {'registered' if ok else 'failed'}")
+    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+
+def cmd_withdrawal_requests():
+    """Read-only: list pending lender withdrawal intents per pool, with current deposit.
+    Uses the oracle-free pool views getUserIntents / getTotalIntentAmount — no RedStone,
+    no tx. Intent storage is per-EOA on the pool (NOT the Prime Account)."""
+    w3 = get_w3()
+    acct = get_account()
+    print(f"Wallet: {acct.address}")
+    any_pending = False
+    for pool_name, cfg in POOLS.items():
+        contract = w3.eth.contract(address=Web3.to_checksum_address(cfg["proxy"]), abi=POOL_ABI)
+        balance = contract.functions.balanceOf(acct.address).call()
+        total_intent = contract.functions.getTotalIntentAmount(acct.address).call()
+        intents = contract.functions.getUserIntents(acct.address).call()
+        if balance == 0 and not intents:
+            continue
+        dec = cfg["decimals"]
+        sym = cfg["symbol"]
+        print(f"  {pool_name.upper()} ({sym}): deposit {balance / 10**dec:,.6f}, "
+              f"pending intents {total_intent / 10**dec:,.6f}")
+        for idx, (amt, actionable_at, expires_at, is_pending, is_actionable, is_expired) in enumerate(intents):
+            any_pending = True
+            if is_expired:
+                state = "EXPIRED"
+            elif is_actionable:
+                state = "READY to execute"
+            elif is_pending:
+                state = "maturing"
+            else:
+                state = "inactive"
+            print(f"    [{idx}] {amt / 10**dec:,.6f} {sym} — {state}")
+            print(f"         {_fmt_window(actionable_at, expires_at)}")
+    if not any_pending:
+        print("  No pending lender withdrawal intents.")
+
+def cmd_execute_withdrawal_request(pool_name: str, index: int = None, execute: bool = False):
+    """Step 2 of lender pool withdrawal: executeWithdrawalIntent(uint256[] indices)
+    pulls matured intent(s) on the pool back to the EOA's wallet. Refuses any intent
+    that has not matured (isActionable=false) or has expired. --index selects one
+    intent; default executes all currently-actionable intents (indices passed strictly
+    increasing, as the contract requires)."""
+    contract, cfg, w3 = get_pool_contract(pool_name)
+    acct = get_account()
+    intents = contract.functions.getUserIntents(acct.address).call()
+    if not intents:
+        print(f"No lender withdrawal intents registered for {pool_name.upper()}.")
+        print(f"Register one first: withdraw --pool {pool_name} --amount <n> --execute")
+        return
+
+    if index is not None:
+        if index < 0 or index >= len(intents):
+            print(f"--index {index} out of range (pool has {len(intents)} intent(s)).")
+            return
+        candidates = [index]
+    else:
+        candidates = [i for i, it in enumerate(intents) if it[4]]  # isActionable
+
+    print(f"Execute lender withdrawal from {pool_name.upper()} pool")
+    print(f"  Wallet: {acct.address}")
+    ready = []
+    for i in candidates:
+        amt, actionable_at, expires_at, is_pending, is_actionable, is_expired = intents[i]
+        print(f"  [{i}] {amt / 10**cfg['decimals']:,.6f} {cfg['symbol']} — "
+              f"{'EXPIRED' if is_expired else 'READY' if is_actionable else 'NOT MATURED'}")
+        print(f"       {_fmt_window(actionable_at, expires_at)}")
+        if is_expired:
+            print(f"       ✗ intent [{i}] has expired — cancel it instead.")
+        elif not is_actionable:
+            print(f"       ✗ intent [{i}] has not matured yet — refusing.")
+        else:
+            ready.append(i)
+
+    if not ready:
+        print("  No matured, non-expired intents to execute. Refusing.")
+        return
+    ready.sort()  # contract requires strictly-increasing indices
+    print(f"  Will execute indices {ready} via executeWithdrawalIntent({ready}).")
+
+    if not execute:
+        print("Run with --execute to broadcast (pulls the funds to the wallet).")
+        return
+
+    tx = contract.functions.executeWithdrawalIntent(ready).build_transaction({
+        "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 600000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+    })
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    ok = receipt["status"] == 1
+    print(f"{'✓' if ok else '✗'} Execute lender withdrawal {'confirmed' if ok else 'failed'}")
+    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+
+def cmd_cancel_withdrawal_request(pool_name: str, index: int, execute: bool = False):
+    """Cancel a pending lender withdrawal intent on the pool via
+    cancelWithdrawalIntent(uint256 index). Reverts with `Invalid intent index` if the
+    index is out of range or already cleared. Useful before maturity to free up the
+    balance for another use."""
+    contract, cfg, w3 = get_pool_contract(pool_name)
+    acct = get_account()
+    intents = contract.functions.getUserIntents(acct.address).call()
+    if not intents:
+        print(f"No lender withdrawal intents registered for {pool_name.upper()}.")
+        return
+    if index < 0 or index >= len(intents):
+        print(f"--index {index} out of range (pool has {len(intents)} intent(s)).")
+        return
+
+    amt, actionable_at, expires_at, is_pending, is_actionable, is_expired = intents[index]
+    print(f"Cancel lender withdrawal intent on {pool_name.upper()} pool")
+    print(f"  Wallet: {acct.address}")
+    print(f"  [{index}] {amt / 10**cfg['decimals']:,.6f} {cfg['symbol']} — "
+          f"{'EXPIRED' if is_expired else 'READY' if is_actionable else 'maturing'}")
+    print(f"       {_fmt_window(actionable_at, expires_at)}")
+    print(f"  Calls cancelWithdrawalIntent({index}).")
+
+    if not execute:
+        print("Run with --execute to broadcast (cancels the intent on-chain).")
+        return
+
+    tx = contract.functions.cancelWithdrawalIntent(index).build_transaction({
+        "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 300000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+    })
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    ok = receipt["status"] == 1
+    print(f"{'✓' if ok else '✗'} Cancel lender withdrawal intent {'confirmed' if ok else 'failed'}")
     print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 # ─── Prime Account commands ──────────────────────────────────────────────────
@@ -1890,25 +2109,46 @@ def _paraswap_decode_and_check(selector_hex, data_bytes, src_token, dest_token, 
 def _swap_via_paraswap(w3, acct, pa_cs, account, from_sym, to_sym, from_cfg, to_cfg,
                        amount, amount_in, slippage_pct, execute):
     """ParaSwap leg of cmd_swap. Builds the Velora calldata for an in-account
-    from_sym->to_sym swap and (on --execute) calls paraSwapV6 with a RedStone payload."""
-    price_route = _paraswap_price_route(from_cfg["token"], from_cfg["decimals"],
-                                        to_cfg["token"], to_cfg["decimals"], amount_in, pa_cs)
+    from_sym->to_sym swap and (on --execute) calls paraSwapV6 with a RedStone payload.
+
+    If the API returns a router method or executor that is NOT on the on-chain
+    ParaSwapFacet allowlist (PARASWAP_SUPPORTED_SELECTORS / PARASWAP_EXECUTORS), this
+    refuses cleanly — see PARASWAP_GOVERNANCE_ISSUE. The historical executor-bytes
+    auto-patch was always cosmetic and is removed; refusing is the honest behaviour."""
+    try:
+        price_route = _paraswap_price_route(from_cfg["token"], from_cfg["decimals"],
+                                            to_cfg["token"], to_cfg["decimals"], amount_in, pa_cs)
+    except RuntimeError as e:
+        print(f"  ParaSwap API: {e}")
+        print(PARASWAP_BLOCKED_MESSAGE)
+        sys.exit(1)
     quoted_out = int(price_route["destAmount"])
-    tx_built = _paraswap_build_tx(price_route, from_cfg["token"], from_cfg["decimals"],
-                                  to_cfg["token"], to_cfg["decimals"], amount_in,
-                                  slippage_pct, pa_cs)
+    try:
+        tx_built = _paraswap_build_tx(price_route, from_cfg["token"], from_cfg["decimals"],
+                                      to_cfg["token"], to_cfg["decimals"], amount_in,
+                                      slippage_pct, pa_cs)
+    except RuntimeError as e:
+        print(f"  ParaSwap API: {e}")
+        print(PARASWAP_BLOCKED_MESSAGE)
+        sys.exit(1)
     full = bytes.fromhex(tx_built["data"][2:])
     selector_hex, data_bytes = "0x" + full[:4].hex(), full[4:]
+    # Refuse if the API emitted a selector the facet does not decode.
+    if selector_hex not in PARASWAP_SUPPORTED_SELECTORS:
+        print(f"  ParaSwap API returned router method {selector_hex} "
+              f"({price_route.get('contractMethod','?')}).")
+        print(f"  The DeltaPrime ParaSwapFacet only decodes "
+              f"{sorted(PARASWAP_SUPPORTED_SELECTORS)} — broadcasting would revert.")
+        print(PARASWAP_BLOCKED_MESSAGE)
+        sys.exit(1)
     _exec, _src, _dest, from_amt, min_out = _paraswap_decode_and_check(
         selector_hex, data_bytes, from_cfg["token"], to_cfg["token"], amount_in, pa_cs)
-    # Same executor-patching as swap-debt (see cmd_swap_debt for full rationale).
-    _PARASWAP_FALLBACK_EXECUTOR = "0x000010036C0190E009a000d0fc3541100A07380A"
     if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
-        fallback_bytes = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:])
-        data_bytes = fallback_bytes + data_bytes[32:]
-        print(f"  ⚠ Executor {_exec} not whitelisted; patching to {_PARASWAP_FALLBACK_EXECUTOR}")
-        _paraswap_decode_and_check(selector_hex, data_bytes, from_cfg["token"], to_cfg["token"],
-                                   amount_in, pa_cs)
+        print(f"  ParaSwap API returned executor {_exec}.")
+        print("  This executor is NOT on the DeltaPrime ParaSwapFacet whitelist —")
+        print("  broadcasting would revert with InvalidExecutor().")
+        print(PARASWAP_BLOCKED_MESSAGE)
+        sys.exit(1)
 
     print(f"Swap {amount} {from_sym} -> {to_sym} on Prime Account {pa_cs}  (via ParaSwap/Velora)")
     print(f"  Router method: {price_route['contractMethod']} ({selector_hex})")
@@ -1974,6 +2214,47 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
 
     w3 = get_w3()
     acct = get_account()
+
+    # Pre-flight ParaSwap API probe using the EOA as the probe user (ParaSwap's
+    # /transactions rejects the obvious burn/dummy addresses). Done BEFORE the
+    # Prime Account check so the refusal fires whether or not the wallet has a PA.
+    # The on-chain ParaSwapFacet allowlist is currently stale — see
+    # PARASWAP_GOVERNANCE_ISSUE. _swap_via_paraswap re-checks at build time.
+    if via == "paraswap":
+        from_cfg_pre, to_cfg_pre = SWAP_ASSETS[from_sym], SWAP_ASSETS[to_sym]
+        amount_in_pre = int(amount * 10**from_cfg_pre["decimals"])
+        try:
+            pr_probe = _paraswap_price_route(from_cfg_pre["token"], from_cfg_pre["decimals"],
+                                             to_cfg_pre["token"], to_cfg_pre["decimals"],
+                                             amount_in_pre, acct.address)
+            tx_probe = _paraswap_build_tx(pr_probe, from_cfg_pre["token"], from_cfg_pre["decimals"],
+                                          to_cfg_pre["token"], to_cfg_pre["decimals"],
+                                          amount_in_pre, slippage_pct, acct.address)
+        except RuntimeError as e:
+            print(f"  ParaSwap API: {e}")
+            print(PARASWAP_BLOCKED_MESSAGE)
+            sys.exit(1)
+        full_probe = bytes.fromhex(tx_probe["data"][2:])
+        sel_probe = "0x" + full_probe[:4].hex()
+        if sel_probe not in PARASWAP_SUPPORTED_SELECTORS:
+            print(f"  ParaSwap API returned router method {sel_probe} "
+                  f"({pr_probe.get('contractMethod','?')}).")
+            print(f"  The DeltaPrime ParaSwapFacet only decodes "
+                  f"{sorted(PARASWAP_SUPPORTED_SELECTORS)} — broadcasting would revert.")
+            print(PARASWAP_BLOCKED_MESSAGE)
+            sys.exit(1)
+        # For the generic-executor route (0xe3ead59e), the executor is the first 20 bytes
+        # of the args tail. The UniV3 variant (0x876a02f6) carries no executor field.
+        if sel_probe == "0xe3ead59e":
+            data_probe = full_probe[4:]
+            executor_probe = "0x" + data_probe[:32][-20:].hex()
+            if executor_probe.lower() not in PARASWAP_EXECUTORS:
+                print(f"  ParaSwap API returned executor {executor_probe}.")
+                print("  This executor is NOT on the DeltaPrime ParaSwapFacet whitelist —")
+                print("  broadcasting would revert with InvalidExecutor().")
+                print(PARASWAP_BLOCKED_MESSAGE)
+                sys.exit(1)
+
     pa = get_prime_account(w3, acct.address)
     if not pa:
         print("No Prime Account exists for this wallet — nothing to swap.")
@@ -2066,13 +2347,66 @@ def _read_prices_usd(w3, account, symbols, payload):
     raw = w3.eth.call({"to": account.address, "data": data})
     return w3.codec.decode(["uint256[]"], bytes(raw))[0]
 
+def _calc_swap_debt_amounts(w3, account, from_sym, to_sym, amount):
+    """Value-match the new borrow to the old repay using the facet's own RedStone prices.
+    Returns (repay_amount, borrow_amount, payload) — repay/borrow in wei.
+    Reads the old-debt pool and RedStone prices fresh on each call. Raises ValueError
+    if the computed borrow rounds to zero or if there's no old debt."""
+    from_cfg, to_cfg = SWAP_ASSETS[from_sym], SWAP_ASSETS[to_sym]
+    pa_cs = account.address
+
+    # Current borrowed of the OLD debt asset, read from its pool (the facet caps
+    # _repayAmount to exactly this).
+    from_pool, _, _ = get_pool_contract(_SYMBOL_TO_POOL[from_sym])
+    borrowed = from_pool.functions.getBorrowed(pa_cs).call()
+    if borrowed == 0:
+        raise ValueError("zero_old_debt")
+    repay_amount = min(int(amount * 10**from_cfg["decimals"]), borrowed)
+
+    # Value-match the new borrow to the repay using the facet's own RedStone prices.
+    feeds = prime_account_price_feeds(account)
+    for s in (from_sym, to_sym):
+        if s not in feeds:
+            feeds.append(s)
+    payload = build_redstone_payload(feeds)
+    price_from, price_to = _read_prices_usd(w3, account, [from_sym, to_sym], payload)
+    # borrow_amount such that its USD value ≈ repay USD value:
+    #   repay_usd  = price_from * repay_amount  / 10**from_dec
+    #   borrow_amt = repay_usd * 10**to_dec / price_to
+    borrow_amount = (price_from * repay_amount * 10**to_cfg["decimals"]) // (price_to * 10**from_cfg["decimals"])
+    if borrow_amount == 0:
+        raise ValueError("zero_borrow")
+    return repay_amount, borrow_amount, payload
+
+def _read_account_health(w3, account, payload) -> tuple:
+    """Read total_value (USD, 1e18-scaled raw) and total_debt (USD, 1e18-scaled raw) from
+    the SolvencyFacet via RedStone-gated eth_calls. Returns (total_value_usd, total_debt_usd)
+    as floats; None if any call fails."""
+    try:
+        tv = account.encode_abi("getTotalValue", args=[]) + payload.hex()
+        raw_tv = w3.eth.call({"to": account.address, "data": tv})
+        td = account.encode_abi("getDebt", args=[]) + payload.hex()
+        raw_td = w3.eth.call({"to": account.address, "data": td})
+        return (w3.codec.decode(["uint256"], bytes(raw_tv))[0] / 1e18,
+                w3.codec.decode(["uint256"], bytes(raw_td))[0] / 1e18)
+    except Exception:
+        return None, None
+
 def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.0,
-                  execute: bool = False):
-    """Refinance debt from --from (existing debt) into --to (new debt) via
-    SwapDebtFacet.swapDebtParaSwap. --amount is how much of the OLD (--from) debt to repay,
-    in --from units. We value-match the new borrow to the repay using the facet's own
-    RedStone prices, build the ParaSwap calldata for the internal --to -> --from swap, and
-    preview the 5% USD-diff cap. RedStone-gated on execute."""
+                  execute: bool = False, fallback: bool = False):
+    """Refinance debt from --from (existing debt) into --to (new debt).
+
+    Default (one-tx): SwapDebtFacet.swapDebtParaSwap — borrows _borrowAmount of _toAsset,
+    ParaSwaps it into _fromAsset, and repays _repayAmount of _fromAsset debt in a single tx.
+    Broken on-chain due to a protocol-level bug on the Velora/ParaSwap facet (as of 2026-05-30).
+
+    --fallback (manual 3-tx via YieldYak):
+      1. borrow to_sym  — borrow the new debt asset into the account
+      2. swap yak       — swap new debt -> old debt via YieldYakSwapFacet.yakSwap
+      3. repay from_sym — repay the old debt (capped to min(requested, debt, in-account balance))
+
+    --amount is how much of the OLD (--from) debt to repay, in --from units.
+    RedStone-gated on execute for both paths."""
     from_sym, to_sym = from_sym.upper(), to_sym.upper()
     if from_sym not in SWAP_ASSETS:
         print(f"Unknown --from (old debt) asset '{from_sym}'. Choose from: {', '.join(SWAP_ASSETS)}")
@@ -2096,123 +2430,173 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
 
     from_cfg, to_cfg = SWAP_ASSETS[from_sym], SWAP_ASSETS[to_sym]
 
-    # Current borrowed of the OLD debt asset, read from its pool (the facet caps
-    # _repayAmount to exactly this).
-    from_pool, _, _ = get_pool_contract(_SYMBOL_TO_POOL[from_sym])
-    borrowed = from_pool.functions.getBorrowed(pa_cs).call()
-    if borrowed == 0:
-        print(f"Prime Account has no {from_sym} debt to refinance.")
+    # Reusable amount calc (used by both the one-tx and fallback paths).
+    try:
+        repay_amount, borrow_amount, payload = _calc_swap_debt_amounts(w3, account, from_sym, to_sym, amount)
+    except ValueError as e:
+        if str(e) == "zero_old_debt":
+            print(f"Prime Account has no {from_sym} debt to refinance.")
+        elif str(e) == "zero_borrow":
+            print("Computed borrow amount rounds to zero — repay amount too small. Refusing.")
         return
-    repay_amount = min(int(amount * 10**from_cfg["decimals"]), borrowed)
 
-    # Value-match the new borrow to the repay using the facet's own RedStone prices, so the
-    # 5% USD-diff cap is computed against the same numbers the contract will see.
-    feeds = prime_account_price_feeds(account)
-    for s in (from_sym, to_sym):
-        if s not in feeds:
-            feeds.append(s)
-    payload = build_redstone_payload(feeds)
+    # --- Shared preview fields ---
     price_from, price_to = _read_prices_usd(w3, account, [from_sym, to_sym], payload)
-    # borrow_amount such that its USD value ≈ repay USD value:
-    #   repay_usd  = price_from * repay_amount  / 10**from_dec
-    #   borrow_amt = repay_usd * 10**to_dec / price_to
-    borrow_amount = (price_from * repay_amount * 10**to_cfg["decimals"]) // (price_to * 10**from_cfg["decimals"])
-    if borrow_amount == 0:
-        print("Computed borrow amount rounds to zero — repay amount too small. Refusing.")
-        return
-
-    # USD values + diff (mirror of the facet's maxDiff math, prices 1e8-scaled).
     repay_usd = price_from * repay_amount / 10**from_cfg["decimals"] / 1e8
     borrow_usd = price_to * borrow_amount / 10**to_cfg["decimals"] / 1e8
-    diff_bps = (abs(repay_usd - borrow_usd) / max(repay_usd, borrow_usd)) * 10000 if max(repay_usd, borrow_usd) else 0
 
-    # ParaSwap calldata for the INTERNAL swap: sell exactly borrow_amount of _toAsset for
-    # _fromAsset (facet requires fromAmount == _borrowAmount). srcToken=to, destToken=from.
-    price_route = _paraswap_price_route(to_cfg["token"], to_cfg["decimals"],
-                                        from_cfg["token"], from_cfg["decimals"], borrow_amount, pa_cs)
-    quoted_out = int(price_route["destAmount"])
-    tx_built = _paraswap_build_tx(price_route, to_cfg["token"], to_cfg["decimals"],
-                                  from_cfg["token"], from_cfg["decimals"], borrow_amount,
-                                  slippage_pct, pa_cs)
-    full = bytes.fromhex(tx_built["data"][2:])
-    selector_hex, data_bytes = "0x" + full[:4].hex(), full[4:]
-    _exec, _src, _dest, swap_from_amt, swap_min_out = _paraswap_decode_and_check(
-        selector_hex, data_bytes, to_cfg["token"], from_cfg["token"], borrow_amount, pa_cs)
+    # ─── Fallback path (manual 3-tx via YieldYak) ────────────────────────────
+    if fallback:
+        # Health check: intermediate state = after borrow, before repay.
+        total_value_usd, total_debt_usd = _read_account_health(w3, account, payload)
 
-    # If the ParaSwap API returned a new executor not on the DeltaPrime whitelist, patch
-    # it to EXECUTOR_3 (0x00001003…A07380A) — the only legacy executor whose calldata
-    # format is compatible with the current API's output (tested on-chain 2026-05-28).
-    _PARASWAP_FALLBACK_EXECUTOR = "0x000010036C0190E009a000d0fc3541100A07380A"
-    if _exec.lower() not in PARASWAP_EXECUTORS:
-        fallback_bytes = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:])
-        data_bytes = fallback_bytes + data_bytes[32:]
-        print(f"  ⚠ Executor {_exec} not whitelisted; patching to {_PARASWAP_FALLBACK_EXECUTOR}")
-        _paraswap_decode_and_check(selector_hex, data_bytes, to_cfg["token"], from_cfg["token"],
-                                   borrow_amount, pa_cs)
+        print(f"Swap debt (manual • 3-tx fallback via YieldYak) on Prime Account {pa}")
+        print(f"  Refinance: {from_sym} debt -> {to_sym} debt")
+        print(f"  Step 1: borrow {borrow_amount / 10**to_cfg['decimals']:.6f} {to_sym}  (≈${borrow_usd:,.2f})")
+        print(f"  Step 2: swap {to_sym} -> {from_sym} via YieldYak")
+        print(f"  Step 3: repay {repay_amount / 10**from_cfg['decimals']:.6f} {from_sym}  (≈${repay_usd:,.2f})")
 
-    print(f"Swap debt on Prime Account {pa}")
-    print(f"  Refinance: {from_sym} debt -> {to_sym} debt")
-    print(f"  Old debt ({from_sym}): {borrowed / 10**from_cfg['decimals']:.6f} total; "
-          f"repaying {repay_amount / 10**from_cfg['decimals']:.6f}")
-    print(f"  New debt ({to_sym}): borrow {borrow_amount / 10**to_cfg['decimals']:.6f}")
-    print(f"  Internal swap (ParaSwap): {borrow_amount / 10**to_cfg['decimals']:.6f} {to_sym} "
-          f"-> {from_sym}  ({price_route['contractMethod']} {selector_hex})")
-    print(f"  Expected {from_sym} out: {quoted_out / 10**from_cfg['decimals']:.6f}", end="")
-    if swap_min_out is not None:
-        print(f" (min {swap_min_out / 10**from_cfg['decimals']:.6f} @{slippage_pct}% slippage)")
-    else:
+        # Intermediate health check.
+        if total_value_usd is not None and total_debt_usd is not None:
+            health_before = total_value_usd / total_debt_usd if total_debt_usd > 0 else float('inf')
+            intermediate_debt = total_debt_usd + borrow_usd
+            intermediate_health = total_value_usd / intermediate_debt if intermediate_debt > 0 else float('inf')
+            print(f"  Current health:   {health_before:.4f}  (total value ${total_value_usd:,.2f} / debt ${total_debt_usd:,.2f})")
+            print(f"  Intermediate:     {intermediate_health:.4f}  (after borrow but before repay)")
+            if intermediate_health < 1.1:
+                print(f"  ✗✗✗ REFUSING: intermediate health {intermediate_health:.2f} < 1.1 —")
+                print(f"    account would be liquidatable during the intermediate state.")
+                print(f"    Reduce the swap amount or add collateral first.")
+                return
+            if intermediate_health < 1.5:
+                print(f"  ⚠ WARNING: intermediate health {intermediate_health:.2f} < 1.5 —")
+                print(f"    dangerously close to liquidation. Proceed with extreme caution.")
+        else:
+            print(f"  ⚠ Could not read current health — proceeding without intermediate check.")
+
+        # Preview the swap leg.
+        amounts, adapters, path = _yak_find_best_path(w3, borrow_amount, to_cfg["token"], from_cfg["token"])
+        expected_out = amounts[-1]
+        min_out = int(expected_out * (1 - slippage_pct / 100))
+        not_whitelisted = [a for a in adapters
+                           if not account.functions.isWhitelistedAdapterOptimized(
+                               Web3.to_checksum_address(a)).call()]
+        print(f"  YieldYak route ({len(adapters)} hop{'s' if len(adapters) != 1 else ''}): "
+              f"{' -> '.join(path)}")
+        print(f"  Expected {from_sym} out: {expected_out / 10**from_cfg['decimals']:.6f}")
+        print(f"  Min out (@{slippage_pct}% slippage): {min_out / 10**from_cfg['decimals']:.6f}")
+        if not_whitelisted:
+            print(f"  ✗ Non-whitelisted adapter(s): {', '.join(not_whitelisted)}. yakSwap would revert. Refusing.")
+            return
+        print(f"  All adapters whitelisted.")
+
+        if not execute:
+            print("Run with --execute to broadcast the 3-tx fallback sequence.")
+            return
+
+        # ─── Execute the 3-tx fallback ───────────────────────────────────────
         print()
-    print(f"  RedStone USD: repay ${repay_usd:,.4f} vs borrow ${borrow_usd:,.4f} "
-          f"-> diff {diff_bps:.1f} bps (facet cap: 500 bps / 5%)")
-    if diff_bps > 500:
-        print("  ✗ USD-value diff exceeds the facet's 5% cap. swapDebtParaSwap would revert. Refusing.")
-        return
-    if quoted_out < repay_amount:
-        print(f"  Note: quoted {from_sym} out is below the repay target; the facet repays "
-              f"min(swap output, {repay_amount / 10**from_cfg['decimals']:.6f}, debt) — any shortfall "
-              "leaves residual old debt.")
+        feeds = prime_account_price_feeds(account)
+        for s in (from_sym, to_sym):
+            if s not in feeds:
+                feeds.append(s)
+        exec_payload = build_redstone_payload(feeds)
 
-    if not execute:
-        print("Run with --execute to broadcast (appends a fresh RedStone price payload).")
-        return
+        # Step 1: Borrow to_sym
+        print("── Step 1/3: Borrow ──")
+        base_borrow = account.encode_abi("borrow", args=[asset_b32(to_sym), borrow_amount])
+        tx = {
+            "from": acct.address, "to": pa_cs, "data": base_borrow + exec_payload.hex(),
+            "nonce": w3.eth.get_transaction_count(acct.address),
+            "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        }
+        signed = acct.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        if receipt["status"] != 1:
+            print(f"  ✗ Borrow failed — aborting fallback sequence.")
+            print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+            return
+        print(f"  ✓ Borrowed {borrow_amount / 10**to_cfg['decimals']:.6f} {to_sym}")
+        print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
-    base_calldata = account.encode_abi("swapDebtParaSwap", args=[
-        asset_b32(from_sym), asset_b32(to_sym), repay_amount, borrow_amount,
-        full[:4], data_bytes,
-    ])
-    data = base_calldata + payload.hex()
-    tx = {
-        "from": acct.address, "to": pa_cs, "data": data,
-        "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
-    }
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
-    ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Swap debt {from_sym} -> {to_sym} {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+        # Re-check health after borrow (fresh payload).
+        fresh_payload = build_redstone_payload(prime_account_price_feeds(account))
+        tv, td = _read_account_health(w3, account, fresh_payload)
+        if tv is not None and td is not None and td > 0:
+            post_borrow_h = tv / td
+            print(f"  Health after borrow: {post_borrow_h:.4f}")
+            if post_borrow_h < 1.0:
+                print(f"  ⚠ Account is now insolvent! Repay or add collateral immediately.")
 
-# ─── Collateral withdrawal (WithdrawalIntentFacet) ──────────────────────────
-# Pulling collateral out of the Prime Account to the EOA is a two-step, time-delayed
-# flow — there is NO instant withdraw. createWithdrawalIntent registers an intent,
-# then executeWithdrawalIntent pulls it after maturity. Window (from source, also
-# exposed on-chain via the IntentInfo flags): actionableAt = createdAt + 24h,
-# expiresAt = actionableAt + 48h. So an intent is executable in a 24h–72h window.
+        # Step 2: Swap to_sym -> from_sym via yak
+        print("── Step 2/3: Swap (yak) ──")
+        amounts2, adapters2, path2 = _yak_find_best_path(w3, borrow_amount, to_cfg["token"], from_cfg["token"])
+        expected_out2 = amounts2[-1]
+        min_out2 = int(expected_out2 * (1 - slippage_pct / 100))
+        not_whitelisted2 = [a for a in adapters2
+                            if not account.functions.isWhitelistedAdapterOptimized(
+                                Web3.to_checksum_address(a)).call()]
+        if not_whitelisted2:
+            print(f"  ✗ Route changed — adapters now non-whitelisted: {', '.join(not_whitelisted2)}. Aborting.")
+            print(f"    Steps completed: 1 (borrow). You may need to manually swap & repay.")
+            return
+        swap_payload2 = build_redstone_payload(prime_account_price_feeds(account))
+        base_swap = account.encode_abi("yakSwap", args=[
+            borrow_amount, min_out2,
+            [Web3.to_checksum_address(p) for p in path2],
+            [Web3.to_checksum_address(a) for a in adapters2],
+        ])
+        tx2 = {
+            "from": acct.address, "to": pa_cs, "data": base_swap + swap_payload2.hex(),
+            "nonce": w3.eth.get_transaction_count(acct.address),
+            "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        }
+        signed2 = acct.sign_transaction(tx2)
+        tx_hash2 = w3.eth.send_raw_transaction(signed2.raw_transaction)
+        receipt2 = w3.eth.wait_for_transaction_receipt(tx_hash2, timeout=180)
+        if receipt2["status"] != 1:
+            print(f"  ✗ Swap failed — aborting fallback sequence.")
+            print(f"  Tx: {EXPLORER}/tx/{tx_hash2.hex()}")
+            print(f"  Steps completed: 1 (borrow). You may need to manually swap & repay.")
+            return
+        print(f"  ✓ Swapped {to_sym} -> {from_sym}")
+        print(f"  Tx: {EXPLORER}/tx/{tx_hash2.hex()}")
 
-def _fmt_window(actionable_at: int, expires_at: int) -> str:
-    """Human one-liner for an intent's maturity window, anchored to chain time."""
-    now = int(time.time())
-    def rel(ts):
-        d = ts - now
-        sign = "in" if d >= 0 else "ago"
-        d = abs(d)
-        h, m = d // 3600, (d % 3600) // 60
-        span = f"{h}h{m:02d}m" if h else f"{m}m"
-        return f"{sign} {span}" if sign == "in" else f"{span} {sign}"
-    a = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(actionable_at))
-    e = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expires_at))
-    return f"actionable {a} ({rel(actionable_at)}), expires {e} ({rel(expires_at)})"
+        # Step 3: Repay from_sym (capped to min(requested, debt, in-account))
+        print("── Step 3/3: Repay ──")
+        from_pool, _, _ = get_pool_contract(_SYMBOL_TO_POOL[from_sym])
+        debt_wei = from_pool.functions.getBorrowed(pa_cs).call()
+        in_acct_wei = account.functions.getBalance(asset_b32(from_sym)).call()
+        actual_reply = min(repay_amount, debt_wei, in_acct_wei)
+        if actual_reply == 0:
+            print(f"  ✗ No {from_sym} available to repay (balance={in_acct_wei/10**from_cfg['decimals']:.6f}, "
+                  f"debt={debt_wei/10**from_cfg['decimals']:.6f}). Swap output may have been below debt.")
+            print(f"  Steps completed: 1 (borrow), 2 (swap).")
+            return
+        cap_notes = []
+        if actual_reply < repay_amount:
+            if in_acct_wei < min(repay_amount, debt_wei):
+                cap_notes.append(f"in-account only {in_acct_wei/10**from_cfg['decimals']:.6f} {from_sym}")
+            if debt_wei < repay_amount:
+                cap_notes.append(f"debt only {debt_wei/10**from_cfg['decimals']:.6f} {from_sym}")
+        if cap_notes:
+            print(f"  Capped repay to {actual_reply/10**from_cfg['decimals']:.6f} {from_sym} ({'; '.join(cap_notes)})")
+        repay_payload3 = build_redstone_payload(prime_account_price_feeds(account))
+        base_reply = account.encode_abi("repay", args=[asset_b32(from_sym), actual_reply])
+        tx3 = {
+            "from": acct.address, "to": pa_cs, "data": base_reply + repay_payload3.hex(),
+            "nonce": w3.eth.get_transaction_count(acct.address),
+            "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        }
+        signed3 = acct.sign_transaction(tx3)
+        tx_hash3 = w3.eth.send_raw_transaction(signed3.raw_transaction)
+        receipt3 = w3.eth.wait_for_transaction_receipt(tx_hash3, timeout=180)
+        ok3 = receipt3["status"] == 1
+        print(f"{'  ✓' if ok3 else '  ✗'} Repaid {actual_reply/10**from_cfg['decimals']:.6f} {from_sym} {'confirmed' if ok3 else 'failed'}")
+        print(f"  Tx: {EXPLORER}/tx/{tx_hash3.hex()}")
+        if not ok3:
+            print(f"  Steps completed: 1 (borrow), 2 (swap). Repay failed — check manually.")
 
 def cmd_withdraw_collateral(pool_name: str, amount: float, execute: bool = False):
     """Step 1 of collateral withdrawal: register a WithdrawalIntent on the Prime
@@ -2659,6 +3043,15 @@ def cmd_gmx_deposit(market: str, amount: float, is_long: bool = True,
         print("Run with --execute to broadcast (appends a fresh RedStone price payload).")
         return
 
+    # Pre-check: EOA must hold the execution fee + gas buffer (~0.01 AVAX).
+    eoa_balance = w3.eth.get_balance(acct.address)
+    min_needed = exec_fee + int(0.01 * 1e18)
+    if eoa_balance < min_needed:
+        print(f"✗ EOA balance {eoa_balance / 1e18:.6f} AVAX is below the minimum needed "
+              f"({min_needed / 1e18:.6f} AVAX: {exec_fee / 1e18:.6f} exec fee + ~0.01 gas).")
+        print("  Transfer more AVAX to the EOA before retrying.")
+        return
+
     if mkt["plus"]:
         base_calldata = account.encode_abi(fn, args=[amount_wei, min_gm, exec_fee])
     else:
@@ -2776,6 +3169,15 @@ def cmd_gmx_withdraw(market: str, amount: float, slippage_pct: float = 1.0,
 
     if not execute:
         print("Run with --execute to broadcast (appends a fresh RedStone price payload).")
+        return
+
+    # Pre-check: EOA must hold the execution fee + gas buffer (~0.01 AVAX).
+    eoa_balance = w3.eth.get_balance(acct.address)
+    min_needed = exec_fee + int(0.01 * 1e18)
+    if eoa_balance < min_needed:
+        print(f"✗ EOA balance {eoa_balance / 1e18:.6f} AVAX is below the minimum needed "
+              f"({min_needed / 1e18:.6f} AVAX: {exec_fee / 1e18:.6f} exec fee + ~0.01 gas).")
+        print("  Transfer more AVAX to the EOA before retrying.")
         return
 
     base_calldata = account.encode_abi(fn, args=[gm_amount, min_long, min_short, exec_fee])
@@ -3106,10 +3508,14 @@ def cmd_lb_add(pair_key: str, amount_x: float, amount_y: float, shape: str = "sp
     base_calldata = account.encode_abi("addLiquidityTraderJoeV2",
                                        args=[Web3.to_checksum_address(p["router"]), liquidity_params])
     data = base_calldata + payload.hex()
+    # Gas scales with bin count: ~150k per bin + 250k overhead + RedStone payload.
+    # 31 bins was OOG at 5M (consumed 4.9M); 80 bins (the account cap) needs ~12M.
+    bin_count = len(deltas)
+    gas = max(5000000, min(12000000, 250000 + bin_count * 160000))
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 5000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": gas, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
     }
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -3949,7 +4355,7 @@ def cmd_zap(market: str, collateral_pool: str, collateral_amount: float, borrow_
 def gather_defi() -> dict:
     """Aggregate ALL DeltaPrime positions for the selected wallet into one DeBank-style dict.
     Read-only: reuses the gather_* helpers (lending/solvency, GMX V2 LP, TraderJoe V2 LB, sJOE,
-    PRIME tier), each of which only does eth_calls. Empty groups are omitted. total_usd /
+    PRIME tier, plus the EOA's own pool deposits surfaced as a Savings group), each of which only does eth_calls. Empty groups are omitted. total_usd /
     health_ratio / solvent come from the RedStone-gated solvency views; per-asset USD is
     best-effort (null where a RedStone feed is missing). Never broadcasts."""
     w3 = get_w3()
@@ -4012,6 +4418,49 @@ def gather_defi() -> dict:
             "type": "PRIME", "tier": tier["tier"],
             "staked": tier["staked"], "in_account": tier["in_account"],
         })
+
+    # Savings: the EOA's own pool deposits (the lending / savings side), independent of
+    # the Prime Account. One balanceOf(EOA) per pool, batched into a single Multicall3.
+    sav_legs, sav_meta = [], []
+    for _pname, _pcfg in POOLS.items():
+        try:
+            _pc, _, _ = get_pool_contract(_pname)
+        except Exception:
+            continue
+        _proxy_cs = Web3.to_checksum_address(_pcfg["proxy"])
+        sav_legs.append((_proxy_cs, bytes.fromhex(_pc.encode_abi("balanceOf", args=[acct.address])[2:])))
+        sav_meta.append(_pcfg)
+    savings = []
+    if sav_legs:
+        try:
+            sav_results = multicall(w3, sav_legs)
+        except Exception:
+            sav_results = [(False, b"")] * len(sav_legs)
+        for _pcfg, (_ok, _rd) in zip(sav_meta, sav_results):
+            _bal = w3.codec.decode(["uint256"], _rd)[0] if _ok and _rd else 0
+            if _bal > 0:
+                savings.append({"symbol": _pcfg["symbol"], "raw": _bal, "decimals": _pcfg["decimals"]})
+    if savings:
+        sav_prices = {}
+        if account is not None:
+            try:
+                _sav_syms = list(dict.fromkeys(r["symbol"] for r in savings))
+                sav_prices = _prices_usd(w3, account, _sav_syms, build_redstone_payload(_sav_syms))
+            except Exception:
+                sav_prices = {}
+        sav_rows, sav_usd_total = [], 0.0
+        for r in savings:
+            amt = r["raw"] / 10**r["decimals"]
+            row = {"symbol": r["symbol"], "balance": f"{amt:.6f}"}
+            usd = sav_prices.get(r["symbol"])
+            if usd is not None:
+                row["usd"] = round(amt * usd, 2)
+                sav_usd_total += amt * usd
+            sav_rows.append(row)
+        result["groups"].append({"type": "Savings", "label": "Savings", "supplied": sav_rows})
+        if sav_usd_total:
+            result["total_usd"] = (result["total_usd"] or 0) + sav_usd_total
+
     return result
 
 _DEFI_DECORATIVE_KEYS = {"url"}
@@ -4121,7 +4570,38 @@ def _dispatch():
         if not pool or amount is None:
             print("Usage: deltaprime withdraw --pool usdc --amount 100 [--execute]")
             return
+        if pool not in POOLS:
+            print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
+            return
         cmd_withdraw(pool, amount, execute)
+    elif cmd == "withdrawal-requests":
+        cmd_withdrawal_requests()
+    elif cmd == "execute-withdrawal-request":
+        pool, index = None, None
+        execute = "--execute" in args
+        for i, a in enumerate(args):
+            if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
+            if a == "--index" and i + 1 < len(args): index = int(args[i + 1])
+        if not pool:
+            print("Usage: deltaprime execute-withdrawal-request --pool usdc [--index N] [--execute]")
+            return
+        if pool not in POOLS:
+            print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
+            return
+        cmd_execute_withdrawal_request(pool, index, execute)
+    elif cmd == "cancel-withdrawal-request":
+        pool, index = None, None
+        execute = "--execute" in args
+        for i, a in enumerate(args):
+            if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
+            if a == "--index" and i + 1 < len(args): index = int(args[i + 1])
+        if not pool or index is None:
+            print("Usage: deltaprime cancel-withdrawal-request --pool usdc --index N [--execute]")
+            return
+        if pool not in POOLS:
+            print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
+            return
+        cmd_cancel_withdrawal_request(pool, index, execute)
     elif cmd in ("create-prime-account", "create-account"):
         fund_pool, fund_amount = None, None
         for i, a in enumerate(args):

@@ -250,7 +250,10 @@ The tool ships **32 commands**. State-changing commands default to a PREVIEW; ad
 | `pool-info [usdc\|wavax\|weth\|btc\|usdt\|all] [--json]` | read-only | Pool supply / borrow / utilization / deposit APR / borrow APR / TVL. Defaults to `all`. With `--json`: emits a single JSON object for a named pool, or a `{name: {...}}` dict for `all` (same shape as `degenprime pool-info --json`). |
 | `my-positions` | read-only | Wallet balances + pool positions + Prime Account address. |
 | `deposit --pool X --amount Y [--execute]` | state-changing | Deposit into a savings pool. ERC20 approve handled automatically (approves the **pool**). |
-| `withdraw --pool X --amount Y [--execute]` | state-changing | Withdraw from a savings pool. |
+| `withdraw --pool X --amount Y [--execute]` | state-changing | **Step 1 of delayed lender withdraw (24h flow).** Registers a withdrawal intent on the pool via `createWithdrawalIntent(uint256)`. The pool's plain `withdraw(uint256)` is now gated and reverts — the savings-pool side has the same time-locked intent flow as the Prime Account collateral side. Intent matures ~24h later and is then executable for a 48h window (24h-72h total). Oracle-free; no RedStone payload. |
+| `withdrawal-requests` | read-only | Lists pending **lender / pool-side** withdrawal intents (per pool, with ready/expired state) + current pool deposit. Oracle-free. Distinct from `withdrawal-intents` (which lists Prime Account **collateral** intents). |
+| `execute-withdrawal-request --pool X [--index N] [--execute]` | state-changing | Step 2 of lender pool withdraw: pulls a matured intent back to the wallet via `executeWithdrawalIntent(uint256[])`. Oracle-free (no RedStone payload — the lender side does not gate on solvency). |
+| `cancel-withdrawal-request --pool X --index N [--execute]` | state-changing | Cancel a pending lender withdrawal intent via `cancelWithdrawalIntent(uint256)`. Useful before maturity to free the balance for another use. |
 | `borrow --pool X --amount Y [--execute]` | state-changing | Calls `borrow()` on the Prime Account. |
 | `repay --pool X --amount Y [--execute]` | state-changing | Calls `repay()` on the Prime Account. |
 | `fund --pool X --amount Y [--execute]` | state-changing | Move collateral from the wallet into the Prime Account. ERC20: approves the **Prime Account** then calls `fund()`. Native AVAX (`wavax`): payable `depositNativeToken()` (wraps AVAX→WAVAX inside the account, no approve, spends raw AVAX). |
@@ -262,9 +265,9 @@ The tool ships **32 commands**. State-changing commands default to a PREVIEW; ad
 | `create-prime-account [--execute]` (alias `create-account`) | state-changing | `factory.createLoan()` — creates an empty Prime Account. |
 | `create-prime-account --fund-pool X --fund-amount Y [--execute]` | state-changing | `factory.createAndFundLoan()` — create + fund in one tx. **ERC20 only** (approves the **factory**); native AVAX is blocked, use the two-step flow. |
 | `prime-summary` | read-only | Prime Account assets / debts + **live solvency** (health ratio, total value, debt, solvent flag) via RedStone-gated `SolvencyFacetProdAvalanche` reads (falls back to balances-only if the gateway is down). |
-| `withdraw-collateral --pool X --amount Y [--execute]` | state-changing | Step 1 of delayed collateral withdrawal: registers a `WithdrawalIntent` (no RedStone). Executable ~24h later for a 48h window. |
-| `withdrawal-intents` | read-only | Lists pending intents (with ready/expired state) + per-asset available balance. Oracle-free. |
-| `execute-withdrawal --pool X [--index N] [--execute]` | state-changing (gated) | Step 2: pulls a matured intent to the wallet (`executeWithdrawalIntent`, RedStone-gated). |
+| `withdraw-collateral --pool X --amount Y [--execute]` | state-changing | Step 1 of delayed **Prime Account collateral** withdrawal: registers a `WithdrawalIntent` on the Prime Account's `WithdrawalIntentFacet` (no RedStone). Executable ~24h later for a 48h window. Note: distinct from `withdraw` (savings-pool lender side) and `withdrawal-requests`. |
+| `withdrawal-intents` | read-only | Lists pending **Prime Account collateral** intents (with ready/expired state) + per-asset available balance. Oracle-free. Distinct from `withdrawal-requests` (which lists lender pool-side intents). |
+| `execute-withdrawal --pool X [--index N] [--execute]` | state-changing (gated) | Step 2 of collateral withdrawal: pulls a matured Prime Account intent to the wallet (`executeWithdrawalIntent`, RedStone-gated). |
 
 **Swaps**
 

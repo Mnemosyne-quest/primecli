@@ -41,15 +41,23 @@ Pool.deposit(uint256 amount) payable               // native path (weth pool; va
 
 ---
 
-## 2. Withdraw (savings pool, lender side) — ✅ SHIPPED as `withdraw --pool X --amount Y`
+## 2. Withdraw (savings pool, lender side) — ✅ SHIPPED as `withdraw` / `withdrawal-requests` / `execute-withdrawal-request` / `cancel-withdrawal-request`
+
+**There is no instant lender withdraw on DegenPrime today.** The pool's plain `withdraw(uint256)` reverts. The lender side runs through the SAME 24h delayed-intent flow that the Degen Account collateral side uses (§7). Probe-confirmed on the WETH pool `0x81b0b59C7967479EC5Ce55cF6588bf314C3E4852` 2026-05-29; same `IntentInfo` struct shape as the collateral facet.
 
 ```
-Pool.withdraw(uint256 amount)
+Pool.createWithdrawalIntent(uint256 amount)            // step 1: register intent
+Pool.executeWithdrawalIntent(uint256[] intentIndices)  // step 2: after 24h, before 72h
+Pool.cancelWithdrawalIntent(uint256 index)             // abort a pending intent
+Pool.getUserIntents(address user) -> IntentInfo[]      // list per-EOA intents
+Pool.getTotalIntentAmount(address user) -> uint256
 ```
-- **Instant**, no time-lock. This is the lender-side path. The Degen Account collateral withdrawal is a separate 24h-locked flow (§7).
+- Timing: `actionableAt = createdAt + 24h`, `expiresAt = actionableAt + 48h`. Executable in a **24h-72h window**.
+- Storage is **per-EOA on the pool** (the wallet that deposited), NOT per-Degen-Account.
+- All five functions are **oracle-free** — no RedStone payload needed.
 - **Approve target:** none.
-- **RedStone:** none.
-- **Gotchas:** the universal 24h time-lock applies only to **collateral** withdrawals (Degen Account → wallet). Lender-side pool withdrawals stay instant. Don't confuse the two.
+- **Tool flow:** `withdraw --pool X --amount Y` registers an intent. `withdrawal-requests` lists pending intents across all pools. After maturity, `execute-withdrawal-request --pool X` pulls all currently-actionable intents (or one via `--index`). `cancel-withdrawal-request --pool X --index N` cancels a pending one.
+- **Gotchas:** distinct from §7 (collateral withdraw). The lender and collateral sides have the SAME 24h pattern but live on different contracts. Use the `*-request` commands for the pool side and the `*-intent` / `withdrawal-intents` commands for the Degen Account side.
 
 ---
 

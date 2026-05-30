@@ -89,9 +89,9 @@ State-changing commands preview by default. Add `--execute` to broadcast.
 
 | Group | Commands |
 |-------|----------|
-| Lending core | `pool-info [--json]`, `my-positions`, `deposit`, `withdraw`, `borrow`, `repay`, `fund` |
+| Lending core | `pool-info [--json]`, `my-positions`, `deposit`, `withdraw` (24h delayed lender flow, step 1), `withdrawal-requests`, `execute-withdrawal-request --pool X [--index N]`, `cancel-withdrawal-request --pool X --index N`, `borrow`, `repay`, `fund` |
 | Prime Account | `create-prime-account` (alias `create-account`), `prime-summary`, `defi --json`, `withdraw-collateral`, `withdrawal-intents`, `execute-withdrawal` |
-| Swaps | `swap --from S --to S --amount N [--via yak\|paraswap] [--slippage P]`, `swap-debt --from S --to S --amount N [--slippage P]` |
+| Swaps | `swap --from S --to S --amount N [--via yak\|paraswap] [--slippage P]` (⚠️ `--via paraswap` blocked upstream, see [issue #2](https://github.com/Mnemosyne-quest/primecli/issues/2)), `swap-debt --from S --to S --amount N [--slippage P]` (⚠️ also blocked upstream — same allowlist) |
 | GMX V2 LP (async, keeper-executed) | `gmx-positions`, `gmx-deposit --market M --amount N [--side long\|short]`, `gmx-withdraw --market M --amount N` |
 | TraderJoe V2 LB | `lb-positions`, `lb-add --pair P --amount-x N --amount-y N [--shape spot\|curve\|bidask] [--range R]`, `lb-remove --pair P` |
 | sJOE staking | `sjoe-position`, `sjoe-stake --amount N`, `sjoe-unstake --amount N`, `sjoe-claim` |
@@ -108,7 +108,7 @@ Full per-command reference: [docs/deltaprime-reference.md](docs/deltaprime-refer
 
 | Group | Commands |
 |-------|----------|
-| Lending core | `pool-info [--json]`, `my-positions`, `deposit`, `withdraw`, `borrow`, `repay`, `fund` |
+| Lending core | `pool-info [--json]`, `my-positions`, `deposit`, `withdraw` (24h delayed lender flow, step 1), `withdrawal-requests`, `execute-withdrawal-request --pool X [--index N]`, `cancel-withdrawal-request --pool X --index N`, `borrow`, `repay`, `fund` |
 | Degen Account | `create-account`, `summary [--json]`, `withdraw-collateral`, `withdrawal-intents`, `execute-withdrawal`, `cancel-withdrawal` |
 | Swaps | `swap --from S --to S --amount N [--slippage P]` (ParaSwap v6), `swap-debt --from S --to S --amount N` |
 | Aerodrome (read-only in v1) | `aerodrome-positions` |

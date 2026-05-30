@@ -57,15 +57,18 @@ Read-only commands work without any key. Write commands require a key.
 | `deltaprime prime-summary` / `degenprime summary [--json]` | no | Account assets, debts, live solvency. `--json` on `summary`. |
 | `deltaprime defi --json` | no | Full positions snapshot, single JSON object (trimmed). |
 | `<tool> deposit --pool X --amount Y [--execute]` | yes | Default: preview. With `--execute`: broadcasts. |
-| `<tool> withdraw --pool X --amount Y [--execute]` | yes | |
+| `<tool> withdraw --pool X --amount Y [--execute]` | yes | **Step 1 of delayed lender withdraw (24h flow).** Registers an intent via `createWithdrawalIntent`. The pool's plain `withdraw(uint256)` reverts — this is the only path. Intent matures ~24h later for a 48h window. |
+| `<tool> withdrawal-requests` | no | Lists pending lender pool-side intents. Distinct from `withdrawal-intents` (Prime/Degen Account collateral side). |
+| `<tool> execute-withdrawal-request --pool X [--index N] [--execute]` | yes | Step 2 of delayed lender withdraw — pulls a matured intent to the wallet. |
+| `<tool> cancel-withdrawal-request --pool X --index N [--execute]` | yes | Cancel a pending lender pool-side intent before maturity. |
 | `<tool> borrow --pool X --amount Y [--execute]` | yes | RedStone-gated. |
 | `<tool> repay --pool X --amount Y [--execute]` | yes | |
 | `<tool> fund --pool X --amount Y [--execute]` | yes | |
-| `<tool> withdraw-collateral --pool X --amount Y [--execute]` | yes | Step 1 of delayed-withdrawal flow. |
-| `<tool> withdrawal-intents` | no | Lists pending intents. |
-| `<tool> execute-withdrawal --pool X [--index N] [--execute]` | yes | Step 2 of delayed-withdrawal flow. |
-| `<tool> swap --from S --to S --amount N [--slippage P] [--execute]` | yes | RedStone-gated. |
-| `<tool> swap-debt --from S --to S --amount N [--slippage P] [--execute]` | yes | RedStone-gated. |
+| `<tool> withdraw-collateral --pool X --amount Y [--execute]` | yes | Step 1 of delayed Prime/Degen Account collateral withdrawal (separate flow). |
+| `<tool> withdrawal-intents` | no | Lists pending Prime/Degen Account collateral intents. |
+| `<tool> execute-withdrawal --pool X [--index N] [--execute]` | yes | Step 2 of delayed collateral withdrawal. |
+| `<tool> swap --from S --to S --amount N [--via yak\|paraswap] [--slippage P] [--execute]` | yes | RedStone-gated. **`--via paraswap` is currently blocked upstream** — see [issue #2](https://github.com/Mnemosyne-quest/primecli/issues/2). Default `--via yak` works. |
+| `<tool> swap-debt --from S --to S --amount N [--slippage P] [--execute]` | yes | **Currently blocked upstream** (same allowlist as paraswap). The tool refuses cleanly. Manual fallback: `borrow → swap --via yak → repay`. See [issue #2](https://github.com/Mnemosyne-quest/primecli/issues/2). |
 
 Avalanche-only on top of the above: `create-prime-account`, `cmd_defi`, `gmx-*` (6 markets), `lb-*` (9 pairs), `sjoe-*`, `prime-tier` / `prime-needed` / `prime-deposit` / `prime-activate` / `prime-deactivate` / `prime-unstake` / `prime-repay`, `zap`.
 
