@@ -138,7 +138,7 @@ DegenPrime is architecturally the same protocol as DeltaPrime, but the on-chain 
 
 ### 6.1 Universal 24h withdrawal time-lock
 
-On DeltaPrime, only **risky** assets are locked behind the 24h `WithdrawalIntent` flow — stable / blue-chip assets can be withdrawn instantly. On DegenPrime, **every** collateral withdrawal from a Degen Account is locked, regardless of asset. The flow is the same three calls:
+Both protocols now lock **every** withdrawal that leaves the protocol behind a 24h `WithdrawalIntent` flow — this covers both the lender-side savings pools and the Degen/Prime Account collateral. Nothing exits instantly on either protocol. On DegenPrime, **every** collateral withdrawal from a Degen Account is locked, regardless of asset. The flow is the same three calls:
 
 1. `createWithdrawalIntent(bytes32 asset, uint256 amount)` — oracle-free, registers the intent.
 2. Wait ~24h. Intent becomes executable for a 48h window (24h-72h total).
@@ -146,7 +146,7 @@ On DeltaPrime, only **risky** assets are locked behind the 24h `WithdrawalIntent
 
 `cancelWithdrawalIntent(bytes32, uint256)` aborts a pending intent. `getAvailableBalance(bytes32)` is the oracle-free view of in-account balance minus pending intents.
 
-Lender-side pool withdrawals (`Pool.withdraw`) remain instant — this is just the Degen Account collateral path. Plan around the lock: surprise 24h delays are how DeFi positions end up wedged.
+Lender-side pool withdrawals are ALSO 24h time-locked — the pool's plain `withdraw(uint256)` reverts and requires the same delayed-intent flow (`createWithdrawalIntent(uint256)` → wait ~24h → `instantWithdraw(uint256 index)`; `cancelWithdrawalIntent(uint256 index)` is oracle-free). This is the savings-pool lender side; the calls above (bytes32-asset) are the Degen Account collateral side. Both are 24h-locked. The `withdraw` / `withdrawal-requests` / `execute-withdrawal-request` / `cancel-withdrawal-request` commands drive the pool side; the `*-collateral` / `withdrawal-intents` commands drive the collateral side. Plan around the lock: surprise 24h delays are how DeFi positions end up wedged. (DegenPrime pool verified 2026-05-29; DeltaPrime pool verified 2026-05-31.)
 
 ### 6.2 No premium / leverage-tier system
 
@@ -221,7 +221,7 @@ Same shape as DeltaPrime's Pool implementation. Selectors that matter:
 
 These are the non-obvious bits. They are the reason naïve approaches fail.
 
-1. **Universal 24h time-lock on collateral withdrawals.** See §6.1. The DeltaPrime mental model ("stable assets withdraw instantly") is wrong here.
+1. **Universal 24h time-lock on every withdrawal.** See §6.1. Both the Degen Account collateral path AND the lender-side savings pools are 24h-locked — nothing exits instantly. The old "stable assets withdraw instantly" mental model is wrong on both protocols now.
 
 2. **bytes32 asset symbols.** Same scheme as DeltaPrime: right-pad the ASCII symbol with zero bytes to 32. Use the bytes32 symbol, not the wrapped-token name. Symbols of note: `ETH` (not `WETH`), `cbBTC` (case matters), `cbDOGE`, `cbXRP`.
 

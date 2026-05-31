@@ -12,7 +12,7 @@ Canonical reference for the DeltaPrime protocol on Avalanche C-chain and the `de
 
 A lending and leverage protocol on Avalanche C-chain. Two layers:
 
-1. **Savings pools** — deposit an asset to earn lending yield. Regular wallets (EOAs) deposit and withdraw directly against the pool contract.
+1. **Savings pools** — deposit an asset to earn lending yield. Regular wallets (EOAs) deposit directly against the pool contract; withdrawing now runs through a 24h delayed-intent flow (the pool's plain `withdraw(uint256)` reverts — see §7 and the `withdraw` command in §10).
 2. **Prime Accounts** — per-user smart-contract accounts for leveraged borrowing. You create one, fund it with collateral, then borrow against that collateral. The Prime Account is what talks to the pools on the borrow side.
 
 You don't need a Prime Account to earn yield. You do need one to borrow.
@@ -195,6 +195,8 @@ These are the non-obvious bits. They are the reason naïve approaches fail.
 
 `deposit(uint256)`, `withdraw(uint256)`, `totalSupply()`, `totalBorrowed()`, `balanceOf(address)`, `getBorrowed(address)`, `getFullPoolStatus()`, `lockDeposit(uint256, uint256)`.
 
+**Lender withdraw is 24h delayed-intent now.** Withdrawing from a savings pool runs through the same delayed-intent flow the Prime Account collateral side uses: `createWithdrawalIntent(uint256)` → wait ~24h → re-call the pool's **own** intent-gated `withdraw(uint256 amount)` (there is **no** separate `instantWithdraw` / `executeWithdrawalIntent` on the pool — `withdraw` reverts while no intent has matured and succeeds, consuming the matured intent, once one covers the amount; `cancelWithdrawalIntent(uint256 index)` aborts a pending one; all oracle-free). The intent is stored per-EOA on the pool. The `withdraw` / `withdrawal-requests` / `execute-withdrawal-request` / `cancel-withdrawal-request` commands drive this flow (see §10 and capabilities §2b). Verified by disassembling the live WAVAX pool impl `0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E` (proxy `0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4`) 2026-05-31: `instantWithdraw` and `executeWithdrawalIntent(uint256[])` selectors are absent.
+
 ---
 
 
@@ -252,7 +254,7 @@ The tool ships **32 commands**. State-changing commands default to a PREVIEW; ad
 | `deposit --pool X --amount Y [--execute]` | state-changing | Deposit into a savings pool. ERC20 approve handled automatically (approves the **pool**). |
 | `withdraw --pool X --amount Y [--execute]` | state-changing | **Step 1 of delayed lender withdraw (24h flow).** Registers a withdrawal intent on the pool via `createWithdrawalIntent(uint256)`. The pool's plain `withdraw(uint256)` is now gated and reverts — the savings-pool side has the same time-locked intent flow as the Prime Account collateral side. Intent matures ~24h later and is then executable for a 48h window (24h-72h total). Oracle-free; no RedStone payload. |
 | `withdrawal-requests` | read-only | Lists pending **lender / pool-side** withdrawal intents (per pool, with ready/expired state) + current pool deposit. Oracle-free. Distinct from `withdrawal-intents` (which lists Prime Account **collateral** intents). |
-| `execute-withdrawal-request --pool X [--index N] [--execute]` | state-changing | Step 2 of lender pool withdraw: pulls a matured intent back to the wallet via `executeWithdrawalIntent(uint256[])`. Oracle-free (no RedStone payload — the lender side does not gate on solvency). |
+| `execute-withdrawal-request --pool X [--index N] [--execute]` | state-changing | Step 2 of lender pool withdraw: the pool has **no separate executor** — once an intent matures, the pool's own intent-gated `withdraw(uint256 amount)` becomes callable, so this re-calls `withdraw(intent_amount)` to pull the matured intent back to the wallet. One matured intent is consumed per call (`--index` to pick which when several are actionable). Oracle-free (no RedStone payload — the lender side does not gate on solvency). |
 | `cancel-withdrawal-request --pool X --index N [--execute]` | state-changing | Cancel a pending lender withdrawal intent via `cancelWithdrawalIntent(uint256)`. Useful before maturity to free the balance for another use. |
 | `borrow --pool X --amount Y [--execute]` | state-changing | Calls `borrow()` on the Prime Account. |
 | `repay --pool X --amount Y [--execute]` | state-changing | Calls `repay()` on the Prime Account. |

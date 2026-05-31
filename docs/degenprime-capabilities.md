@@ -162,7 +162,7 @@ DegenAccount.swapDebtParaSwap(bytes32 fromAsset, bytes32 toAsset,
 
 ## 8. Universal 24h delayed collateral withdrawal — ✅ SHIPPED as `withdraw-collateral` / `withdrawal-intents` / `execute-withdrawal` / `cancel-withdrawal`
 
-**Key difference from DeltaPrime:** DegenPrime locks **every** collateral withdrawal from a Degen Account behind a 24h time-lock, not just risky assets. Lender-side pool withdrawals (`Pool.withdraw`, §2) remain instant.
+**No instant withdrawal of any kind.** DegenPrime locks **every** collateral withdrawal from a Degen Account behind a 24h time-lock, regardless of asset. The lender-side savings pools (`Pool.withdraw`, §2) are ALSO 24h-locked behind the same delayed-intent flow — the plain `withdraw(uint256)` reverts. Nothing leaves the protocol without the 24h wait (same model as DeltaPrime now).
 
 ```
 DegenAccount.createWithdrawalIntent(bytes32 asset, uint256 amount)               // step 1, oracle-free

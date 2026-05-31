@@ -55,14 +55,15 @@ prime-summary reports live solvency (health ratio, total value, debt, solvent fl
 SolvencyFacetProdAvalanche, read via eth_call with a RedStone price payload appended (falls
 back to balances-only if the gateway is unreachable).
 
-The savings-pool lender side `withdraw` is ALSO a two-step, time-delayed intent flow —
-the pool's plain `withdraw(uint256)` reverts. Step 1: `deltaprime withdraw --pool X
---amount Y` calls the pool's `createWithdrawalIntent(uint256)`. Step 2 (after the 24h
-maturity, within the 48h execution window): `execute-withdrawal-request --pool X`
-calls `executeWithdrawalIntent(uint256[])`. `withdrawal-requests` lists pending lender
-intents per pool; `cancel-withdrawal-request --pool X --index N` cancels a pending one
-via `cancelWithdrawalIntent(uint256)`. Storage is per-EOA on the pool (NOT the Prime
-Account address). No RedStone on any of these.
+The savings-pool lender side `withdraw` is ALSO a two-step, time-delayed intent flow.
+Step 1: `deltaprime withdraw --pool X --amount Y` calls the pool's
+`createWithdrawalIntent(uint256)` (the pool's plain `withdraw` reverts while no intent
+has matured). Step 2 (after the 24h maturity, within the 48h execution window):
+`execute-withdrawal-request --pool X [--index N]` re-calls the pool's own intent-gated
+`withdraw(uint256 amount)` — there is NO separate executor selector. `withdrawal-requests`
+lists pending lender intents per pool; `cancel-withdrawal-request --pool X --index N`
+cancels a pending one via `cancelWithdrawalIntent(uint256)`. Storage is per-EOA on the
+pool (NOT the Prime Account address). No RedStone on any of these.
 
 Collateral withdrawal on the Prime Account is the separate `WithdrawalIntentFacet` flow:
 withdraw-collateral / withdrawal-intents / execute-withdrawal. Same 24h-72h shape; the
@@ -543,19 +544,22 @@ ERC20_BALANCE_ABI = json.loads(
 # `pool-info all` on cold cache, rate-limited); the hand-curated ABI removes that
 # dependency entirely. Rates are 1e18-scaled annualised (same shape as DegenPrime's
 # pool, verified on Snowtrace 2026-05-23 / 2026-05-29).
-# Pool ABI. `withdraw(uint256)` is included for the historical/instant path BUT the
-# lender side now runs through the same delayed-intent flow as the Prime Account
-# collateral side: createWithdrawalIntent registers, executeWithdrawalIntent pulls
-# after the 24h maturity, cancelWithdrawalIntent kills a pending one. Intent storage
-# is per-EOA (the wallet address, NOT the Prime Account address). Confirmed on the
-# wavax pool 0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4 2026-05-29. Signatures match
+# Pool ABI. The lender side runs through the same delayed-intent flow as the Prime
+# Account collateral side: createWithdrawalIntent registers, cancelWithdrawalIntent
+# kills a pending one. There is NO separate pool executor — `withdraw(uint256)` is
+# itself intent-gated: it reverts with no matured intent and succeeds (consuming the
+# matured intent) once one covers the amount, so re-calling withdraw IS step 2. Intent
+# storage is per-EOA (the wallet address, NOT the Prime Account address). Confirmed by
+# disassembling the live wavax pool impl 0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E
+# (proxy 0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4) 2026-05-31: selectors
+# withdraw/createWithdrawalIntent/cancelWithdrawalIntent/getUserIntents are present;
+# instantWithdraw and executeWithdrawalIntent(uint256[]) are ABSENT. Signatures match
 # the Prime Account WithdrawalIntentFacet's IntentInfo shape.
 POOL_ABI = json.loads(
     '['
     '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"deposit","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"amount","type":"uint256"}],"name":"createWithdrawalIntent","outputs":[],"stateMutability":"nonpayable","type":"function"},'
-    '{"inputs":[{"name":"intentIndices","type":"uint256[]"}],"name":"executeWithdrawalIntent","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"index","type":"uint256"}],"name":"cancelWithdrawalIntent","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"user","type":"address"}],"name":"getUserIntents","outputs":[{"components":[{"name":"amount","type":"uint256"},{"name":"actionableAt","type":"uint256"},{"name":"expiresAt","type":"uint256"},{"name":"isPending","type":"bool"},{"name":"isActionable","type":"bool"},{"name":"isExpired","type":"bool"}],"type":"tuple[]"}],"stateMutability":"view","type":"function"},'
     '{"inputs":[{"name":"user","type":"address"}],"name":"getTotalIntentAmount","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
@@ -1456,11 +1460,14 @@ def cmd_withdrawal_requests():
         print("  No pending lender withdrawal intents.")
 
 def cmd_execute_withdrawal_request(pool_name: str, index: int = None, execute: bool = False):
-    """Step 2 of lender pool withdrawal: executeWithdrawalIntent(uint256[] indices)
-    pulls matured intent(s) on the pool back to the EOA's wallet. Refuses any intent
-    that has not matured (isActionable=false) or has expired. --index selects one
-    intent; default executes all currently-actionable intents (indices passed strictly
-    increasing, as the contract requires)."""
+    """Step 2 of lender pool withdrawal. The pool has NO separate executor function:
+    once an intent matures, the pool's OWN `withdraw(uint256 amount)` becomes callable
+    (it is intent-gated — reverts with no matured intent, succeeds against a matured
+    one covering the amount). So step 2 is just re-calling `withdraw(intent_amount)`.
+    Refuses any intent that has not matured (isActionable=false) or has expired.
+    --index selects which intent to execute; with no --index, the single actionable
+    intent is used (if more than one is actionable, --index is required — one matured
+    intent is consumed per `withdraw` call)."""
     contract, cfg, w3 = get_pool_contract(pool_name)
     acct = get_account()
     intents = contract.functions.getUserIntents(acct.address).call()
@@ -1473,36 +1480,37 @@ def cmd_execute_withdrawal_request(pool_name: str, index: int = None, execute: b
         if index < 0 or index >= len(intents):
             print(f"--index {index} out of range (pool has {len(intents)} intent(s)).")
             return
-        candidates = [index]
     else:
-        candidates = [i for i, it in enumerate(intents) if it[4]]  # isActionable
+        actionable = [i for i, it in enumerate(intents) if it[4] and not it[5]]
+        if not actionable:
+            print("  No matured, non-expired intents to execute. Refusing.")
+            return
+        if len(actionable) > 1:
+            print(f"  Multiple actionable intents {actionable} — pass --index to pick one "
+                  f"(one matured intent is consumed per withdraw call).")
+            return
+        index = actionable[0]
 
+    amt, actionable_at, expires_at, is_pending, is_actionable, is_expired = intents[index]
     print(f"Execute lender withdrawal from {pool_name.upper()} pool")
     print(f"  Wallet: {acct.address}")
-    ready = []
-    for i in candidates:
-        amt, actionable_at, expires_at, is_pending, is_actionable, is_expired = intents[i]
-        print(f"  [{i}] {amt / 10**cfg['decimals']:,.6f} {cfg['symbol']} — "
-              f"{'EXPIRED' if is_expired else 'READY' if is_actionable else 'NOT MATURED'}")
-        print(f"       {_fmt_window(actionable_at, expires_at)}")
-        if is_expired:
-            print(f"       ✗ intent [{i}] has expired — cancel it instead.")
-        elif not is_actionable:
-            print(f"       ✗ intent [{i}] has not matured yet — refusing.")
-        else:
-            ready.append(i)
-
-    if not ready:
-        print("  No matured, non-expired intents to execute. Refusing.")
+    print(f"  [{index}] {amt / 10**cfg['decimals']:,.6f} {cfg['symbol']} — "
+          f"{'EXPIRED' if is_expired else 'READY' if is_actionable else 'NOT MATURED'}")
+    print(f"       {_fmt_window(actionable_at, expires_at)}")
+    if is_expired:
+        print(f"  ✗ intent [{index}] has expired — cancel it instead.")
         return
-    ready.sort()  # contract requires strictly-increasing indices
-    print(f"  Will execute indices {ready} via executeWithdrawalIntent({ready}).")
+    if not is_actionable:
+        print(f"  ✗ intent [{index}] has not matured yet — refusing.")
+        return
+    print(f"  Will pull {amt / 10**cfg['decimals']:,.6f} {cfg['symbol']} via withdraw({amt}) "
+          f"(intent-gated; matures intent [{index}]).")
 
     if not execute:
         print("Run with --execute to broadcast (pulls the funds to the wallet).")
         return
 
-    tx = contract.functions.executeWithdrawalIntent(ready).build_transaction({
+    tx = contract.functions.withdraw(amt).build_transaction({
         "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 600000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
     })
