@@ -138,15 +138,15 @@ DegenPrime is architecturally the same protocol as DeltaPrime, but the on-chain 
 
 ### 6.1 Universal 24h withdrawal time-lock
 
-Both protocols now lock **every** withdrawal that leaves the protocol behind a 24h `WithdrawalIntent` flow — this covers both the lender-side savings pools and the Degen/Prime Account collateral. Nothing exits instantly on either protocol. On DegenPrime, **every** collateral withdrawal from a Degen Account is locked, regardless of asset. The flow is the same three calls:
+Both protocols now lock **every** withdrawal that leaves the protocol behind a `WithdrawalIntent` flow — this covers both the lender-side savings pools and the Degen/Prime Account collateral. The time-lock is always 24h; the execute window differs by path. Nothing exits instantly on either protocol. On DegenPrime, **every** collateral withdrawal from a Degen Account is locked, regardless of asset. The Degen Account flow is:
 
-1. `createWithdrawalIntent(bytes32 asset, uint256 amount)` — oracle-free, registers the intent.
-2. Wait ~24h. Intent becomes executable for a 48h window (24h-72h total).
+1. `createWithdrawalIntent(bytes32 asset, uint256 amount)` — **RedStone-gated** on the Degen Account (on-chain solvency check at create), registers the intent.
+2. 24h time-lock, then a **48h** execute window (72h total; `expiresAt = actionableAt + 48h`).
 3. `executeWithdrawalIntent(bytes32 asset, uint256[] indices)` — RedStone-gated, pulls the funds to the EOA.
 
-`cancelWithdrawalIntent(bytes32, uint256)` aborts a pending intent. `getAvailableBalance(bytes32)` is the oracle-free view of in-account balance minus pending intents.
+`cancelWithdrawalIntent(bytes32, uint256)` aborts a pending intent (oracle-free). `getAvailableBalance(bytes32)` is the oracle-free view of in-account balance minus pending intents.
 
-Lender-side pool withdrawals are ALSO 24h time-locked — the pool's plain `withdraw(uint256)` reverts and requires the same delayed-intent flow (`createWithdrawalIntent(uint256)` → wait ~24h → `instantWithdraw(uint256 index)`; `cancelWithdrawalIntent(uint256 index)` is oracle-free). This is the savings-pool lender side; the calls above (bytes32-asset) are the Degen Account collateral side. Both are 24h-locked. The `withdraw` / `withdrawal-requests` / `execute-withdrawal-request` / `cancel-withdrawal-request` commands drive the pool side; the `*-collateral` / `withdrawal-intents` commands drive the collateral side. Plan around the lock: surprise 24h delays are how DeFi positions end up wedged. (DegenPrime pool verified 2026-05-29; DeltaPrime pool verified 2026-05-31.)
+Lender-side pool ("diamond hands") withdrawals are ALSO time-locked, but with the pool's own executor and a shorter window: the single-arg `withdraw(uint256)` reverts (bare `0x`, never resolves a named intent), so the flow is `createWithdrawalIntent(uint256)` (oracle-free) → wait 24h → `withdraw(uint256 amount, uint256[] intentIndices)` (selector 0x5915d806, oracle-free); `cancelWithdrawalIntent(uint256 index)` is oracle-free. The DegenPrime pool re-anchors `expiresAt` to `block.timestamp + 48h`, so its execute window is **24h** (48h total), NOT 48h. This is the savings-pool lender side; the bytes32-asset calls above are the Degen Account collateral side. The `withdraw` / `withdrawal-requests` / `execute-withdrawal-request` / `cancel-withdrawal-request` commands drive the pool side; the `*-collateral` / `withdrawal-intents` commands drive the collateral side. Plan around the lock: surprise 24h delays are how DeFi positions end up wedged. (Verified on-chain 2026-06-02.)
 
 ### 6.2 No premium / leverage-tier system
 
@@ -211,7 +211,7 @@ None of DeltaPrime's extended-DeFi facets are deployed on DegenPrime. The only D
 
 Same shape as DeltaPrime's Pool implementation. Selectors that matter:
 
-`deposit(uint256)`, `depositNativeToken()` (payable, for the `weth` pool only), `withdraw(uint256)`, `instantWithdraw(uint256)`, `totalSupply()`, `totalBorrowed()`, `balanceOf(address)`, `getBorrowed(address)`, `getDepositRate()`, `getBorrowingRate()`, `tokenAddress()`.
+`deposit(uint256)`, `depositNativeToken()` (payable, for the `weth` pool only), `withdraw(uint256,uint256[])` (the intent-gated step-2 executor, selector 0x5915d806), `createWithdrawalIntent(uint256)`, `cancelWithdrawalIntent(uint256)`, `totalSupply()`, `totalBorrowed()`, `balanceOf(address)`, `getBorrowed(address)`, `getDepositRate()`, `getBorrowingRate()`, `tokenAddress()`. (The single-arg `withdraw(uint256)` exists in bytecode but reverts bare `0x` — it does not resolve a named intent. `instantWithdraw` is absent.)
 
 `getDepositRate()` and `getBorrowingRate()` return 1e18-scaled annualised rates. Multiply by 100 for the percentage display.
 
@@ -269,9 +269,9 @@ The tool ships **17 commands**. State-changing commands default to a PREVIEW; ad
 | `pool-info [usdc\|weth\|cbbtc\|aero\|brett\|kaito\|cbdoge\|cbxrp\|all] [--json]` | read-only | Pool supply / borrow / utilization / deposit APR / borrow APR / TVL. Defaults to `all`. With `--json`: emits a single JSON object for a named pool, or a `{name: {...}}` dict for `all` (same shape as `deltaprime pool-info --json`). |
 | `my-positions` | read-only | Wallet ETH balance, per-pool wallet + deposit + borrow, Degen Account address. |
 | `deposit --pool X --amount Y [--execute]` | state-changing | Deposit into a savings pool. ERC20 approve handled automatically (approves the **pool**); native ETH (`weth`) sends `value` and skips the approve. |
-| `withdraw --pool X --amount Y [--execute]` | state-changing | **Step 1 of delayed lender withdraw (24h flow).** Registers a withdrawal intent on the pool via `createWithdrawalIntent(uint256)`. The pool's plain `withdraw(uint256)` is now gated and reverts — the savings-pool side has the same time-locked intent flow as the Degen Account collateral side. Intent matures ~24h later for a 48h window. Oracle-free; no RedStone payload. |
+| `withdraw --pool X --amount Y [--execute]` | state-changing | **Step 1 of delayed lender withdraw (24h flow).** Registers a withdrawal intent on the pool via `createWithdrawalIntent(uint256)`. The single-arg `withdraw(uint256)` does not resolve a named intent (reverts bare `0x`) — the savings-pool side has the same time-locked intent flow as the Degen Account collateral side. 24h time-lock, then a **24h** execute window (48h total). Oracle-free; no RedStone payload. |
 | `withdrawal-requests` | read-only | Lists pending **lender / pool-side** withdrawal intents (per pool, with ready/expired state) + current pool deposit. Oracle-free. Distinct from `withdrawal-intents` (Degen Account collateral side). |
-| `execute-withdrawal-request --pool X [--index N] [--execute]` | state-changing | Step 2 of lender pool withdraw: pulls a matured intent back to the wallet via `executeWithdrawalIntent(uint256[])`. Oracle-free. |
+| `execute-withdrawal-request --pool X [--index N] [--execute]` | state-changing | Step 2 of lender pool withdraw: consumes a matured intent via the two-arg `withdraw(uint256 amount, uint256[] intentIndices)` (selector 0x5915d806, same as the DegenPrime pool — not `instantWithdraw` or the single-arg form). An eth_call simulation runs first and refuses to broadcast on revert. Oracle-free. |
 | `cancel-withdrawal-request --pool X --index N [--execute]` | state-changing | Cancel a pending lender withdrawal intent via `cancelWithdrawalIntent(uint256)`. |
 | `create-account [--execute]` | state-changing | `factory.createLoan()` — empty Degen Account. |
 | `create-account --fund-pool X --fund-amount Y [--execute]` | state-changing | `factory.createAndFundLoan()` — create + fund in one tx (ERC20 only; approves the **factory**). |
@@ -281,7 +281,7 @@ The tool ships **17 commands**. State-changing commands default to a PREVIEW; ad
 | `summary [--json]` | read-only | Degen Account assets / debts + **live solvency** (health ratio, total value, debt, solvent flag) via RedStone-gated SolvencyFacet reads (falls back to balances-only if the gateway is down). With `--json`: emits a single trimmed JSON object (drops null, empty list, empty dict; preserves 0 and false) for one-shot agent ingestion. |
 | `swap --from S --to S --amount N [--slippage P] [--execute]` | state-changing (gated) | Swap one in-account asset for another via ParaSwap v6 / Velora. Hard 5% facet slippage cap on top of `--slippage`. RedStone-gated on execute. |
 | `swap-debt --from S --to S --amount N [--slippage P] [--execute]` | state-changing (gated) | Refinance debt: borrow `--to`, ParaSwap into `--from`, repay the old `--from` debt. Both symbols must have RedStone feeds. 5% USD-diff cap. RedStone-gated on execute. |
-| `withdraw-collateral --pool X --amount Y [--execute]` | state-changing | Step 1 of the universal 24h delayed withdrawal: registers a `WithdrawalIntent` (no RedStone). Executable ~24h later for a 48h window. |
+| `withdraw-collateral --pool X --amount Y [--execute]` | state-changing (gated) | Step 1 of the Degen Account collateral withdrawal: registers a `WithdrawalIntent` — **RedStone-gated** on the Account. 24h time-lock, then a **48h** execute window (72h total). |
 | `withdrawal-intents` | read-only | Lists pending intents per owned asset (READY / maturing / EXPIRED) + per-asset available balance. Oracle-free. |
 | `execute-withdrawal --pool X [--index N] [--execute]` | state-changing (gated) | Step 2: pulls matured intent(s) to the wallet (`executeWithdrawalIntent`). Default executes all currently-actionable intents for the asset. |
 | `cancel-withdrawal --pool X --index N [--execute]` | state-changing | Cancel a pending intent before maturity. Oracle-free, no payload. |
@@ -291,7 +291,7 @@ The tool ships **17 commands**. State-changing commands default to a PREVIEW; ad
 
 ### Preview vs broadcast
 
-Every state-changing command **defaults to a PREVIEW** that prints what it would do and does nothing on-chain. It only signs and broadcasts when you add `--execute`. On `--execute`, solvency-gated writes (`borrow`, `swap`, `swap-debt`, `execute-withdrawal`) append a RedStone signed-price payload to the calldata; the rest (`deposit`, `withdraw`, `fund`, `repay`, `create-account`, `withdraw-collateral`, `cancel-withdrawal`) need no payload. Read-only commands ignore `--execute`.
+Every state-changing command **defaults to a PREVIEW** that prints what it would do and does nothing on-chain. It only signs and broadcasts when you add `--execute`. On `--execute`, solvency-gated writes (`borrow`, `swap`, `swap-debt`, `withdraw-collateral`, `execute-withdrawal`) append a RedStone signed-price payload to the calldata; the rest (`deposit`, `withdraw`, `fund`, `repay`, `create-account`, `cancel-withdrawal`) need no payload. (The Degen Account `createWithdrawalIntent` is RedStone-gated on-chain; the exact create-time feed set is still being reconciled.) Read-only commands ignore `--execute`.
 
 ---
 

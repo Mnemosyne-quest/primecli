@@ -40,11 +40,14 @@ Diamond's SolvencyFacet, read via eth_call with a RedStone price payload appende
 back to balances-only if the gateway is unreachable).
 
 Collateral withdrawal is universally time-locked on DegenPrime (NOT just risky assets):
-withdraw-collateral registers a WithdrawalIntent (createWithdrawalIntent, no RedStone).
-The intent becomes executable ~24h later for a 48h window (24h-72h total);
-execute-withdrawal then pulls it to the wallet (executeWithdrawalIntent, RedStone-gated).
-withdrawal-intents lists pending intents + per-asset available balance (oracle-free reads).
-cancel-withdrawal cancels a pending intent before maturity.
+withdraw-collateral registers a WithdrawalIntent on the Degen Account (createWithdrawalIntent,
+which IS RedStone-gated — the create-time solvency check is on-chain). The intent becomes
+actionable 24h after creation and stays actionable for a further 48h (expiresAt =
+actionableAt + 48h), so the live execute window is 24h-72h after creation; execute-withdrawal
+then pulls it to the wallet (executeWithdrawalIntent, RedStone-gated). withdrawal-intents lists
+pending intents + per-asset available balance (oracle-free reads). cancel-withdrawal cancels a
+pending intent before maturity. (The savings-pool "diamond hands" path differs: see cmd_withdraw
+— oracle-free create, and a 24h execute window because the pool re-anchors expiresAt.)
 
 Leverage flow: create-account -> fund (collateral) -> borrow -> repay -> withdraw.
 fund moves collateral from the wallet into the Degen Account; borrow needs a funded
@@ -250,15 +253,17 @@ def get_account() -> Account:
 EIP1967_IMPL_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
 
 # Pool ABI - minimum surface for lending pool ops. DegenPrime pools share the
-# DeltaPrime Pool implementation: deposit/withdraw/instantWithdraw, rate views,
-# borrow accounting, and ERC20 receipt-token reads. Function names are verified
-# against Harvest's DegenPrime strategies (which call these directly) and the
-# DeltaPrimeLabs/deltaprime-contracts Pool.sol source.
+# DeltaPrime Pool implementation: deposit, the intent-gated two-arg withdraw, rate views,
+# borrow accounting, and ERC20 receipt-token reads. The matured-intent executor is
+# withdraw(uint256 _amount, uint256[] intentIndices) (selector 0x5915d806) — the single-arg
+# withdraw(uint256) and instantWithdraw(uint256) do NOT resolve a named lender intent (they
+# revert without reaching the intent lookup). Verified on-chain on Base/Avalanche pools
+# 2026-06-02. See _encode_pool_withdraw + cmd_execute_pool_withdrawal.
 POOL_ABI = json.loads(
     '['
     '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"deposit","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[],"name":"depositNativeToken","outputs":[],"stateMutability":"payable","type":"function"},'
-    '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[{"name":"_amount","type":"uint256"},{"name":"intentIndices","type":"uint256[]"}],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"withdrawNativeToken","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"instantWithdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[],"name":"totalSupply","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
@@ -391,10 +396,11 @@ PRIME_ACCOUNT_ABI = [
     # repay leg against the facet's own 5% cap (the facet calls the same view internally).
     {"inputs": [{"name": "symbols", "type": "bytes32[]"}], "name": "getPrices",
      "outputs": [{"type": "uint256[]"}], "stateMutability": "view", "type": "function"},
-    # WithdrawalIntentFacet - universal time-locked collateral withdrawal on DegenPrime.
-    # createWithdrawalIntent / cancelWithdrawalIntent are oracle-free; executeWithdrawalIntent
-    # is RedStone-gated. IntentInfo's isActionable/isExpired flags make the 24h-72h window
-    # readable on-chain.
+    # WithdrawalIntentFacet - universal time-locked collateral withdrawal on the Degen
+    # Account. On the Account, createWithdrawalIntent IS RedStone-gated (on-chain solvency
+    # check at create); cancelWithdrawalIntent is oracle-free; executeWithdrawalIntent is
+    # RedStone-gated. IntentInfo's isActionable/isExpired flags make the 24h-72h window
+    # (actionable at created+24h, expires at actionableAt+48h) readable on-chain.
     {"inputs": [{"name": "_asset", "type": "bytes32"}, {"name": "_amount", "type": "uint256"}],
      "name": "createWithdrawalIntent", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
     {"inputs": [{"name": "_asset", "type": "bytes32"}, {"name": "intentIndices", "type": "uint256[]"}],
@@ -933,10 +939,14 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
     print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
-    """Pool-side (LENDER) withdraw. DegenPrime uses a 24h time-locked intent
-    system for ALL withdrawals (both pool-side and Degen Account). Step 1 creates
-    a WithdrawalIntent via createWithdrawalIntent; after ~24h, instantWithdraw
-    executes it.
+    """Pool-side (LENDER) withdraw — step 1 of a time-locked intent flow.
+    DegenPrime time-locks ALL withdrawals (both pool-side and Degen Account). Step 1
+    creates a WithdrawalIntent via createWithdrawalIntent (no RedStone). The pool
+    ("diamond hands") becomes actionable 24h after creation and stays actionable for a
+    further 24h (the pool re-anchors expiresAt to creation + 48h), so the execute window
+    is 24h-48h after creation. Step 2 (execute-pool-withdrawal) consumes it via
+    withdraw(uint256 _amount, uint256[] intentIndices) (selector 0x5915d806) — NOT
+    instantWithdraw, which does not resolve a named intent.
 
     Always withdraws the wrapped token (WETH for the weth pool, not native ETH).
     The pool also exposes withdrawNativeToken — future --native flag could opt in."""
@@ -948,7 +958,8 @@ def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
     if not execute:
         print(f"Preview: Request withdrawal of {amount} {cfg['symbol']} from {pool_name.upper()} pool")
         print("  Step 1: createWithdrawalIntent — registers the intent on-chain (no RedStone).")
-        print("  Wait ~24h for the intent to mature, then step 2: instantWithdraw.")
+        print("  Becomes actionable 24h after creation, then stays actionable for a further")
+        print("  24h (expires at created+48h). Step 2 is execute-pool-withdrawal in that window.")
         print("  Use withdrawal-intents to track pending intents.")
         print("Run with --execute to broadcast (step 1 only — creates the intent).")
         return
@@ -987,10 +998,30 @@ def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
             print(f"  After maturity, execute: degenprime execute-pool-withdrawal --pool {pool_name} --index {len(intents)-1} --execute")
             print(f"  Or cancel: degenprime withdraw --pool {pool_name} --amount {amount} --cancel --index {len(intents)-1} --execute")
 
+def _encode_pool_withdraw(amount_wei: int, indices: list) -> str:
+    """Calldata for the pool's intent-gated executor withdraw(uint256 _amount,
+    uint256[] intentIndices) (selector 0x5915d806). Hand-encoded (uint256 head +
+    dynamic uint256[] tail) so it never depends on instantWithdraw / single-arg
+    withdraw, neither of which resolves a named lender intent."""
+    selector = Web3.keccak(text="withdraw(uint256,uint256[])")[:4].hex()
+    head = amount_wei.to_bytes(32, "big").hex()          # _amount
+    head += (0x40).to_bytes(32, "big").hex()             # offset to the array (2 head words in)
+    tail = len(indices).to_bytes(32, "big").hex()
+    tail += b"".join(int(i).to_bytes(32, "big") for i in indices).hex()
+    return "0x" + selector + head + tail
+
+
 def cmd_execute_pool_withdrawal(pool_name: str, index: int, execute: bool = False):
-    """Step 2 of pool-side withdrawal: execute a matured WithdrawalIntent via
-    instantWithdraw(uint256 index). The intent must be past its actionableAt
-    timestamp (~24h after creation) and before expiry (~72h). Not RedStone-gated."""
+    """Step 2 of pool-side (LENDER) withdrawal: consume a matured WithdrawalIntent via
+    withdraw(uint256 _amount, uint256[] intentIndices) (selector 0x5915d806). The intent
+    must be past its actionableAt timestamp (24h after creation) and before expiry (a
+    further 24h on the pool — created+48h). Not RedStone-gated.
+
+    NOT instantWithdraw: the pool also exposes instantWithdraw(uint256) and single-arg
+    withdraw(uint256), but neither resolves a named lender intent — they revert without
+    reaching the intent lookup. withdraw(_amount, [index]) reaches the maturity check
+    (verified on-chain 2026-06-02). An eth_call simulation runs before broadcast and
+    refuses to send on revert."""
     contract, cfg, w3 = get_pool_contract(pool_name)
     acct = get_account()
     print(f"Wallet: {acct.address}")
@@ -1015,8 +1046,18 @@ def cmd_execute_pool_withdrawal(pool_name: str, index: int, execute: bool = Fals
         print(f"  ✗ Not yet actionable. Wait until {act_str}.")
         return
 
+    data = _encode_pool_withdraw(intent[0], [index])
+
+    # Simulate before broadcasting. A passing eth_call here means the intent is matured,
+    # non-expired, and the pool has the liquidity.
+    try:
+        w3.eth.call({"from": acct.address, "to": contract.address, "data": data})
+    except Exception as e:
+        print(f"  ✗ Simulation reverted — refusing to broadcast: {type(e).__name__}: {str(e)[:160]}")
+        return
+
     if not execute:
-        print(f"Preview: Execute withdrawal of {amount_str} via instantWithdraw({index})")
+        print(f"Preview: Execute withdrawal of {amount_str} via withdraw({intent[0]}, [{index}]) — simulation passed")
         print("Run with --execute to broadcast")
         return
 
@@ -1027,8 +1068,7 @@ def cmd_execute_pool_withdrawal(pool_name: str, index: int, execute: bool = Fals
         "gas": 600000,
         "gasPrice": _tx_gas_price(w3),
         "chainId": CHAIN_ID,
-        "data": "0x" + Web3.keccak(text="instantWithdraw(uint256)")[:4].hex() +
-                index.to_bytes(32, "big").hex(),
+        "data": data,
     }
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -1882,12 +1922,14 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     print(f"{'✓' if ok else '✗'} Swap debt {from_sym} -> {to_sym} {'confirmed' if ok else 'failed'}")
     print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
-# ─── Collateral withdrawal (WithdrawalIntentFacet) ──────────────────────────
-# Universal 24h time-lock on DegenPrime - NOT just risky assets. createWithdrawalIntent
-# registers an intent (no RedStone), then executeWithdrawalIntent pulls it after
-# maturity (RedStone-gated). Window (from the IntentInfo flags on-chain):
-# actionableAt = createdAt + 24h, expiresAt = actionableAt + 48h. So an intent is
-# executable in a 24h-72h window. cancelWithdrawalIntent drops a pending intent.
+# ─── Collateral withdrawal (WithdrawalIntentFacet, Degen Account) ───────────
+# Universal 24h time-lock on the Degen Account - NOT just risky assets. On the Account,
+# createWithdrawalIntent IS RedStone-gated (on-chain solvency check at create), then
+# executeWithdrawalIntent pulls it after maturity (also RedStone-gated). Window (from the
+# IntentInfo flags on-chain): actionableAt = createdAt + 24h, expiresAt = actionableAt + 48h.
+# So an intent is executable in a 24h-72h window (a 48h actionable span) — actionableAt-
+# anchored, unlike the savings pool which re-anchors expiresAt for a 24h window.
+# cancelWithdrawalIntent drops a pending intent.
 
 def _fmt_window(actionable_at: int, expires_at: int) -> str:
     """Human one-liner for an intent's maturity window, anchored to chain time."""

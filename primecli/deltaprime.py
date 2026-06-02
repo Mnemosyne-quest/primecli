@@ -57,13 +57,14 @@ back to balances-only if the gateway is unreachable).
 
 The savings-pool lender side `withdraw` is ALSO a two-step, time-delayed intent flow.
 Step 1: `deltaprime withdraw --pool X --amount Y` calls the pool's
-`createWithdrawalIntent(uint256)` (the pool's plain `withdraw` reverts while no intent
-has matured). Step 2 (after the 24h maturity, within the 48h execution window):
-`execute-withdrawal-request --pool X [--index N]` re-calls the pool's own intent-gated
-`withdraw(uint256 amount)` — there is NO separate executor selector. `withdrawal-requests`
-lists pending lender intents per pool; `cancel-withdrawal-request --pool X --index N`
-cancels a pending one via `cancelWithdrawalIntent(uint256)`. Storage is per-EOA on the
-pool (NOT the Prime Account address). No RedStone on any of these.
+`createWithdrawalIntent(uint256)` (the single-arg `withdraw` does not resolve a named
+intent). Step 2 (after the 24h time-lock, within the following 48h execute window — 72h
+total): `execute-withdrawal-request --pool X [--index N]` consumes the matured intent via
+the pool's two-arg intent-gated executor `withdraw(uint256 _amount, uint256[] intentIndices)`
+(selector 0x5915d806, same as the DegenPrime pool — NOT the single-arg form).
+`withdrawal-requests` lists pending lender intents per pool; `cancel-withdrawal-request
+--pool X --index N` cancels a pending one via `cancelWithdrawalIntent(uint256)`. Storage is
+per-EOA on the pool (NOT the Prime Account address). No RedStone on any of these.
 
 Collateral withdrawal on the Prime Account is the separate `WithdrawalIntentFacet` flow:
 withdraw-collateral / withdrawal-intents / execute-withdrawal. Same 24h-72h shape; the
@@ -546,19 +547,20 @@ ERC20_BALANCE_ABI = json.loads(
 # pool, verified on Snowtrace 2026-05-23 / 2026-05-29).
 # Pool ABI. The lender side runs through the same delayed-intent flow as the Prime
 # Account collateral side: createWithdrawalIntent registers, cancelWithdrawalIntent
-# kills a pending one. There is NO separate pool executor — `withdraw(uint256)` is
-# itself intent-gated: it reverts with no matured intent and succeeds (consuming the
-# matured intent) once one covers the amount, so re-calling withdraw IS step 2. Intent
-# storage is per-EOA (the wallet address, NOT the Prime Account address). Confirmed by
-# disassembling the live wavax pool impl 0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E
-# (proxy 0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4) 2026-05-31: selectors
-# withdraw/createWithdrawalIntent/cancelWithdrawalIntent/getUserIntents are present;
-# instantWithdraw and executeWithdrawalIntent(uint256[]) are ABSENT. Signatures match
-# the Prime Account WithdrawalIntentFacet's IntentInfo shape.
+# kills a pending one. The matured-intent executor is the two-arg
+# `withdraw(uint256 _amount, uint256[] intentIndices)` (selector 0x5915d806) — the same
+# intent-gated executor as the DegenPrime pool, NOT the single-arg `withdraw(uint256)`.
+# Intent storage is per-EOA (the wallet address, NOT the Prime Account address). Verified
+# on the live wavax pool impl 0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E (proxy
+# 0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4) 2026-06-02: both single-arg withdraw and
+# two-arg withdraw exist in bytecode, but only the two-arg form resolves a named intent —
+# differential eth_call with no intent gives "Invalid intent index" (two-arg) vs bare 0x
+# (single-arg). instantWithdraw and executeWithdrawalIntent(uint256[]) are ABSENT.
+# Signatures match the Prime Account WithdrawalIntentFacet's IntentInfo shape.
 POOL_ABI = json.loads(
     '['
     '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"deposit","outputs":[],"stateMutability":"nonpayable","type":"function"},'
-    '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[{"name":"_amount","type":"uint256"},{"name":"intentIndices","type":"uint256[]"}],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"amount","type":"uint256"}],"name":"createWithdrawalIntent","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"index","type":"uint256"}],"name":"cancelWithdrawalIntent","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"user","type":"address"}],"name":"getUserIntents","outputs":[{"components":[{"name":"amount","type":"uint256"},{"name":"actionableAt","type":"uint256"},{"name":"expiresAt","type":"uint256"},{"name":"isPending","type":"bool"},{"name":"isActionable","type":"bool"},{"name":"isExpired","type":"bool"}],"type":"tuple[]"}],"stateMutability":"view","type":"function"},'
@@ -1459,15 +1461,32 @@ def cmd_withdrawal_requests():
     if not any_pending:
         print("  No pending lender withdrawal intents.")
 
+def _encode_pool_withdraw(amount_wei: int, indices: list) -> str:
+    """Calldata for the pool's intent-gated executor withdraw(uint256 _amount,
+    uint256[] intentIndices) (selector 0x5915d806). Hand-encoded (uint256 head +
+    dynamic uint256[] tail) so it never depends on the single-arg withdraw(uint256),
+    which does NOT resolve a lender's named intent. Mirrors the DegenPrime pool executor."""
+    selector = Web3.keccak(text="withdraw(uint256,uint256[])")[:4].hex()
+    head = amount_wei.to_bytes(32, "big").hex()          # _amount
+    head += (0x40).to_bytes(32, "big").hex()             # offset to the array (2 head words in)
+    tail = len(indices).to_bytes(32, "big").hex()
+    tail += b"".join(int(i).to_bytes(32, "big") for i in indices).hex()
+    return "0x" + selector + head + tail
+
+
 def cmd_execute_withdrawal_request(pool_name: str, index: int = None, execute: bool = False):
-    """Step 2 of lender pool withdrawal. The pool has NO separate executor function:
-    once an intent matures, the pool's OWN `withdraw(uint256 amount)` becomes callable
-    (it is intent-gated — reverts with no matured intent, succeeds against a matured
-    one covering the amount). So step 2 is just re-calling `withdraw(intent_amount)`.
+    """Step 2 of lender pool withdrawal: consume a matured WithdrawalIntent via
+    withdraw(uint256 _amount, uint256[] intentIndices) (selector 0x5915d806) — the same
+    two-arg intent-gated executor as the DegenPrime pool, hand-encoded via
+    _encode_pool_withdraw. NOT the single-arg withdraw(uint256): both selectors exist on
+    the live wavax pool impl 0x1b9BcAC5..., but only the two-arg form resolves a lender's
+    named intent (verified 2026-06-02 — two-arg withdraw(amount,[0]) against no intent
+    reverts "Invalid intent index"; single-arg reverts bare 0x).
     Refuses any intent that has not matured (isActionable=false) or has expired.
     --index selects which intent to execute; with no --index, the single actionable
     intent is used (if more than one is actionable, --index is required — one matured
-    intent is consumed per `withdraw` call)."""
+    intent is consumed per `withdraw` call). An eth_call simulation runs before broadcast
+    and refuses to send on revert."""
     contract, cfg, w3 = get_pool_contract(pool_name)
     acct = get_account()
     intents = contract.functions.getUserIntents(acct.address).call()
@@ -1503,17 +1522,29 @@ def cmd_execute_withdrawal_request(pool_name: str, index: int = None, execute: b
     if not is_actionable:
         print(f"  ✗ intent [{index}] has not matured yet — refusing.")
         return
-    print(f"  Will pull {amt / 10**cfg['decimals']:,.6f} {cfg['symbol']} via withdraw({amt}) "
-          f"(intent-gated; matures intent [{index}]).")
+    print(f"  Will pull {amt / 10**cfg['decimals']:,.6f} {cfg['symbol']} via "
+          f"withdraw({amt}, [{index}]) (intent-gated; consumes intent [{index}]).")
 
-    if not execute:
-        print("Run with --execute to broadcast (pulls the funds to the wallet).")
+    data = _encode_pool_withdraw(amt, [index])
+
+    # Simulate before broadcasting. A passing eth_call here means the intent is matured,
+    # non-expired, and the named index resolves correctly.
+    try:
+        w3.eth.call({"from": acct.address, "to": contract.address, "data": data})
+    except Exception as e:
+        print(f"  ✗ Simulation reverted — refusing to broadcast: {type(e).__name__}: {str(e)[:160]}")
         return
 
-    tx = contract.functions.withdraw(amt).build_transaction({
-        "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+    if not execute:
+        print("Run with --execute to broadcast (pulls the funds to the wallet — simulation passed).")
+        return
+
+    tx = {
+        "from": acct.address, "to": contract.address,
+        "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 600000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
-    })
+        "data": data,
+    }
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)

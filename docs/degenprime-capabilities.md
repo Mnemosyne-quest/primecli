@@ -14,7 +14,7 @@ Per-capability build spec for the DegenPrime surface on Base (chainId 8453), pre
 
 - **bytes32 asset symbols**: right-pad the ASCII symbol with zero bytes to 32. Symbols: `USDC`, `ETH`, `cbBTC`, `AERO`, `BRETT`, `KAITO`, `cbDOGE`, `cbXRP`, plus any of the 32 TokenManager-listed collateral symbols (`AIXBT`, `TOSHI`, `VIRTUAL`, `MOG`, `SKI`, `DEGEN`, `KEYCAT`, `BASEDPEPE`, `VVV`, `CLANKER`, `BNKR`, `DRB`, `COOKIE`, `ZORA`, `DINO`, `EUROC`, `weETH`, `ezETH`, `SPX`, `LBTC`, `USDT`, `cbLTC`, `AVNT`, `GIZA`). Case matters (`cbBTC` not `cbbtc`). Use `symbol.encode().ljust(32, b"\x00")`.
 - **Decimals**: USDC 6, USDT 6, cbXRP 6, cbBTC 8, cbDOGE 8, WETH 18, AERO 18, BRETT 18, KAITO 18, most other collateral 18. Resolve unknowns via `TokenManager.getAssetAddress(bytes32) -> address` then `ERC20.decimals()`. Pool decimals are baked into `POOLS` in the tool.
-- **Solvency gating**: state-changing facet functions that carry `remainsSolvent` (so: `borrow`, `swap` via `paraSwapV6`, `swap-debt` via `swapDebtParaSwap`, `executeWithdrawalIntent`) run the RedStone-gated solvency math inside the transaction. A real broadcast needs RedStone signed price calldata appended (the tool's `build_redstone_payload` does this). Plain `eth_call` previews of these revert `0xe7764c9e` ("missing oracle payload"). The remaining writes (`deposit`, `withdraw`, `fund`, `repay`, `createLoan`, `createAndFundLoan`, `createWithdrawalIntent`, `cancelWithdrawalIntent`) need no payload.
+- **Solvency gating**: state-changing facet functions that carry `remainsSolvent` (so: `borrow`, `swap` via `paraSwapV6`, `swap-debt` via `swapDebtParaSwap`, the Degen Account's `createWithdrawalIntent` and `executeWithdrawalIntent`) run the RedStone-gated solvency math inside the transaction. A real broadcast needs RedStone signed price calldata appended (the tool's `build_redstone_payload` does this). Plain `eth_call` previews of these revert `0xe7764c9e` ("missing oracle payload"). The remaining writes (`deposit`, `withdraw`, `fund`, `repay`, `createLoan`, `createAndFundLoan`, `cancelWithdrawalIntent`, and the pool-side `createWithdrawalIntent`) need no payload.
 - **Approve targets** (easy to get wrong):
   - `deposit` (pool savings) approves the **pool proxy**.
   - `fund` (collateral into Degen Account) approves the **Degen Account** itself.
@@ -43,16 +43,16 @@ Pool.deposit(uint256 amount) payable               // native path (weth pool; va
 
 ## 2. Withdraw (savings pool, lender side) — ✅ SHIPPED as `withdraw` / `withdrawal-requests` / `execute-withdrawal-request` / `cancel-withdrawal-request`
 
-**There is no instant lender withdraw on DegenPrime today.** The pool's plain `withdraw(uint256)` reverts. The lender side runs through the SAME 24h delayed-intent flow that the Degen Account collateral side uses (§7). Probe-confirmed on the WETH pool `0x81b0b59C7967479EC5Ce55cF6588bf314C3E4852` 2026-05-29; same `IntentInfo` struct shape as the collateral facet.
+**There is no instant lender withdraw on DegenPrime today.** The pool's single-arg `withdraw(uint256)` reverts (bare `0x`; it never resolves a named intent). The lender side runs through the SAME delayed-intent flow as the Degen Account collateral side (§7), but with the pool's own two-arg executor. Verified on-chain 2026-06-02: `withdraw(amount,[index])` reaches the intent lookup; `instantWithdraw` / `executeWithdrawalIntent(uint256[])` are ABSENT on the pool. Same `IntentInfo` struct shape as the collateral facet.
 
 ```
-Pool.createWithdrawalIntent(uint256 amount)            // step 1: register intent
-Pool.executeWithdrawalIntent(uint256[] intentIndices)  // step 2: after 24h, before 72h
-Pool.cancelWithdrawalIntent(uint256 index)             // abort a pending intent
-Pool.getUserIntents(address user) -> IntentInfo[]      // list per-EOA intents
+Pool.createWithdrawalIntent(uint256 amount)                // step 1: register intent (oracle-free)
+Pool.withdraw(uint256 amount, uint256[] intentIndices)     // step 2: after 24h, consume the matured intent (selector 0x5915d806)
+Pool.cancelWithdrawalIntent(uint256 index)                 // abort a pending intent (oracle-free)
+Pool.getUserIntents(address user) -> IntentInfo[]          // list per-EOA intents
 Pool.getTotalIntentAmount(address user) -> uint256
 ```
-- Timing: `actionableAt = createdAt + 24h`, `expiresAt = actionableAt + 48h`. Executable in a **24h-72h window**.
+- Timing: 24h time-lock, then a **24h** execute window (48h total). The DegenPrime pool re-anchors `expiresAt` to `block.timestamp + 48h` (not `actionableAt + 48h`), so its window is 24h, not 48h. (DeltaPrime's savings pool, by contrast, is `actionableAt + 48h` = 72h total.)
 - Storage is **per-EOA on the pool** (the wallet that deposited), NOT per-Degen-Account.
 - All five functions are **oracle-free** — no RedStone payload needed.
 - **Approve target:** none.
@@ -162,10 +162,10 @@ DegenAccount.swapDebtParaSwap(bytes32 fromAsset, bytes32 toAsset,
 
 ## 8. Universal 24h delayed collateral withdrawal — ✅ SHIPPED as `withdraw-collateral` / `withdrawal-intents` / `execute-withdrawal` / `cancel-withdrawal`
 
-**No instant withdrawal of any kind.** DegenPrime locks **every** collateral withdrawal from a Degen Account behind a 24h time-lock, regardless of asset. The lender-side savings pools (`Pool.withdraw`, §2) are ALSO 24h-locked behind the same delayed-intent flow — the plain `withdraw(uint256)` reverts. Nothing leaves the protocol without the 24h wait (same model as DeltaPrime now).
+**No instant withdrawal of any kind.** DegenPrime locks **every** collateral withdrawal from a Degen Account behind a 24h time-lock, regardless of asset. The lender-side savings pools (`Pool.withdraw`, §2) are ALSO 24h-locked behind the same delayed-intent flow — the single-arg `withdraw(uint256)` reverts. Nothing leaves the protocol without the 24h wait (same model as DeltaPrime now). The two differ: the Degen Account uses a **48h** execute window and `createWithdrawalIntent` is RedStone-gated; the savings pool uses a **24h** window and is oracle-free (§2).
 
 ```
-DegenAccount.createWithdrawalIntent(bytes32 asset, uint256 amount)               // step 1, oracle-free
+DegenAccount.createWithdrawalIntent(bytes32 asset, uint256 amount)               // step 1, RedStone-gated
 DegenAccount.executeWithdrawalIntent(bytes32 asset, uint256[] intentIndices)     // step 2, RedStone-gated
 DegenAccount.cancelWithdrawalIntent(bytes32 asset, uint256 intentIndex)          // oracle-free
 DegenAccount.getUserIntents(bytes32 asset) -> IntentInfo[]                       // view, oracle-free

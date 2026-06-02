@@ -65,20 +65,20 @@ swapDebtParaSwap(bytes32 _fromAsset, bytes32 _toAsset, uint256 _repayAmount, uin
 
 ## 2b. Lender pool withdraw — ✅ SHIPPED as `withdraw` / `withdrawal-requests` / `execute-withdrawal-request` / `cancel-withdrawal-request`
 
-**There is no instant lender-side withdraw on DeltaPrime today.** The savings-pool's `withdraw(uint256)` is intent-gated: it reverts while no intent has matured, and there is **no** separate executor (`instantWithdraw` / `executeWithdrawalIntent` are absent on the pool). The lender side applies the SAME 24h delayed-intent flow that the Prime Account collateral side uses (§3), but step 2 is just **re-calling the pool's own `withdraw(uint256 amount)`** once the intent matures. Confirmed by disassembling the live wavax pool impl `0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E` (proxy `0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4`) 2026-05-31; same `IntentInfo` struct shape as `WithdrawalIntentFacet`.
+**There is no instant lender-side withdraw on DeltaPrime today.** The savings-pool's single-arg `withdraw(uint256)` does NOT resolve a named intent (reverts bare `0x`). The matured-intent executor is the two-arg `withdraw(uint256 amount, uint256[] intentIndices)` (selector `0x5915d806`) — the same intent-gated executor as the DegenPrime pool, NOT a re-call of the single-arg form. `instantWithdraw` / `executeWithdrawalIntent(uint256[])` are absent on the pool. The lender side applies the SAME 24h delayed-intent flow that the Prime Account collateral side uses (§3). Verified on the live wavax pool impl `0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E` (proxy `0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4`) 2026-06-02: both selectors exist in bytecode, but only the two-arg form reaches the intent lookup — `withdraw(amount,[0])` against no intent reverts `"Invalid intent index"` (0x08c379a0), while single-arg reverts bare `0x`. Same `IntentInfo` struct shape as `WithdrawalIntentFacet`.
 
 ```
-createWithdrawalIntent(uint256 amount)            // step 1: register intent
-withdraw(uint256 amount)                          // step 2: after 24h, re-call the pool's OWN intent-gated withdraw (consumes the matured intent)
-cancelWithdrawalIntent(uint256 index)             // abort a pending intent
-getUserIntents(address user) -> IntentInfo[]      // list per-EOA intents
-getTotalIntentAmount(address user) -> uint256     // sum of pending amounts
+createWithdrawalIntent(uint256 amount)                       // step 1: register intent
+withdraw(uint256 amount, uint256[] intentIndices)            // step 2: after 24h, consume the matured intent (selector 0x5915d806)
+cancelWithdrawalIntent(uint256 index)                        // abort a pending intent
+getUserIntents(address user) -> IntentInfo[]                 // list per-EOA intents
+getTotalIntentAmount(address user) -> uint256                // sum of pending amounts
 ```
 
-- Timing: `actionableAt = createdAt + 24h`, `expiresAt = actionableAt + 48h`. So executable in a **24h-72h window**.
+- Timing: `actionableAt = createdAt + 24h`, `expiresAt = actionableAt + 48h`. So a 24h time-lock then a **48h** execute window (24h-72h total). Note this differs from the DegenPrime pool (24h window), which re-anchors `expiresAt` to `block.timestamp`.
 - Storage is **per-EOA on the pool** (the wallet address that deposited), NOT per-Prime-Account. Same key shape across both chains.
 - All of these are **oracle-free** — no RedStone payload needed (compare §3 below, where only the create step is oracle-free).
-- Build: `withdraw --pool X --amount Y` registers an intent. `execute-withdrawal-request --pool X` re-calls the pool's `withdraw(intent_amount)` to pull the matured intent — one matured intent per call (`--index` to pick which when several are actionable). `withdrawal-requests` lists pending lender intents per pool. `cancel-withdrawal-request --pool X --index N` cancels a pending one.
+- Build: `withdraw --pool X --amount Y` registers an intent. `execute-withdrawal-request --pool X` calls the pool's `withdraw(intent_amount, [index])` to pull the matured intent — one matured intent per call (`--index` to pick which when several are actionable); an eth_call simulation runs first and refuses to broadcast on revert. `withdrawal-requests` lists pending lender intents per pool. `cancel-withdrawal-request --pool X --index N` cancels a pending one.
 - Distinct from §3 (Prime Account collateral withdraw) — different contract (pool, not facet), different selector signatures, but identical user-facing 24h flow.
 
 ---
