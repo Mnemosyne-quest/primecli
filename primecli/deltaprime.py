@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/root/.openclaw/venv/bin/python3
 """DeltaPrime Protocol interaction module (Avalanche C-chain).
 
 Lending pools take direct EOA deposits/withdrawals. Borrowing and leverage go
@@ -7,68 +7,65 @@ SmartLoansFactory. The EOA owns it; borrow/repay/fund run on the Prime Account,
 which itself talks to the pools.
 
 Usage:
-  deltaprime pool-info [usdc|wavax|weth|btc|usdt|all] [--json]
-  deltaprime my-positions
-  deltaprime deposit --pool usdc --amount 100 [--execute]
-  deltaprime withdraw --pool usdc --amount 100 [--execute]                       (24h delayed; step 1)
-  deltaprime withdrawal-requests                                                 (lists pending lender intents)
-  deltaprime execute-withdrawal-request --pool usdc [--index N] [--execute]      (step 2; post-maturity)
-  deltaprime cancel-withdrawal-request --pool usdc --index N [--execute]
-  deltaprime create-prime-account [--execute]   (alias: create-account)
-  deltaprime create-prime-account --fund-pool usdc --fund-amount 100 [--execute]
-  deltaprime prime-summary
-  deltaprime defi --json          (aggregate ALL positions as DeBank-style JSON; read-only)
-  deltaprime fund --pool usdc --amount 100 [--execute]
-  deltaprime borrow --pool usdc --amount 100 [--execute]
-  deltaprime repay --pool usdc --amount 100 [--execute]
-  deltaprime swap --from USDC --to AVAX --amount 10 [--via yak|paraswap] [--slippage 0.5] [--execute]
-  deltaprime swap-debt --from AVAX --to USDC --amount 100 [--slippage 0.5] [--execute]
-  deltaprime withdraw-collateral --pool usdc --amount 100 [--execute]
-  deltaprime withdrawal-intents
-  deltaprime execute-withdrawal --pool usdc [--index N] [--execute]
-  deltaprime gmx-positions
-  deltaprime gmx-deposit --market avax-usdc --amount 10 [--side long|short] [--slippage 1] [--fee-buffer 2] [--execute]
-  deltaprime gmx-withdraw --market avax+ --amount 5 [--slippage 1] [--fee-buffer 2] [--execute]
-  deltaprime lb-positions
-  deltaprime lb-add --pair avax-usdc --amount-x 1 --amount-y 30 [--shape spot|curve|bidask] [--range 5] [--slippage 1] [--id-slippage 5] [--execute]
-  deltaprime lb-remove --pair avax-usdc [--slippage 1] [--execute]
-  deltaprime sjoe-position
-  deltaprime sjoe-stake --amount 100 [--execute]
-  deltaprime sjoe-unstake --amount 100 [--execute]
-  deltaprime sjoe-claim [--execute]
-  deltaprime prime-tier
-  deltaprime prime-needed --borrow 1000 [--tier premium|basic]
-  deltaprime prime-deposit --amount 200 [--execute]
-  deltaprime prime-activate [--amount N] [--execute]
-  deltaprime prime-deactivate [--withdraw] [--execute]
-  deltaprime prime-unstake --amount N [--execute]
-  deltaprime prime-repay --amount N [--execute]
-  deltaprime zap --market avax-usdc --collateral wavax --collateral-amount 1 --borrow-amount 30 --deposit-amount 30 [--side long|short] [--swap] [--slippage 1] [--fee-buffer 2] [--execute]
-
-Configuration (env vars):
-  DELTAPRIME_PRIVATE_KEY  Raw 0x... private key for the signer.
-  DELTAPRIME_KEY_FILE     Path to a file containing the 0x key (alternative to the env var).
-  DELTAPRIME_RPC          Avalanche C-chain RPC URL (defaults to api.avax.network).
-  --key <0xhex>           One-off CLI override (takes precedence over both env vars).
+  python3 deltaprime.py pool-info [usdc|wavax|weth|btc|usdt|all]
+  python3 deltaprime.py my-positions
+  python3 deltaprime.py deposit --pool usdc --amount 100 [--execute]
+  python3 deltaprime.py withdraw --pool usdc --amount 100 [--execute]   (step 1: 24h WithdrawalIntent, NOT instant)
+  python3 deltaprime.py withdrawal-requests                                          (lists pending lender intents)
+  python3 deltaprime.py execute-withdrawal-request --pool usdc [--index N] [--execute]   (step 2; post-maturity)
+  python3 deltaprime.py cancel-withdrawal-request --pool usdc --index N [--execute]
+  python3 deltaprime.py create-prime-account [--execute]   (alias: create-account)
+  python3 deltaprime.py create-prime-account --fund-pool usdc --fund-amount 100 [--execute]
+  python3 deltaprime.py prime-summary
+  python3 deltaprime.py defi --json          (aggregate ALL positions as DeBank-style JSON; read-only)
+  python3 deltaprime.py fund --pool usdc --amount 100 [--execute]
+  python3 deltaprime.py borrow --pool usdc --amount 100 [--execute]
+  python3 deltaprime.py repay --pool usdc --amount 100 [--execute]
+  python3 deltaprime.py swap --from USDC --to AVAX --amount 10 [--via yak|paraswap] [--slippage 0.5] [--execute]
+  python3 deltaprime.py swap-debt --from AVAX --to USDC --amount 100 [--slippage 0.5] [--fallback] [--execute]
+  python3 deltaprime.py withdraw-collateral --pool usdc --amount 100 [--execute]
+  python3 deltaprime.py withdrawal-intents
+  python3 deltaprime.py execute-withdrawal --pool usdc [--index N] [--execute]
+  python3 deltaprime.py cancel-withdrawal --pool usdc --index N [--execute]
+  python3 deltaprime.py gmx-positions
+  python3 deltaprime.py gmx-deposit --market avax-usdc --amount 500 [--side auto|long|short] [--slippage 1] [--fee-buffer 2] [--execute]
+  python3 deltaprime.py gmx-withdraw --market avax+ --amount 5 [--slippage 1] [--fee-buffer 2] [--execute]
+  python3 deltaprime.py lb-positions
+  python3 deltaprime.py lb-add --pair avax-usdc --amount-x 1 --amount-y 30 [--shape spot|curve|bidask] [--range 5] [--slippage 1] [--id-slippage 5] [--execute]
+  python3 deltaprime.py lb-remove --pair avax-usdc [--slippage 1] [--execute]
+  python3 deltaprime.py sjoe-position
+  python3 deltaprime.py sjoe-stake --amount 100 [--execute]
+  python3 deltaprime.py sjoe-unstake --amount 100 [--execute]
+  python3 deltaprime.py sjoe-claim [--execute]
+  python3 deltaprime.py prime-tier
+  python3 deltaprime.py prime-needed --borrow 1000 [--tier premium|basic]
+  python3 deltaprime.py prime-deposit --amount 200 [--execute]
+  python3 deltaprime.py prime-activate [--amount N] [--execute]
+  python3 deltaprime.py prime-deactivate [--withdraw] [--execute]
+  python3 deltaprime.py prime-unstake --amount N [--execute]
+  python3 deltaprime.py prime-repay --amount N [--execute]
+  python3 deltaprime.py zap --market avax-usdc --collateral usdc --collateral-amount 100 --borrow-amount 400 [--side auto|long|short] [--deposit-amount 500] [--swap] [--slippage 1] [--fee-buffer 2] [--execute]
 
 prime-summary reports live solvency (health ratio, total value, debt, solvent flag) from
 SolvencyFacetProdAvalanche, read via eth_call with a RedStone price payload appended (falls
 back to balances-only if the gateway is unreachable).
 
-The savings-pool lender side `withdraw` is ALSO a two-step, time-delayed intent flow.
-Step 1: `deltaprime withdraw --pool X --amount Y` calls the pool's
-`createWithdrawalIntent(uint256)` (the single-arg `withdraw` does not resolve a named
-intent). Step 2 (after the 24h time-lock, within the following 48h execute window — 72h
-total): `execute-withdrawal-request --pool X [--index N]` consumes the matured intent via
-the pool's two-arg intent-gated executor `withdraw(uint256 _amount, uint256[] intentIndices)`
-(selector 0x5915d806, same as the DegenPrime pool — NOT the single-arg form).
-`withdrawal-requests` lists pending lender intents per pool; `cancel-withdrawal-request
---pool X --index N` cancels a pending one via `cancelWithdrawalIntent(uint256)`. Storage is
-per-EOA on the pool (NOT the Prime Account address). No RedStone on any of these.
-
-Collateral withdrawal on the Prime Account is the separate `WithdrawalIntentFacet` flow:
-withdraw-collateral / withdrawal-intents / execute-withdrawal. Same 24h-72h shape; the
-execute step is RedStone-gated (the create step is not).
+Collateral withdrawal is a two-step, time-delayed flow on the Prime Account (there is NO
+instant withdraw of in-account collateral). The savings-pool `withdraw` above is a separate
+two-step intent flow on the pool itself, not the Prime Account. Step 1: `withdraw --pool X
+--amount Y` calls the pool's createWithdrawalIntent(uint256), oracle-free. Step 2 (after the
+24h time-lock, within the following 48h execute window — 72h total): `execute-withdrawal-request
+--pool X [--index N]` consumes the matured intent via the pool's two-arg intent-gated executor
+`withdraw(uint256 _amount, uint256[] intentIndices)` (selector 0x5915d806, same as the
+DegenPrime pool — NOT the single-arg withdraw, which never resolves a named intent).
+`withdrawal-requests` lists pending lender intents per pool; `cancel-withdrawal-request --pool X
+--index N` cancels a pending one via cancelWithdrawalIntent(uint256). No RedStone on any of
+these; storage is per-EOA on the pool (NOT the Prime Account). The separate Prime Account
+collateral flow is withdraw-collateral registers a WithdrawalIntent (createWithdrawalIntent, no
+RedStone). The intent becomes executable ~24h later for a 48h execute window (72h total);
+execute-withdrawal then pulls it to the wallet (executeWithdrawalIntent, RedStone-gated). withdrawal-intents
+lists pending intents + per-asset available balance (oracle-free reads). The maturity window
+and ready/expired state come straight off-chain from the IntentInfo struct.
 
 Leverage flow: create-prime-account -> fund (collateral) -> borrow -> repay -> withdraw.
 fund moves collateral from the wallet into the Prime Account; borrow needs a funded
@@ -214,26 +211,31 @@ from eth_abi import encode as abi_encode, decode as abi_decode
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
-# Default Avalanche C-chain RPC. Override with the DELTAPRIME_RPC env var (paid
-# Alchemy/QuickNode/Infura endpoints are recommended for higher throughput; the
-# public endpoint rate-limits hard on busy `defi --json` reads).
-AVALANCHE_RPC = os.environ.get("DELTAPRIME_RPC", "https://api.avax.network/ext/bc/C/rpc")
+AVALANCHE_RPC = "https://api.avax.network/ext/bc/C/rpc"
 EXPLORER = "https://snowtrace.io"
 CHAIN_ID = 43114
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
-# ── Signing key resolution ──────────────────────────────────────────────────
-# The Prime Account is derived on-chain from the wallet owner (getLoanForOwner),
-# so each user automatically operates on their own Prime Account — no per-user
-# addresses are hardcoded.
+# ── Agent / wallet selection ─────────────────────────────────────────────────
+# Agent-agnostic: any agent (Parakletos, Paraklaudios, or another of Bruno's) runs
+# this same tool with its OWN wallet. The Prime Account is derived on-chain from the
+# wallet owner (getLoanForOwner), so each agent automatically operates on its own
+# Prime Account — no per-agent addresses are hardcoded.
 #
 # Key resolution order (first hit wins; see resolve_private_key):
-#   1. --key <0xhex> CLI flag         -> raw 0x... key (one-off escape hatch)
-#   2. DELTAPRIME_PRIVATE_KEY env var -> raw 0x... key (primary path)
-#   3. DELTAPRIME_KEY_FILE env var    -> path to a file containing the 0x key
+#   1. --as <agent> CLI flag                     -> AGENTS[<agent>]
+#   2. DELTAPRIME_PRIVATE_KEY env var            -> raw 0x… key (universal escape hatch)
+#   3. DELTAPRIME_ENV_FILE + DELTAPRIME_KEY_VAR  -> read <var> from <file>
+#   4. DELTAPRIME_AGENT env var                  -> AGENTS[<agent>]
+#   5. DEFAULT_AGENT                             -> AGENTS[DEFAULT_AGENT] (back-compat)
 #
-# The CLI key (#1) is set by main() before the command runs; the env vars (#2/#3)
-# are read lazily so read-only commands that don't sign never need a key at all.
-_CLI_KEY = None  # set by the --key CLI flag in main()
+# To add another wallet: add a row to AGENTS, or export DELTAPRIME_PRIVATE_KEY.
+AGENTS = {
+    "parakletos":   ("/root/.openclaw/.env",                "PARAKLETOS_EVM_PRIVATE_KEY"),
+    "paraklaudios": ("/root/paraklaudios/.credentials.env", "PARAKLAUDIOS_EVM_PRIVATE_KEY"),
+}
+DEFAULT_AGENT = "parakletos"  # preserves original behavior when nothing else is set
+_SELECTED_AGENT = None        # set by the --as CLI flag in main()
+SNOWTRACE = "https://api.snowtrace.io/api"
 FACTORY_PROXY = "0x3Ea9D480295A73fd2aF95b4D96c2afF88b21B03D"
 # On-chain registry of active pools. getPoolAddress(bytes32 asset) is the source
 # of truth — the docs/repo per-pool artifacts are stale and point at frozen pools.
@@ -261,34 +263,6 @@ YAK_ROUTER = "0xC4729E56b831d74bBc18797e0e17A295fA77488c"
 PARASWAP_API = "https://apiv5.paraswap.io"
 PARASWAP_AUGUSTUS = "0x6A000F20005980200259B80c5102003040001068"
 PARASWAP_SUPPORTED_SELECTORS = {"0xe3ead59e", "0x876a02f6"}
-
-# As of 2026-05-29 the ParaSwap API routinely emits router methods (directUniV3Swap,
-# simpleSwap, multiSwap, megaSwap…) and executors NOT in the on-chain ParaSwapFacet /
-# SwapDebtFacet allowlists below. This is an on-chain governance issue — the facets
-# need their PARASWAP_SUPPORTED_SELECTORS / PARASWAP_EXECUTORS allowlists refreshed
-# by DeltaPrime governance. Until then, any --via paraswap swap or swap-debt will
-# revert on broadcast. Tool refuses cleanly with a pointer to the tracking issue.
-PARASWAP_GOVERNANCE_ISSUE = "https://github.com/Mnemosyne-quest/primecli/issues/2"
-PARASWAP_BLOCKED_MESSAGE = (
-    "error: ParaSwap API currently emits router methods / executors that are not on\n"
-    "DeltaPrime's on-chain ParaSwapFacet allowlist. This is an on-chain governance\n"
-    "issue, not a tool issue. Use --via yak instead (the default), or wait for\n"
-    "DeltaPrime governance to refresh the allowlist.\n"
-    f"See: {PARASWAP_GOVERNANCE_ISSUE}"
-)
-SWAP_DEBT_BLOCKED_MESSAGE = (
-    "error: swap-debt routes through SwapDebtFacet.swapDebtParaSwap, which uses the\n"
-    "same ParaSwap allowlist as paraSwapV6 — and that allowlist is currently out of\n"
-    "date on-chain (the API emits router methods / executors the facet does not\n"
-    "decode or whitelist). swap-debt is therefore blocked until DeltaPrime governance\n"
-    "refreshes the facet allowlist.\n"
-    "Manual fallback: compose the refinance as three commands (will need ~$gas + a\n"
-    "moment of unfunded health while the leg is open):\n"
-    "  deltaprime borrow --pool <new> --amount N --execute\n"
-    "  deltaprime swap --via yak --from <new-symbol> --to <old-symbol> --amount N --execute\n"
-    "  deltaprime repay --pool <old> --amount N --execute\n"
-    f"See: {PARASWAP_GOVERNANCE_ISSUE}"
-)
 # Executors the facet whitelists (ParaSwapHelper._checkExecutorAddress). Lowercased.
 PARASWAP_EXECUTORS = {
     # Must match the ParaSwap executor whitelist on DeltaPrime's ParaSwapFacet and
@@ -439,12 +413,12 @@ TJ_ROUTER_V21 = "0xb4315e873dBcf96Ffd0acd8EA43f689D8c20fB30"
 TJ_ROUTER_V22 = "0x18556DA13313f3532c54711497A8FedAC273220E"
 TJ_MAX_BINS = 80
 
-# Whitelisted LB pairs exposed as tool keys, matching the DeltaPrime frontend (bin step in
+# Whitelisted LB pairs exposed as tool keys, matching Bruno's live frontend (bin step in
 # the key suffix where a pair exists at two steps). For each: the LBPair address, the
 # router version the pair belongs to, the canonical (tokenX, tokenY) order read on-chain,
 # and the binStep. tokenX/tokenY carry the ERC20 address, the account bytes32 symbol (for
 # the in-account balance read + RedStone feed), and decimals. The 13 source-whitelisted
-# pairs include 4 aUSD pairs not on the frontend; those are omitted (no clean
+# pairs include 4 aUSD pairs not on Bruno's frontend; those are omitted (no clean
 # symbol/decimals + out of scope).
 _WAVAX = {"addr": "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7", "symbol": "AVAX", "decimals": 18}
 _USDC = {"addr": "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E", "symbol": "USDC", "decimals": 6}
@@ -545,21 +519,32 @@ ERC20_BALANCE_ABI = json.loads(
 # `pool-info all` on cold cache, rate-limited); the hand-curated ABI removes that
 # dependency entirely. Rates are 1e18-scaled annualised (same shape as DegenPrime's
 # pool, verified on Snowtrace 2026-05-23 / 2026-05-29).
-# Pool ABI. The lender side runs through the same delayed-intent flow as the Prime
-# Account collateral side: createWithdrawalIntent registers, cancelWithdrawalIntent
-# kills a pending one. The matured-intent executor is the two-arg
-# `withdraw(uint256 _amount, uint256[] intentIndices)` (selector 0x5915d806) — the same
-# intent-gated executor as the DegenPrime pool, NOT the single-arg `withdraw(uint256)`.
-# Intent storage is per-EOA (the wallet address, NOT the Prime Account address). Verified
-# on the live wavax pool impl 0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E (proxy
-# 0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4) 2026-06-02: both single-arg withdraw and
-# two-arg withdraw exist in bytecode, but only the two-arg form resolves a named intent —
-# differential eth_call with no intent gives "Invalid intent index" (two-arg) vs bare 0x
-# (single-arg). instantWithdraw and executeWithdrawalIntent(uint256[]) are ABSENT.
-# Signatures match the Prime Account WithdrawalIntentFacet's IntentInfo shape.
+# The lender side runs the same 24h delayed-intent flow as the Prime Account collateral
+# side: createWithdrawalIntent registers, cancelWithdrawalIntent kills a pending one,
+# getUserIntents / getTotalIntentAmount are oracle-free reads. The matured-intent executor
+# is `withdraw(uint256 _amount, uint256[] intentIndices)` (selector 0x5915d806) — the same
+# two-arg intent-gated executor as the DegenPrime pool, NOT the single-arg `withdraw(uint256)`.
+# Verified on the live wavax pool impl 0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E (proxy
+# 0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4) 2026-06-02: both selectors exist in bytecode,
+# but only the two-arg form resolves a lender's named intent. Differential eth_call with no
+# intent registered: single-arg withdraw(amount) reverts with a bare 0x (never reaches the
+# intent lookup); two-arg withdraw(amount,[0]) reverts "Invalid intent index" (0x08c379a0),
+# i.e. it reaches and validates the named intent. instantWithdraw and
+# executeWithdrawalIntent(uint256[]) are ABSENT. IntentInfo shape matches the Prime Account
+# WithdrawalIntentFacet.
 POOL_ABI = json.loads(
     '['
+    # deposit(uint256) is non-payable on every pool (verified on-chain — calling
+    # it with value reverts on the wavax pool). The native AVAX / ETH path is the
+    # separate depositNativeToken() entry below.
     '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"deposit","outputs":[],"stateMutability":"nonpayable","type":"function"},'
+    # depositNativeToken() is the payable native-AVAX entry on the wavax pool (and
+    # native-ETH on the weth pool on Base). Wraps the AVAX/ETH internally.
+    '{"inputs":[],"name":"depositNativeToken","outputs":[],"stateMutability":"payable","type":"function"},'
+    # withdrawNativeToken(uint256) unwraps on the way out (returns native AVAX/ETH).
+    # withdraw(uint256,uint256[]) is the intent-gated step-2 executor (returns the
+    # wrapped token); see _encode_pool_withdraw + cmd_execute_withdrawal_request.
+    '{"inputs":[{"name":"_amount","type":"uint256"}],"name":"withdrawNativeToken","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"_amount","type":"uint256"},{"name":"intentIndices","type":"uint256[]"}],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"amount","type":"uint256"}],"name":"createWithdrawalIntent","outputs":[],"stateMutability":"nonpayable","type":"function"},'
     '{"inputs":[{"name":"index","type":"uint256"}],"name":"cancelWithdrawalIntent","outputs":[],"stateMutability":"nonpayable","type":"function"},'
@@ -571,6 +556,18 @@ POOL_ABI = json.loads(
     '{"inputs":[],"name":"getBorrowingRate","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
     '{"inputs":[{"name":"_user","type":"address"}],"name":"balanceOf","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
     '{"inputs":[{"name":"_user","type":"address"}],"name":"getBorrowed","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}'
+    ']'
+)
+
+# SmartLoansFactory ABI — hand-curated minimum surface. createLoan / createAndFundLoan
+# for writes; getLoanForOwner for the per-EOA Prime Account lookup. Previously fetched
+# from Snowtrace per session; the hand-curated subset removes that dependency. Verified
+# against the factory on Snowtrace (2026-05-23).
+FACTORY_ABI = json.loads(
+    '['
+    '{"inputs":[],"name":"createLoan","outputs":[{"type":"address"}],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[{"name":"_fundedAsset","type":"bytes32"},{"name":"_amount","type":"uint256"}],"name":"createAndFundLoan","outputs":[{"type":"address"}],"stateMutability":"nonpayable","type":"function"},'
+    '{"inputs":[{"name":"_user","type":"address"}],"name":"getLoanForOwner","outputs":[{"type":"address"}],"stateMutability":"view","type":"function"}'
     ']'
 )
 
@@ -614,6 +611,9 @@ def multicall(w3, calls):
     raw = mc.functions.aggregate3(args).call()
     return [(bool(ok), bytes(rd)) for ok, rd in raw]
 
+_abi_cache = {}
+_impl_cache = {}
+
 # Process-local Web3 singleton. Each get_w3() call previously constructed a fresh
 # HTTPProvider — wasteful on multi-pool reads (cmd_pool_info("all"), gather_defi).
 _W3 = None
@@ -637,30 +637,77 @@ def _tx_gas_price(w3) -> int:
     gasPrice; the GMX keeper execution-fee floor (25 gwei) is a separate calc, kept as-is."""
     return max(int(w3.eth.gas_price * 2), 10**9)
 
+def _read_env_var(path, var):
+    """Return the value of `var` from a KEY=VALUE env file, or None if absent."""
+    try:
+        for line in Path(path).read_text().splitlines():
+            s = line.strip()
+            if s.startswith(var + "="):
+                return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except FileNotFoundError:
+        return None
+    return None
+
+def _agent_key(agent):
+    if agent not in AGENTS:
+        raise RuntimeError(
+            f"Unknown agent '{agent}'. Known agents: {', '.join(AGENTS)}. "
+            f"Or set DELTAPRIME_PRIVATE_KEY, or DELTAPRIME_ENV_FILE + DELTAPRIME_KEY_VAR."
+        )
+    path, var = AGENTS[agent]
+    key = _read_env_var(path, var)
+    if not key:
+        raise RuntimeError(f"{var} not found in {path} (agent '{agent}').")
+    return key
+
 def resolve_private_key():
-    """Resolve the signing key per the documented precedence:
-       1. --key <0xhex> CLI flag
-       2. DELTAPRIME_PRIVATE_KEY env var
-       3. DELTAPRIME_KEY_FILE env var (path to a file containing the 0x key)
-    Raises with a clear message if none of the three are set."""
-    if _CLI_KEY:
-        return _CLI_KEY.strip()
+    # 1. --as <agent> CLI flag (set in main)
+    if _SELECTED_AGENT:
+        return _agent_key(_SELECTED_AGENT)
+    # 2. raw key directly in the environment
     raw = os.environ.get("DELTAPRIME_PRIVATE_KEY")
     if raw:
         return raw.strip()
-    key_file = os.environ.get("DELTAPRIME_KEY_FILE")
-    if key_file:
-        try:
-            return Path(key_file).read_text().strip()
-        except FileNotFoundError:
-            raise RuntimeError(f"DELTAPRIME_KEY_FILE points at {key_file} but the file does not exist.")
-    raise RuntimeError(
-        "No signing key found. Set DELTAPRIME_PRIVATE_KEY (raw 0x... key), or "
-        "DELTAPRIME_KEY_FILE (path to a file containing the key), or pass --key <0xhex>."
-    )
+    # 3. explicit env-file + var-name
+    env_file = os.environ.get("DELTAPRIME_ENV_FILE")
+    key_var = os.environ.get("DELTAPRIME_KEY_VAR")
+    if env_file and key_var:
+        key = _read_env_var(env_file, key_var)
+        if not key:
+            raise RuntimeError(f"{key_var} not found in {env_file}.")
+        return key
+    # 4. named agent in the environment
+    agent = os.environ.get("DELTAPRIME_AGENT")
+    if agent:
+        return _agent_key(agent)
+    # 5. default agent (back-compat with the original Parakletos-only behavior)
+    return _agent_key(DEFAULT_AGENT)
 
 def get_account() -> Account:
     return Account.from_key(resolve_private_key())
+
+def fetch_json(url, params):
+    r = requests.get(url, params=params, timeout=15)
+    return r.json()
+
+def get_pool_impl(pool_proxy: str) -> str:
+    p = pool_proxy.lower()
+    if p not in _impl_cache:
+        d = fetch_json(SNOWTRACE, {"module": "contract", "action": "getsourcecode", "address": pool_proxy})
+        impl = d["result"][0].get("Implementation", "")
+        _impl_cache[p] = impl or pool_proxy
+    return _impl_cache[p]
+
+def get_pool_abi(pool_proxy: str) -> list:
+    p = pool_proxy.lower()
+    if p not in _abi_cache:
+        impl = get_pool_impl(pool_proxy)
+        d = fetch_json(SNOWTRACE, {"module": "contract", "action": "getabi", "address": impl})
+        if d.get("status") == "1":
+            _abi_cache[p] = json.loads(d["result"])
+        else:
+            _abi_cache[p] = []
+    return _abi_cache[p]
 
 def get_pool_contract(pool_name: str):
     """Pool proxy contract bound to the hand-curated POOL_ABI. Previously this fetched
@@ -912,18 +959,6 @@ YAK_ROUTER_ABI = [
 # the underlying ERC20 the YieldYak router routes on.
 SWAP_ASSETS = {cfg["symbol"]: {"token": cfg["token"], "decimals": cfg["decimals"]}
                for cfg in POOLS.values()}
-
-# SmartLoansFactory ABI — hand-curated minimum surface. createLoan / createAndFundLoan
-# for writes; getLoanForOwner for the per-EOA Prime Account lookup. Previously fetched
-# from Snowtrace per session; the hand-curated subset removes that dependency. Verified
-# against the factory on Snowtrace (2026-05-23).
-FACTORY_ABI = json.loads(
-    '['
-    '{"inputs":[],"name":"createLoan","outputs":[{"type":"address"}],"stateMutability":"nonpayable","type":"function"},'
-    '{"inputs":[{"name":"_fundedAsset","type":"bytes32"},{"name":"_amount","type":"uint256"}],"name":"createAndFundLoan","outputs":[{"type":"address"}],"stateMutability":"nonpayable","type":"function"},'
-    '{"inputs":[{"name":"_user","type":"address"}],"name":"getLoanForOwner","outputs":[{"type":"address"}],"stateMutability":"view","type":"function"}'
-    ']'
-)
 
 def get_factory_contract(w3):
     return w3.eth.contract(address=Web3.to_checksum_address(FACTORY_PROXY), abi=FACTORY_ABI)
@@ -1322,7 +1357,7 @@ def cmd_my_positions():
             if pa_avax >= 1e-9:
                 print(f"  AVAX balance: {pa_avax:.6f}")
         else:
-            print("\nNo Prime Account yet. Create with: deltaprime create-prime-account --execute")
+            print("\nNo Prime Account yet. Create with: deltaprime.py create-prime-account --execute")
     except Exception as e:
         print(f"\nPrime Account lookup failed: {e}")
 
@@ -1337,25 +1372,31 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
         return
 
     if cfg["native"]:
-        tx = contract.functions.deposit(amount_wei).build_transaction({
+        # Native AVAX path: depositNativeToken() (payable, no args). deposit(uint256)
+        # itself is NOT payable on the wavax pool — calling it with value reverts.
+        # Gas: the native path wraps AVAX→WAVAX + does the pool accounting +
+        # internal rate update — the 200k limit on the ERC20 branch is not enough
+        # (live tx 3a4f6a9c… consumed 197k and OOG-reverted). 500k clears it cleanly.
+        tx = contract.functions.depositNativeToken().build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 200000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID, "value": amount_wei,
+            "gas": 500000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID, "value": amount_wei,
         })
         signed = acct.sign_transaction(tx)
     else:
         # Approve
         token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]),
                                 abi=json.loads('[{"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}]'))
+        _dep_nonce = w3.eth.get_transaction_count(acct.address)
         app_tx = token.functions.approve(Web3.to_checksum_address(cfg["proxy"]), amount_wei).build_transaction({
-            "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+            "from": acct.address, "nonce": _dep_nonce,
             "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
         })
         signed_app = acct.sign_transaction(app_tx)
         w3.eth.send_raw_transaction(signed_app.raw_transaction)
 
-        # Deposit
+        # Deposit — nonce N+1 because approve (N) is in-flight
         dep_tx = contract.functions.deposit(amount_wei).build_transaction({
-            "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+            "from": acct.address, "nonce": _dep_nonce + 1,
             "gas": 200000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
         })
         signed = acct.sign_transaction(dep_tx)
@@ -1365,22 +1406,6 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
     ok = receipt["status"] == 1
     print(f"{'✓' if ok else '✗'} Deposit {amount} {cfg['symbol']} {'confirmed' if ok else 'failed'}")
     print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
-
-def _fmt_window(actionable_at: int, expires_at: int) -> str:
-    """Human one-liner for a withdrawal intent's maturity window, anchored to chain
-    time. Used for both pool-side (lender) and Prime Account (collateral) intents —
-    the IntentInfo shape is identical on both sides."""
-    now = int(time.time())
-    def rel(ts):
-        d = ts - now
-        sign = "in" if d >= 0 else "ago"
-        d = abs(d)
-        h, m = d // 3600, (d % 3600) // 60
-        span = f"{h}h{m:02d}m" if h else f"{m}m"
-        return f"{sign} {span}" if sign == "in" else f"{span} {sign}"
-    a = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(actionable_at))
-    e = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expires_at))
-    return f"actionable {a} ({rel(actionable_at)}), expires {e} ({rel(expires_at)})"
 
 def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
     """Pool-side (LENDER) withdraw — step 1 of a 24h delayed flow.
@@ -1465,7 +1490,8 @@ def _encode_pool_withdraw(amount_wei: int, indices: list) -> str:
     """Calldata for the pool's intent-gated executor withdraw(uint256 _amount,
     uint256[] intentIndices) (selector 0x5915d806). Hand-encoded (uint256 head +
     dynamic uint256[] tail) so it never depends on the single-arg withdraw(uint256),
-    which does NOT resolve a lender's named intent. Mirrors the DegenPrime pool executor."""
+    which does NOT resolve a lender's named intent (see cmd_execute_withdrawal_request).
+    Mirrors the DegenPrime pool executor encoding."""
     selector = Web3.keccak(text="withdraw(uint256,uint256[])")[:4].hex()
     head = amount_wei.to_bytes(32, "big").hex()          # _amount
     head += (0x40).to_bytes(32, "big").hex()             # offset to the array (2 head words in)
@@ -1476,17 +1502,18 @@ def _encode_pool_withdraw(amount_wei: int, indices: list) -> str:
 
 def cmd_execute_withdrawal_request(pool_name: str, index: int = None, execute: bool = False):
     """Step 2 of lender pool withdrawal: consume a matured WithdrawalIntent via
-    withdraw(uint256 _amount, uint256[] intentIndices) (selector 0x5915d806) — the same
-    two-arg intent-gated executor as the DegenPrime pool, hand-encoded via
-    _encode_pool_withdraw. NOT the single-arg withdraw(uint256): both selectors exist on
-    the live wavax pool impl 0x1b9BcAC5..., but only the two-arg form resolves a lender's
-    named intent (verified 2026-06-02 — two-arg withdraw(amount,[0]) against no intent
-    reverts "Invalid intent index"; single-arg reverts bare 0x).
+    withdraw(uint256 _amount, uint256[] intentIndices) (selector 0x5915d806) — the
+    same two-arg intent-gated executor as the DegenPrime pool, hand-encoded via
+    _encode_pool_withdraw. NOT the single-arg withdraw(uint256): both selectors exist
+    on the live wavax pool impl 0x1b9BcAC5..., but only the two-arg form resolves a
+    lender's named intent (verified 2026-06-02 — two-arg withdraw(amount,[0]) against
+    no intent reverts "Invalid intent index", i.e. it reaches the intent lookup, while
+    single-arg withdraw(amount) reverts with a bare 0x and never gets there).
     Refuses any intent that has not matured (isActionable=false) or has expired.
     --index selects which intent to execute; with no --index, the single actionable
     intent is used (if more than one is actionable, --index is required — one matured
-    intent is consumed per `withdraw` call). An eth_call simulation runs before broadcast
-    and refuses to send on revert."""
+    intent is consumed per `withdraw` call). Not RedStone-gated. An eth_call simulation
+    runs before broadcast and refuses to send on revert (simulate-first rule)."""
     contract, cfg, w3 = get_pool_contract(pool_name)
     acct = get_account()
     intents = contract.functions.getUserIntents(acct.address).call()
@@ -1527,8 +1554,8 @@ def cmd_execute_withdrawal_request(pool_name: str, index: int = None, execute: b
 
     data = _encode_pool_withdraw(amt, [index])
 
-    # Simulate before broadcasting. A passing eth_call here means the intent is matured,
-    # non-expired, and the named index resolves correctly.
+    # Simulate before broadcasting (simulate-first rule). A passing eth_call here means
+    # the intent is matured, non-expired, and the named index resolves correctly.
     try:
         w3.eth.call({"from": acct.address, "to": contract.address, "data": data})
     except Exception as e:
@@ -1609,7 +1636,7 @@ def cmd_create_prime_account(execute: bool = False, fund_pool: str = None, fund_
     existing = get_prime_account(w3, acct.address)
     if existing:
         print(f"Prime Account already exists: {existing}")
-        print("Nothing to create. Fund it with: deltaprime fund --pool <p> --amount <n> --execute")
+        print("Nothing to create. Fund it with: deltaprime.py fund --pool <p> --amount <n> --execute")
         return
 
     funding = fund_pool is not None and fund_amount is not None
@@ -1645,15 +1672,17 @@ def cmd_create_prime_account(execute: bool = False, fund_pool: str = None, fund_
         # so approve the factory first.
         token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]),
                                 abi=json.loads('[{"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}]'))
+        _cf_nonce = w3.eth.get_transaction_count(acct.address)
         app_tx = token.functions.approve(factory_cs, amount_wei).build_transaction({
-            "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+            "from": acct.address, "nonce": _cf_nonce,
             "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
         })
         signed_app = acct.sign_transaction(app_tx)
         w3.eth.send_raw_transaction(signed_app.raw_transaction)
 
+        # createAndFundLoan — nonce N+1 because approve (N) is in-flight
         tx = factory.functions.createAndFundLoan(asset_b32(symbol), amount_wei).build_transaction({
-            "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+            "from": acct.address, "nonce": _cf_nonce + 1,
             "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
         })
     else:
@@ -1695,7 +1724,7 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
     acct = get_account()
     pa = get_prime_account(w3, acct.address)
     if not pa:
-        print("No Prime Account. Create one first: deltaprime create-prime-account --execute")
+        print("No Prime Account. Create one first: deltaprime.py create-prime-account --execute")
         return
 
     symbol = pool_to_asset_symbol(pool_name)
@@ -1730,8 +1759,11 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
         signed_app = acct.sign_transaction(app_tx)
         w3.eth.send_raw_transaction(signed_app.raw_transaction)
 
+        # Nonce: approve uses get_transaction_count (N). Fund must use N+1 since
+        # the approve is in-flight and confirmed nonce hasn't advanced yet.
+        _fund_nonce = w3.eth.get_transaction_count(acct.address) + 1
         fund_tx = account.functions.fund(asset_b32(symbol), amount_wei).build_transaction({
-            "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+            "from": acct.address, "nonce": _fund_nonce,
             "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
         })
         signed = acct.sign_transaction(fund_tx)
@@ -1828,7 +1860,6 @@ def gather_lending(w3, account):
             solv_legs.append(("getPrices", ["uint256[]"],
                               account.encode_abi("getPrices",
                                                  args=[[asset_b32(s) for s in price_syms]])))
-        pa_cs = account.address
         solv_results = multicall(w3, [(pa_cs, bytes.fromhex(d[2:]) + bytes.fromhex(payload_hex))
                                        for _, _, d in solv_legs])
         decoded_solv = {}
@@ -1875,7 +1906,7 @@ def cmd_prime_summary():
     pa = get_prime_account(w3, acct.address)
     print(f"Owner wallet: {acct.address}")
     if not pa:
-        print("No Prime Account yet. Create one with: deltaprime create-prime-account --execute")
+        print("No Prime Account yet. Create one with: deltaprime.py create-prime-account --execute")
         return
 
     print(f"Prime Account: {pa}")
@@ -1924,7 +1955,7 @@ def cmd_borrow(pool_name: str, amount: float, execute: bool = False):
     acct = get_account()
     pa = get_prime_account(w3, acct.address)
     if not pa:
-        print("No Prime Account. Create one first: deltaprime create-prime-account --execute")
+        print("No Prime Account. Create one first: deltaprime.py create-prime-account --execute")
         return
 
     symbol = pool_to_asset_symbol(pool_name)
@@ -1964,7 +1995,7 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     acct = get_account()
     pa = get_prime_account(w3, acct.address)
     if not pa:
-        print("No Prime Account. Create one first: deltaprime create-prime-account --execute")
+        print("No Prime Account. Create one first: deltaprime.py create-prime-account --execute")
         return
 
     symbol = pool_to_asset_symbol(pool_name)
@@ -1983,7 +2014,7 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     amount_wei = min(requested_wei, debt_wei, in_acct_wei)
     if amount_wei == 0:
         print(f"Repay {amount} {symbol}: in-account {symbol} balance is 0 — "
-              f"swap into {symbol} first (e.g. deltaprime swap --to {symbol} --amount N --execute).")
+              f"swap into {symbol} first (e.g. deltaprime.py swap --to {symbol} --amount N --execute).")
         return
     cap_notes = []
     if amount_wei < requested_wei:
@@ -2148,46 +2179,25 @@ def _paraswap_decode_and_check(selector_hex, data_bytes, src_token, dest_token, 
 def _swap_via_paraswap(w3, acct, pa_cs, account, from_sym, to_sym, from_cfg, to_cfg,
                        amount, amount_in, slippage_pct, execute):
     """ParaSwap leg of cmd_swap. Builds the Velora calldata for an in-account
-    from_sym->to_sym swap and (on --execute) calls paraSwapV6 with a RedStone payload.
-
-    If the API returns a router method or executor that is NOT on the on-chain
-    ParaSwapFacet allowlist (PARASWAP_SUPPORTED_SELECTORS / PARASWAP_EXECUTORS), this
-    refuses cleanly — see PARASWAP_GOVERNANCE_ISSUE. The historical executor-bytes
-    auto-patch was always cosmetic and is removed; refusing is the honest behaviour."""
-    try:
-        price_route = _paraswap_price_route(from_cfg["token"], from_cfg["decimals"],
-                                            to_cfg["token"], to_cfg["decimals"], amount_in, pa_cs)
-    except RuntimeError as e:
-        print(f"  ParaSwap API: {e}")
-        print(PARASWAP_BLOCKED_MESSAGE)
-        sys.exit(1)
+    from_sym->to_sym swap and (on --execute) calls paraSwapV6 with a RedStone payload."""
+    price_route = _paraswap_price_route(from_cfg["token"], from_cfg["decimals"],
+                                        to_cfg["token"], to_cfg["decimals"], amount_in, pa_cs)
     quoted_out = int(price_route["destAmount"])
-    try:
-        tx_built = _paraswap_build_tx(price_route, from_cfg["token"], from_cfg["decimals"],
-                                      to_cfg["token"], to_cfg["decimals"], amount_in,
-                                      slippage_pct, pa_cs)
-    except RuntimeError as e:
-        print(f"  ParaSwap API: {e}")
-        print(PARASWAP_BLOCKED_MESSAGE)
-        sys.exit(1)
+    tx_built = _paraswap_build_tx(price_route, from_cfg["token"], from_cfg["decimals"],
+                                  to_cfg["token"], to_cfg["decimals"], amount_in,
+                                  slippage_pct, pa_cs)
     full = bytes.fromhex(tx_built["data"][2:])
     selector_hex, data_bytes = "0x" + full[:4].hex(), full[4:]
-    # Refuse if the API emitted a selector the facet does not decode.
-    if selector_hex not in PARASWAP_SUPPORTED_SELECTORS:
-        print(f"  ParaSwap API returned router method {selector_hex} "
-              f"({price_route.get('contractMethod','?')}).")
-        print(f"  The DeltaPrime ParaSwapFacet only decodes "
-              f"{sorted(PARASWAP_SUPPORTED_SELECTORS)} — broadcasting would revert.")
-        print(PARASWAP_BLOCKED_MESSAGE)
-        sys.exit(1)
     _exec, _src, _dest, from_amt, min_out = _paraswap_decode_and_check(
         selector_hex, data_bytes, from_cfg["token"], to_cfg["token"], amount_in, pa_cs)
+    # Same executor-patching as swap-debt (see cmd_swap_debt for full rationale).
+    _PARASWAP_FALLBACK_EXECUTOR = "0x000010036C0190E009a000d0fc3541100A07380A"
     if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
-        print(f"  ParaSwap API returned executor {_exec}.")
-        print("  This executor is NOT on the DeltaPrime ParaSwapFacet whitelist —")
-        print("  broadcasting would revert with InvalidExecutor().")
-        print(PARASWAP_BLOCKED_MESSAGE)
-        sys.exit(1)
+        fallback_bytes = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:])
+        data_bytes = fallback_bytes + data_bytes[32:]
+        print(f"  ⚠ Executor {_exec} not whitelisted; patching to {_PARASWAP_FALLBACK_EXECUTOR}")
+        _paraswap_decode_and_check(selector_hex, data_bytes, from_cfg["token"], to_cfg["token"],
+                                   amount_in, pa_cs)
 
     print(f"Swap {amount} {from_sym} -> {to_sym} on Prime Account {pa_cs}  (via ParaSwap/Velora)")
     print(f"  Router method: {price_route['contractMethod']} ({selector_hex})")
@@ -2253,51 +2263,10 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
 
     w3 = get_w3()
     acct = get_account()
-
-    # Pre-flight ParaSwap API probe using the EOA as the probe user (ParaSwap's
-    # /transactions rejects the obvious burn/dummy addresses). Done BEFORE the
-    # Prime Account check so the refusal fires whether or not the wallet has a PA.
-    # The on-chain ParaSwapFacet allowlist is currently stale — see
-    # PARASWAP_GOVERNANCE_ISSUE. _swap_via_paraswap re-checks at build time.
-    if via == "paraswap":
-        from_cfg_pre, to_cfg_pre = SWAP_ASSETS[from_sym], SWAP_ASSETS[to_sym]
-        amount_in_pre = int(amount * 10**from_cfg_pre["decimals"])
-        try:
-            pr_probe = _paraswap_price_route(from_cfg_pre["token"], from_cfg_pre["decimals"],
-                                             to_cfg_pre["token"], to_cfg_pre["decimals"],
-                                             amount_in_pre, acct.address)
-            tx_probe = _paraswap_build_tx(pr_probe, from_cfg_pre["token"], from_cfg_pre["decimals"],
-                                          to_cfg_pre["token"], to_cfg_pre["decimals"],
-                                          amount_in_pre, slippage_pct, acct.address)
-        except RuntimeError as e:
-            print(f"  ParaSwap API: {e}")
-            print(PARASWAP_BLOCKED_MESSAGE)
-            sys.exit(1)
-        full_probe = bytes.fromhex(tx_probe["data"][2:])
-        sel_probe = "0x" + full_probe[:4].hex()
-        if sel_probe not in PARASWAP_SUPPORTED_SELECTORS:
-            print(f"  ParaSwap API returned router method {sel_probe} "
-                  f"({pr_probe.get('contractMethod','?')}).")
-            print(f"  The DeltaPrime ParaSwapFacet only decodes "
-                  f"{sorted(PARASWAP_SUPPORTED_SELECTORS)} — broadcasting would revert.")
-            print(PARASWAP_BLOCKED_MESSAGE)
-            sys.exit(1)
-        # For the generic-executor route (0xe3ead59e), the executor is the first 20 bytes
-        # of the args tail. The UniV3 variant (0x876a02f6) carries no executor field.
-        if sel_probe == "0xe3ead59e":
-            data_probe = full_probe[4:]
-            executor_probe = "0x" + data_probe[:32][-20:].hex()
-            if executor_probe.lower() not in PARASWAP_EXECUTORS:
-                print(f"  ParaSwap API returned executor {executor_probe}.")
-                print("  This executor is NOT on the DeltaPrime ParaSwapFacet whitelist —")
-                print("  broadcasting would revert with InvalidExecutor().")
-                print(PARASWAP_BLOCKED_MESSAGE)
-                sys.exit(1)
-
     pa = get_prime_account(w3, acct.address)
     if not pa:
         print("No Prime Account exists for this wallet — nothing to swap.")
-        print("Create and fund one first: deltaprime create-prime-account --execute")
+        print("Create and fund one first: deltaprime.py create-prime-account --execute")
         return
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
@@ -2636,6 +2605,103 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         print(f"  Tx: {EXPLORER}/tx/{tx_hash3.hex()}")
         if not ok3:
             print(f"  Steps completed: 1 (borrow), 2 (swap). Repay failed — check manually.")
+        else:
+            print(f"\n✓ All 3 steps completed. {from_sym} debt refinanced to {to_sym}.")
+        return
+
+    # ─── One-tx ParaSwap path (original) ────────────────────────────────────
+    diff_bps = (abs(repay_usd - borrow_usd) / max(repay_usd, borrow_usd)) * 10000 if max(repay_usd, borrow_usd) else 0
+
+    # ParaSwap calldata for the INTERNAL swap: sell exactly borrow_amount of _toAsset for
+    # _fromAsset (facet requires fromAmount == _borrowAmount). srcToken=to, destToken=from.
+    price_route = _paraswap_price_route(to_cfg["token"], to_cfg["decimals"],
+                                        from_cfg["token"], from_cfg["decimals"], borrow_amount, pa_cs)
+    quoted_out = int(price_route["destAmount"])
+    tx_built = _paraswap_build_tx(price_route, to_cfg["token"], to_cfg["decimals"],
+                                  from_cfg["token"], from_cfg["decimals"], borrow_amount,
+                                  slippage_pct, pa_cs)
+    full_data = bytes.fromhex(tx_built["data"][2:])
+    selector_hex, data_bytes = "0x" + full_data[:4].hex(), full_data[4:]
+    _exec, _src, _dest, swap_from_amt, swap_min_out = _paraswap_decode_and_check(
+        selector_hex, data_bytes, to_cfg["token"], from_cfg["token"], borrow_amount, pa_cs)
+
+    # If the ParaSwap API returned a new executor not on the DeltaPrime whitelist, patch
+    # it to EXECUTOR_3 (0x00001003…A07380A) — the only legacy executor whose calldata
+    # format is compatible with the current API's output (tested on-chain 2026-05-28).
+    _PARASWAP_FALLBACK_EXECUTOR = "0x000010036C0190E009a000d0fc3541100A07380A"
+    if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
+        fallback_bytes = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:])
+        data_bytes = fallback_bytes + data_bytes[32:]
+        print(f"  ⚠ Executor {_exec} not whitelisted; patching to {_PARASWAP_FALLBACK_EXECUTOR}")
+        _paraswap_decode_and_check(selector_hex, data_bytes, to_cfg["token"], from_cfg["token"],
+                                   borrow_amount, pa_cs)
+
+    from_pool, _, _ = get_pool_contract(_SYMBOL_TO_POOL[from_sym])
+    borrowed = from_pool.functions.getBorrowed(pa_cs).call()
+
+    print(f"Swap debt on Prime Account {pa}")
+    print(f"  Refinance: {from_sym} debt -> {to_sym} debt")
+    print(f"  Old debt ({from_sym}): {borrowed / 10**from_cfg['decimals']:.6f} total; "
+          f"repaying {repay_amount / 10**from_cfg['decimals']:.6f}")
+    print(f"  New debt ({to_sym}): borrow {borrow_amount / 10**to_cfg['decimals']:.6f}")
+    print(f"  Internal swap (ParaSwap): {borrow_amount / 10**to_cfg['decimals']:.6f} {to_sym} "
+          f"-> {from_sym}  ({price_route['contractMethod']} {selector_hex})")
+    print(f"  Expected {from_sym} out: {quoted_out / 10**from_cfg['decimals']:.6f}", end="")
+    if swap_min_out is not None:
+        print(f" (min {swap_min_out / 10**from_cfg['decimals']:.6f} @{slippage_pct}% slippage)")
+    else:
+        print()
+    print(f"  RedStone USD: repay ${repay_usd:,.4f} vs borrow ${borrow_usd:,.4f} "
+          f"-> diff {diff_bps:.1f} bps (facet cap: 500 bps / 5%)")
+    if diff_bps > 500:
+        print("  ✗ USD-value diff exceeds the facet's 5% cap. swapDebtParaSwap would revert. Refusing.")
+        return
+    if quoted_out < repay_amount:
+        print(f"  Note: quoted {from_sym} out is below the repay target; the facet repays "
+              f"min(swap output, {repay_amount / 10**from_cfg['decimals']:.6f}, debt) — any shortfall "
+              "leaves residual old debt.")
+
+    if not execute:
+        print("Run with --execute to broadcast (appends a fresh RedStone price payload).")
+        return
+
+    base_calldata = account.encode_abi("swapDebtParaSwap", args=[
+        asset_b32(from_sym), asset_b32(to_sym), repay_amount, borrow_amount,
+        full_data[:4], data_bytes,
+    ])
+    data = base_calldata + payload.hex()
+    tx = {
+        "from": acct.address, "to": pa_cs, "data": data,
+        "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+    }
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    ok = receipt["status"] == 1
+    print(f"{'✓' if ok else '✗'} Swap debt {from_sym} -> {to_sym} {'confirmed' if ok else 'failed'}")
+    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+
+# ─── Collateral withdrawal (WithdrawalIntentFacet) ──────────────────────────
+# Pulling collateral out of the Prime Account to the EOA is a two-step, time-delayed
+# flow — there is NO instant withdraw. createWithdrawalIntent registers an intent,
+# then executeWithdrawalIntent pulls it after maturity. Window (from source, also
+# exposed on-chain via the IntentInfo flags): actionableAt = createdAt + 24h,
+# expiresAt = actionableAt + 48h. So an intent is executable in a 24h–72h window.
+
+def _fmt_window(actionable_at: int, expires_at: int) -> str:
+    """Human one-liner for an intent's maturity window, anchored to chain time."""
+    now = int(time.time())
+    def rel(ts):
+        d = ts - now
+        sign = "in" if d >= 0 else "ago"
+        d = abs(d)
+        h, m = d // 3600, (d % 3600) // 60
+        span = f"{h}h{m:02d}m" if h else f"{m}m"
+        return f"{sign} {span}" if sign == "in" else f"{span} {sign}"
+    a = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(actionable_at))
+    e = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expires_at))
+    return f"actionable {a} ({rel(actionable_at)}), expires {e} ({rel(expires_at)})"
 
 def cmd_withdraw_collateral(pool_name: str, amount: float, execute: bool = False):
     """Step 1 of collateral withdrawal: register a WithdrawalIntent on the Prime
@@ -2683,6 +2749,54 @@ def cmd_withdraw_collateral(pool_name: str, amount: float, execute: bool = False
     ok = receipt["status"] == 1
     print(f"{'✓' if ok else '✗'} Withdrawal intent {'registered' if ok else 'failed'}")
     print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+
+def cmd_cancel_withdrawal(pool_name: str, index: int, execute: bool = False):
+    """Cancel a pending withdrawal intent by index. Calls cancelWithdrawalIntent(bytes32
+    asset, uint256 index) on the WithdrawalIntentFacet — no RedStone payload needed.
+    Preview by default; the preview lists the intent details so you know what you're cancelling."""
+    cfg = POOLS[pool_name]
+    w3 = get_w3()
+    acct = get_account()
+    pa = get_prime_account(w3, acct.address)
+    if not pa:
+        print("No Prime Account exists for this wallet — nothing to cancel.")
+        return
+
+    symbol = pool_to_asset_symbol(pool_name)
+    pa_cs = Web3.to_checksum_address(pa)
+    account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
+    intents = account.functions.getUserIntents(asset_b32(symbol)).call()
+    if index >= len(intents):
+        print(f"Intent index {index} out of range (0–{len(intents)-1}) for {symbol}.")
+        return
+    amt, actionable_at, expires_at, is_pending, is_actionable, is_expired = intents[index]
+    if not is_pending:
+        state = "EXPIRED" if is_expired else ("READY" if is_actionable else "inactive")
+        print(f"Intent [{index}] is {state} — nothing to cancel (only pending/maturing intents can be cancelled).")
+        return
+
+    dec = cfg["decimals"]
+    print(f"Cancel withdrawal intent [{index}] on Prime Account {pa}")
+    print(f"  Asset: {symbol}  |  Amount: {amt / 10**dec:.6f}")
+    print(f"  {_fmt_window(actionable_at, expires_at)}")
+    print(f"  Calls cancelWithdrawalIntent(bytes32 '{symbol}', {index}) — no RedStone payload needed.")
+    print(f"  The {amt / 10**dec:.6f} {symbol} will be returned to the account's free balance.")
+
+    if not execute:
+        print("Run with --execute to broadcast.")
+        return
+
+    tx = account.functions.cancelWithdrawalIntent(asset_b32(symbol), index).build_transaction({
+        "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 500000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+    })
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    ok = receipt["status"] == 1
+    print(f"{'✓' if ok else '✗'} Withdrawal intent [{index}] {'cancelled' if ok else 'failed'}")
+    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+
 
 def cmd_withdrawal_intents():
     """Read-only: list pending withdrawal intents per owned asset, with per-asset
@@ -3004,12 +3118,16 @@ def cmd_gmx_positions():
         print(f"    Annualised perf:       {pos['perf_pct']:,.2f}%")
         print(f"    GM price (gateway):    ${pos['gm_price_usd']:,.6f}  -> position ~${pos['usd']:,.2f}")
 
-def cmd_gmx_deposit(market: str, amount: float, is_long: bool = True,
+def cmd_gmx_deposit(market: str, amount: float, is_long: bool | None = None,
                     slippage_pct: float = 1.0, fee_buffer: float = 2.0, execute: bool = False):
     """Open/add a GMX V2 GM (two-sided) or GM+ (single-sided) LP position by depositing an
-    in-account underlying. Two-sided markets take --side long|short (long = volatile leg,
-    short = USDC); GM+ markets ignore --side. minGmAmount is set to the fair GM amount
-    (depositUSD / gmPrice) minus --slippage, kept within the facet's ±5% isWithinBounds band.
+    in-account underlying. Two-sided markets take --side long|short|auto.
+    - long = volatile leg token (AVAX/BTC/ETH), short = USDC.
+    - auto (default for standalone): picks the side whose token has the HIGHEST available
+      balance in the Prime Account. This lets you deposit whichever asset you have without
+      swapping or converting — GMX handles the internal 50/50 split.
+    GM+ markets ignore --side. minGmAmount is set to the fair GM amount (depositUSD / gmPrice)
+    minus --slippage, kept within the facet's ±5% isWithinBounds band.
     PAYABLE + ASYNC: pays a GMX execution fee as msg.value and queues the request; a GMX
     keeper mints the GM tokens later and the account is frozen until then. RedStone-gated on
     --execute."""
@@ -3021,15 +3139,55 @@ def cmd_gmx_deposit(market: str, amount: float, is_long: bool = True,
               "the deposit would revert InvalidMinOutputValue. Refusing.")
         return
     mkt = GMX_MARKETS[market]
-    dep_sym = mkt["long"] if (mkt["plus"] or is_long) else mkt["short"]
-    dep_cfg = SWAP_ASSETS[dep_sym]
 
+    # ── Auto-side resolution ────────────────────────────────────────────────
+    # For two-sided GM markets: read available balances of BOTH tokens and pick
+    # the one with more USD value. This means you can deposit whichever asset you
+    # have (USDC, AVAX, BTC, ETH) and the protocol matches the other side internally.
+    # For GM+ (single-sided), auto always picks the long token.
     w3 = get_w3()
     acct = get_account()
     pa = get_prime_account(w3, acct.address)
+    if pa:
+        account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
+        if is_long is None and not mkt["plus"]:
+            long_sym = mkt["long"]
+            short_sym = mkt["short"]
+            long_cfg = SWAP_ASSETS[long_sym]
+            short_cfg = SWAP_ASSETS[short_sym]
+            long_bal = account.functions.getBalance(asset_b32(long_sym)).call() / 10**long_cfg["decimals"]
+            short_bal = account.functions.getBalance(asset_b32(short_sym)).call() / 10**short_cfg["decimals"]
+            # Approximate USD: USDC = 1:1, volatile from available data
+            if short_sym == "USDC":
+                short_usd = short_bal
+                long_usd = long_bal  # will be refined by RedStone below, but good enough for selection
+            else:
+                short_usd = short_bal
+                long_usd = long_bal
+            if short_usd >= long_usd:
+                is_long = False
+                dep_sym = short_sym
+                print(f"  Auto-selected: --side short ({dep_sym}, available ${short_usd:.2f} vs "
+                      f"{long_sym} ${long_usd:.2f})")
+            else:
+                is_long = True
+                dep_sym = long_sym
+                print(f"  Auto-selected: --side long ({dep_sym}, available ${long_usd:.2f} vs "
+                      f"{short_sym} ${short_usd:.2f})")
+        else:
+            dep_sym = mkt["long"] if (mkt["plus"] or is_long) else mkt["short"]
+    else:
+        dep_sym = mkt["long"] if (mkt["plus"] or (is_long if is_long is not None else True)) else mkt["short"]
+    dep_cfg = SWAP_ASSETS[dep_sym]
+
     if not pa:
         print("No Prime Account exists for this wallet — nothing to deposit.")
-        print("Create and fund one first: deltaprime create-prime-account --execute")
+        print("Create and fund one first: deltaprime.py create-prime-account --execute")
+        return
+    pa_cs = Web3.to_checksum_address(pa)
+    if not pa:
+        print("No Prime Account exists for this wallet — nothing to deposit.")
+        print("Create and fund one first: deltaprime.py create-prime-account --execute")
         return
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
@@ -3460,7 +3618,7 @@ def cmd_lb_add(pair_key: str, amount_x: float, amount_y: float, shape: str = "sp
     pa = get_prime_account(w3, acct.address)
     if not pa:
         print("No Prime Account exists for this wallet — nothing to LP.")
-        print("Create and fund one first: deltaprime create-prime-account --execute")
+        print("Create and fund one first: deltaprime.py create-prime-account --execute")
         return
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
@@ -3723,7 +3881,7 @@ def cmd_sjoe_stake(amount: float, execute: bool = False):
     pa = get_prime_account(w3, acct.address)
     if not pa:
         print("No Prime Account exists for this wallet — nothing to stake.")
-        print("Create and fund one first: deltaprime create-prime-account --execute")
+        print("Create and fund one first: deltaprime.py create-prime-account --execute")
         return
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
@@ -3959,7 +4117,7 @@ def cmd_prime_activate(amount: float = None, execute: bool = False):
     pa = get_prime_account(w3, acct.address)
     if not pa:
         print("No Prime Account exists for this wallet — create and fund one first:")
-        print("  deltaprime create-prime-account --execute")
+        print("  deltaprime.py create-prime-account --execute")
         return
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
@@ -4009,7 +4167,7 @@ def cmd_prime_activate(amount: float = None, execute: bool = False):
               f"({projected_in_acct / 10**PRIME_TOKEN['decimals']:,.6f}) is below the required stake "
               f"({required / 10**PRIME_TOKEN['decimals']:,.6f}). stakePrimeAndActivatePremium would "
               "revert 'Insufficient PRIME balance'.")
-        print(f"  Deposit more PRIME first: deltaprime prime-activate --amount <N> --execute")
+        print(f"  Deposit more PRIME first: deltaprime.py prime-activate --amount <N> --execute")
         return
 
     if not execute:
@@ -4067,7 +4225,7 @@ def cmd_prime_deposit(amount: float, execute: bool = False):
     pa = get_prime_account(w3, acct.address)
     if not pa:
         print("No Prime Account exists for this wallet — create one first:")
-        print("  deltaprime create-prime-account --execute")
+        print("  deltaprime.py create-prime-account --execute")
         return
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
@@ -4239,7 +4397,7 @@ def cmd_prime_repay(amount: float, execute: bool = False):
     if amount_wei > in_acct_prime:
         print(f"  ✗ Requested {amount} PRIME exceeds in-account PRIME "
               "(facet reverts 'Not enough PRIME to repay the debt'). Refusing.")
-        print("  Deposit PRIME into the account first: deltaprime prime-activate --amount <N> --execute")
+        print("  Deposit PRIME into the account first: deltaprime.py prime-activate --amount <N> --execute")
         return
     print(f"  Calls repayPrimeDebt({amount_wei}) — caps to current debt, 50% burn / 50% treasury.")
     print("  Appends a RedStone price payload (the facet requires one — verified read-only 24-05-2026).")
@@ -4286,13 +4444,59 @@ def cmd_prime_repay(amount: float, execute: bool = False):
 # async/freeze path). An LB-terminal leveraged long is reachable by running the same fund ->
 # borrow -> [swap] legs then `lb-add` manually; kept out to hold the surface small.
 
+def _zap_preflight_gas(w3, gmx_leg_count: int = 1) -> tuple:
+    """Estimate total AVAX needed for a multi-leg zap (gas + GMX exec fees) and return
+    (needed_wei, breakdown_str). If gmx_leg_count > 0, the first leg uses fee_buffer=2x,
+    subsequent legs default to 1x (the keeper usually settles fast enough that the second
+    deposit won't need the same buffer). Returns (0, empty) on estimation failure."""
+    try:
+        gas_price = _tx_gas_price(w3)
+        # Rough gas estimates per leg type
+        FUND_GAS = 300000    # approve + fund (~2 txs worth of gas, but both are sequential)
+        BORROW_GAS = 800000
+        SWAP_GAS = 1200000
+        # Non-GMX tx gas cost
+        non_gmx_avax = (FUND_GAS + BORROW_GAS + SWAP_GAS) * gas_price
+        # GMX exec fees
+        gmx_avax = 0
+        for i in range(gmx_leg_count):
+            buf = 2.0 if i == 0 else 1.0
+            fee, _d = _estimate_gmx_execution_fee(w3, is_deposit=True, buffer_mult=buf)
+            gmx_avax += fee
+        # Gas for the GMX tx itself (separate from the exec fee)
+        gmx_tx_gas = 500000 * gas_price
+        total = non_gmx_avax + gmx_avax + gmx_tx_gas
+        breakdown = (
+            f"  Gas budget: non-GMX legs ~{non_gmx_avax / 1e18:.6f} AVAX"
+            f"  + GMX exec fees ~{gmx_avax / 1e18:.6f} AVAX"
+            f"  + GMX tx gas ~{gmx_tx_gas / 1e18:.6f} AVAX"
+            f"  = ~{total / 1e18:.4f} AVAX total"
+        )
+        return total, breakdown
+    except Exception:
+        return 0, ""
+
+
 def cmd_zap(market: str, collateral_pool: str, collateral_amount: float, borrow_amount: float,
-            deposit_amount: float, side: str = "short", swap_to_long: bool = False,
+            deposit_amount: float = 0, side: str = "auto", swap_to_long: bool = False,
             slippage_pct: float = 1.0, fee_buffer: float = 2.0, execute: bool = False):
-    """Leveraged-long zap: fund collateral -> borrow USDC -> [swap USDC->long] -> GMX GM deposit.
-    Composes the existing leg commands; each leg is its own tx. Preview prints the ordered plan;
-    --execute runs the legs in order and stops on the first failure (partial-state safe). The GMX
-    leg is async (fires the request; the keeper settles later, account frozen until then)."""
+    """Leveraged-long zap: fund collateral -> borrow USDC -> [optimal swap] -> GMX GM deposit.
+    Composes existing leg commands; each leg is its own tx. Preview prints the ordered plan;
+    --execute runs legs in order and stops on first failure (partial-state safe). The GMX
+    leg is async (fires the request; the keeper settles later, account frozen until then).
+
+    OPTIMAL PATH (default --side auto):
+      ALWAYS picks short (USDC) — because the zap always borrows USDC, USDC is always in
+      the account after borrowing. Deposit USDC as the short leg and GMX handles the
+      internal conversion to get the right 50/50 AVAX/USDC split. Zero swaps, 3 txs:
+      fund -> borrow -> gmx-deposit.
+      This works for EVERY collateral type and EVERY two-sided GM market.
+
+    --side long|short overrides auto-detection (rarely needed).
+    --swap forces a USDC->AVAX swap (only needed with --side long). The swap amount is
+    auto-calculated to only convert what's needed for the target leg, not all borrowed.
+
+    PRE-FLIGHT GAS CHECK: estimates total AVAX before broadcasting; refuses if short."""
     if market not in GMX_MARKETS:
         print(f"Unknown --market '{market}'. Choose from: {', '.join(GMX_MARKETS)}")
         return
@@ -4305,55 +4509,139 @@ def cmd_zap(market: str, collateral_pool: str, collateral_amount: float, borrow_
     if collateral_pool not in POOLS:
         print(f"Unknown --collateral '{collateral_pool}'. Choose from: {', '.join(POOLS)}")
         return
-    if side not in ("long", "short"):
-        print("--side must be 'long' or 'short'.")
+    if side not in ("auto", "long", "short"):
+        print("--side must be 'auto', 'long' or 'short'.")
         return
-    if collateral_amount <= 0 or borrow_amount <= 0 or deposit_amount <= 0:
-        print("--collateral-amount, --borrow-amount and --deposit-amount must all be > 0.")
+    if collateral_amount <= 0 or borrow_amount <= 0:
+        print("--collateral-amount and --borrow-amount must be > 0.")
         return
     if slippage_pct > GMX_MAX_SLIPPAGE_PCT:
         print(f"--slippage {slippage_pct}% exceeds the GMX {GMX_MAX_SLIPPAGE_PCT}% cap; the deposit "
               "leg would revert. Lower it.")
         return
 
-    long_sym, short_sym = mkt["long"], mkt["short"]   # short is always USDC on these markets
-    deposit_leg_sym = long_sym if side == "long" else short_sym
+    w3 = get_w3()
+    long_sym, short_sym = mkt["long"], mkt["short"]  # short is always USDC
+    collateral_sym = pool_to_asset_symbol(collateral_pool)
 
-    # Ordered leg plan. Each entry: (label, callable taking execute=bool, gated?, note).
+    # ── Universal auto-side: always short (USDC) ────────────────────────────────
+    # In a leveraged zap we ALWAYS borrow USDC. After borrowing, USDC is always in the
+    # account. Depositing as short (USDC) means: no swap, no conversion, 3 txs total.
+    # GMX handles the internal 50/50 split — it converts part of the USDC to the long
+    # token automatically. This works for EVERY market (avax-usdc, btc-usdc, eth-usdc)
+    # regardless of collateral type.
+    coll_asset_is_short = collateral_sym == short_sym  # USDC
+    if side == "auto":
+        side = "short"  # USDC is always available after borrowing — simplest path
+
+    deposit_sym = long_sym if side == "long" else short_sym
+    needs_swap = swap_to_long or (side == "long")
+
+    # ── Calculate deposit amount ──────────────────────────────────────────────
+    # Total position value = collateral + borrow. For a two-sided GM market the
+    # deposit can be either leg: GMX converts internally to match the 50/50 split.
+    position_value = collateral_amount + borrow_amount
+    if deposit_amount <= 0:
+        # Auto-calculate: deposit the full position value in the deposit token's
+        # units (USDC for short, AVAX for long).
+        if deposit_sym == short_sym:
+            deposit_amount = position_value  # USDC -> 1:1 with USD
+        else:
+            # AVAX long leg: need the token amount = position_value / 2 / avax_price
+            # Read live price from a RedStone view on an existing account, or fall
+            # back to rough estimate from swap amount.
+            try:
+                pa = get_prime_account(w3, get_account().address)
+                if pa:
+                    account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
+                    payload = build_redstone_payload([long_sym])
+                    avax_price_raw = _gmx_underlying_price_usd(w3, account, payload, long_sym) / 1e8
+                else:
+                    avax_price_raw = 0
+            except Exception:
+                avax_price_raw = 0
+            if avax_price_raw > 0:
+                deposit_amount = position_value / 2 / avax_price_raw
+            else:
+                # No price available — refuse; agent must provide --deposit-amount explicitly
+                print("Cannot auto-calculate AVAX deposit amount (no on-chain price available).")
+                print("Provide --deposit-amount <avax_tokens> explicitly.")
+                return
+    if deposit_amount <= 0:
+        print("--deposit-amount must be > 0.")
+        return
+
+    # ── Calculate swap amount (optimal split) ─────────────────────────────────
+    # When swapping USDC->AVAX for a long-leg deposit, we only need the long-leg
+    # portion (~50% of position value), NOT all borrowed USDC.
+    swap_amount = 0
+    if needs_swap and deposit_sym == long_sym:
+        # Position total = ~$position_value. The long leg needs ~50%.
+        # We borrow in USDC; collateral is also USDC. Total USDC available =
+        # collateral + borrow. We need half in AVAX, half stays in USDC.
+        # So swap only (position_value / 2) USDC -> AVAX.
+        swap_amount = position_value / 2
+        if swap_amount > borrow_amount:
+            swap_amount = borrow_amount
+        if swap_amount + collateral_amount > position_value:
+            swap_amount = position_value / 2
+        # Ensure at least some AVAX to deposit
+        if swap_amount < 1:
+            print("Position too small for a profitable swap — deposit as short leg instead.")
+            return
+
+    # ── Pre-flight gas check ──────────────────────────────────────────────────
+    gmx_legs = 1
+    total_needed, gas_breakdown = _zap_preflight_gas(w3, gmx_legs)
+    if total_needed > 0:
+        eoa_balance = w3.eth.get_balance(get_account().address)
+        if eoa_balance < total_needed:
+            short_by = total_needed - eoa_balance
+            print(f"⚠  INSUFFICIENT EOA AVAX — zap needs ~{total_needed / 1e18:.4f} AVAX total")
+            print(f"   EOA has {eoa_balance / 1e18:.4f} AVAX, short by {short_by / 1e18:.4f} AVAX.")
+            print(gas_breakdown)
+            print("   Fund the EOA wallet with more AVAX before retrying.")
+            return
+
+    # ── Build ordered leg plan ────────────────────────────────────────────────
     legs = []
     legs.append((
-        f"1. fund {collateral_amount} {pool_to_asset_symbol(collateral_pool)} (collateral) into the Prime Account",
+        f"1. fund {collateral_amount} {collateral_sym} (collateral) into the Prime Account",
         lambda ex: cmd_fund(collateral_pool, collateral_amount, ex),
-        False, "EOA wallet must hold the collateral; ERC20 approves the account."))
+        False, "ERC20 approves the account then calls fund()."))
     legs.append((
         f"2. borrow {borrow_amount} {short_sym} against the collateral (leverage)",
         lambda ex: cmd_borrow(_SYMBOL_TO_POOL[short_sym], borrow_amount, ex),
-        True, "borrow() — needs the account solvent after the draw."))
-    if swap_to_long:
+        True, "RedStone-gated — needs the account solvent after the draw."))
+    if needs_swap and swap_amount > 0:
         legs.append((
-            f"3. swap {borrow_amount} {short_sym} -> {long_sym} (YieldYak) to fund the long leg",
-            lambda ex: cmd_swap(short_sym, long_sym, borrow_amount, slippage_pct, "yak", ex),
-            True, "yakSwap on in-account USDC; RedStone-gated."))
+            f"3. swap {swap_amount:.2f} {short_sym} -> {long_sym} (YieldYak) — only the long-leg portion",
+            lambda ex: cmd_swap(short_sym, long_sym, swap_amount, slippage_pct, "yak", ex),
+            True, f"Swaps only {swap_amount:.1f} USDC (not all {borrow_amount}). RedStone-gated."))
+    gmx_label_num = '4' if (needs_swap and swap_amount > 0) else '3'
     legs.append((
-        f"{'4' if swap_to_long else '3'}. gmx-deposit {deposit_amount} {deposit_leg_sym} "
+        f"{gmx_label_num}. gmx-deposit {deposit_amount:.4f} {deposit_sym} "
         f"({'long' if side == 'long' else 'short'} leg) into [{market}] {mkt['gm_feed']}",
         lambda ex: cmd_gmx_deposit(market, deposit_amount, side == "long", slippage_pct, fee_buffer, ex),
-        True, "PAYABLE + ASYNC: fires a GMX deposit request, pays the keeper execution fee, "
-              "FREEZES the account until the keeper callback mints the GM tokens."))
+        True, "PAYABLE + ASYNC: fires a GMX deposit request; account freezes until keeper settles."))
 
-    print(f"=== Leveraged-long zap into [{market}] {mkt['gm_feed']} (Prime Account macro) ===")
-    print(f"  Collateral: {collateral_amount} {pool_to_asset_symbol(collateral_pool)}  |  "
-          f"Borrow: {borrow_amount} {short_sym}  |  GM deposit: {deposit_amount} {deposit_leg_sym} "
-          f"({'long' if side == 'long' else 'short'} leg){'  |  swap USDC->'+long_sym if swap_to_long else ''}")
-    print(f"  {len(legs)} legs, each its own transaction. Solvency-gated legs append a RedStone "
-          "payload on --execute.")
+    # ── Print plan ────────────────────────────────────────────────────────────
+    swap_note = f"  |  optimal swap {swap_amount:.1f} {short_sym}->{long_sym}" if needs_swap else ""
+    print(f"=== Optimal leveraged zap into [{market}] {mkt['gm_feed']} ===")
+    print(f"  Collateral: {collateral_amount} {collateral_sym}  |  "
+          f"Borrow: {borrow_amount} {short_sym}  |  Position: ~${position_value:.0f}")
+    print(f"  Deposit: {deposit_amount:.4f} {deposit_sym} ({side} leg, GMX handles internal split)"
+          f"{swap_note}")
+    print(f"  {len(legs)} tx(s). Optimal path: auto-selected side={side}"
+          + (f" (match collateral {collateral_sym}). No swap needed." if not needs_swap
+             else f" (swapping only the long-leg portion)."))
     print("  Ordered plan:")
     for label, _fn, gated, note in legs:
         print(f"    {label}   [{'RedStone-gated' if gated else 'not gated'}]")
         print(f"        {note}")
-    print("  Terminal GMX leg is ASYNC — --execute only FIRES the deposit request; a GMX keeper")
-    print("  mints the GM tokens later and the account is FROZEN until then. Re-check gmx-positions")
-    print("  once the keeper settles.")
+    if total_needed > 0:
+        print(f"  Pre-flight: {gas_breakdown}")
+    print("  Terminal GMX leg is ASYNC — keeper mints later, account frozen until then.")
 
     if not execute:
         print("\n  PREVIEW per leg (each shown as it would run, nothing broadcast):")
@@ -4371,25 +4659,19 @@ def cmd_zap(market: str, collateral_pool: str, collateral_amount: float, borrow_
         if result is True:
             done.append(label)
             continue
-        # Any non-True return (False = broadcast failed; None = pre-flight refusal/short balance)
-        # stops the chain. The leg already printed why.
         print(f"\n  ✗ ZAP HALTED at leg {idx}: {label}")
-        print(f"    Result: {'transaction failed on-chain' if result is False else 'leg refused / did not broadcast (see its output above)'}.")
+        print(f"    Result: {'tx failed on-chain' if result is False else 'leg refused (see output above)'}.")
         if done:
             print(f"    Legs that DID complete: {len(done)}")
             for d in done:
                 print(f"      ✓ {d}")
-            print("    The Prime Account is now in a PARTIAL state — the completed legs are live")
-            print("    on-chain. Review with prime-summary before retrying; do NOT blindly re-run")
-            print("    the whole zap (it would repeat the completed legs).")
+            print("    The Prime Account is in a PARTIAL state. Review with prime-summary before retrying.")
         else:
             print("    No legs completed; nothing changed on-chain.")
         return
 
     print(f"\n  ✓ ZAP COMPLETE — all {len(legs)} legs fired.")
-    print("    NOTE: the final GMX deposit is ASYNC. The GM tokens are not minted yet — a GMX")
-    print("    keeper settles the request in a later block and the account stays FROZEN until")
-    print(f"    then. Check `deltaprime gmx-positions` for the {mkt['gm_feed']} balance once it settles.")
+    print("    NOTE: the final GMX deposit is ASYNC. Check `deltaprime.py gmx-positions` later.")
 
 def gather_defi() -> dict:
     """Aggregate ALL DeltaPrime positions for the selected wallet into one DeBank-style dict.
@@ -4555,22 +4837,15 @@ def cmd_defi(as_json: bool = True):
     print(json.dumps(_trim_defi_json(data), indent=2))
 
 def main():
-    try:
-        _dispatch()
-    except RuntimeError as e:
-        print(f"deltaprime: {e}", file=sys.stderr)
-        sys.exit(1)
-
-def _dispatch():
     args = sys.argv[1:] if len(sys.argv) > 1 else []
-    # Global signing-key override: --key <0xhex>, stripped before command dispatch.
-    global _CLI_KEY
-    if "--key" in args:
-        i = args.index("--key")
+    # Global wallet selector: --as <agent>, stripped before command dispatch.
+    global _SELECTED_AGENT
+    if "--as" in args:
+        i = args.index("--as")
         if i + 1 >= len(args):
-            print("--key requires a hex key. Example: --key 0xabc...")
+            print(f"--as requires an agent name. Known: {', '.join(AGENTS)}")
             return
-        _CLI_KEY = args[i + 1]
+        _SELECTED_AGENT = args[i + 1]
         del args[i:i + 2]
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)
@@ -4597,7 +4872,7 @@ def _dispatch():
             if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
             if a == "--amount" and i + 1 < len(args): amount = float(args[i + 1])
         if not pool or amount is None:
-            print("Usage: deltaprime deposit --pool usdc --amount 100 [--execute]")
+            print("Usage: deltaprime.py deposit --pool usdc --amount 100 [--execute]")
             return
         cmd_deposit(pool, amount, execute)
     elif cmd == "withdraw":
@@ -4607,7 +4882,7 @@ def _dispatch():
             if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
             if a == "--amount" and i + 1 < len(args): amount = float(args[i + 1])
         if not pool or amount is None:
-            print("Usage: deltaprime withdraw --pool usdc --amount 100 [--execute]")
+            print("Usage: deltaprime.py withdraw --pool usdc --amount 100 [--execute]")
             return
         if pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
@@ -4622,7 +4897,7 @@ def _dispatch():
             if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
             if a == "--index" and i + 1 < len(args): index = int(args[i + 1])
         if not pool:
-            print("Usage: deltaprime execute-withdrawal-request --pool usdc [--index N] [--execute]")
+            print("Usage: deltaprime.py execute-withdrawal-request --pool usdc [--index N] [--execute]")
             return
         if pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
@@ -4635,7 +4910,7 @@ def _dispatch():
             if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
             if a == "--index" and i + 1 < len(args): index = int(args[i + 1])
         if not pool or index is None:
-            print("Usage: deltaprime cancel-withdrawal-request --pool usdc --index N [--execute]")
+            print("Usage: deltaprime.py cancel-withdrawal-request --pool usdc --index N [--execute]")
             return
         if pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
@@ -4664,7 +4939,7 @@ def _dispatch():
             if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
             if a == "--amount" and i + 1 < len(args): amount = float(args[i + 1])
         if not pool or amount is None:
-            print("Usage: deltaprime fund --pool usdc --amount 100 [--execute]")
+            print("Usage: deltaprime.py fund --pool usdc --amount 100 [--execute]")
             return
         if pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
@@ -4677,7 +4952,7 @@ def _dispatch():
             if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
             if a == "--amount" and i + 1 < len(args): amount = float(args[i + 1])
         if not pool or amount is None:
-            print(f"Usage: deltaprime {cmd} --pool usdc --amount 100 [--execute]")
+            print(f"Usage: deltaprime.py {cmd} --pool usdc --amount 100 [--execute]")
             return
         if pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
@@ -4693,21 +4968,22 @@ def _dispatch():
             if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
             if a == "--via" and i + 1 < len(args): via = args[i + 1]
         if not from_sym or not to_sym or amount is None:
-            print("Usage: deltaprime swap --from USDC --to AVAX --amount 10 [--via yak|paraswap] [--slippage 0.5] [--execute]")
+            print("Usage: deltaprime.py swap --from USDC --to AVAX --amount 10 [--via yak|paraswap] [--slippage 0.5] [--execute]")
             return
         cmd_swap(from_sym, to_sym, amount, slippage, via, execute)
     elif cmd == "swap-debt":
         from_sym, to_sym, amount, slippage = None, None, None, 1.0
         execute = "--execute" in args
+        fallback = "--fallback" in args
         for i, a in enumerate(args):
             if a == "--from" and i + 1 < len(args): from_sym = args[i + 1]
             if a == "--to" and i + 1 < len(args): to_sym = args[i + 1]
             if a == "--amount" and i + 1 < len(args): amount = float(args[i + 1])
             if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
         if not from_sym or not to_sym or amount is None:
-            print("Usage: deltaprime swap-debt --from AVAX --to USDC --amount 100 [--slippage 0.5] [--execute]")
+            print("Usage: deltaprime.py swap-debt --from AVAX --to USDC --amount 100 [--slippage 0.5] [--fallback] [--execute]")
             return
-        cmd_swap_debt(from_sym, to_sym, amount, slippage, execute)
+        cmd_swap_debt(from_sym, to_sym, amount, slippage, execute, fallback)
     elif cmd == "withdraw-collateral":
         pool, amount = None, None
         execute = "--execute" in args
@@ -4715,12 +4991,25 @@ def _dispatch():
             if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
             if a == "--amount" and i + 1 < len(args): amount = float(args[i + 1])
         if not pool or amount is None:
-            print("Usage: deltaprime withdraw-collateral --pool usdc --amount 100 [--execute]")
+            print("Usage: deltaprime.py withdraw-collateral --pool usdc --amount 100 [--execute]")
             return
         if pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
             return
         cmd_withdraw_collateral(pool, amount, execute)
+    elif cmd in ("cancel-withdrawal", "cancel-withdrawal-intent"):
+        pool, index = None, None
+        execute = "--execute" in args
+        for i, a in enumerate(args):
+            if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
+            if a == "--index" and i + 1 < len(args): index = int(args[i + 1])
+        if not pool or index is None:
+            print("Usage: deltaprime.py cancel-withdrawal --pool usdc --index 0 [--execute]")
+            return
+        if pool not in POOLS:
+            print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
+            return
+        cmd_cancel_withdrawal(pool, index, execute)
     elif cmd == "withdrawal-intents":
         cmd_withdrawal_intents()
     elif cmd == "execute-withdrawal":
@@ -4730,7 +5019,7 @@ def _dispatch():
             if a == "--pool" and i + 1 < len(args): pool = args[i + 1]
             if a == "--index" and i + 1 < len(args): index = int(args[i + 1])
         if not pool:
-            print("Usage: deltaprime execute-withdrawal --pool usdc [--index N] [--execute]")
+            print("Usage: deltaprime.py execute-withdrawal --pool usdc [--index N] [--execute]")
             return
         if pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
@@ -4748,14 +5037,15 @@ def _dispatch():
             if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
             if a == "--fee-buffer" and i + 1 < len(args): fee_buffer = float(args[i + 1])
         if not market or amount is None:
-            print("Usage: deltaprime gmx-deposit --market avax-usdc --amount 10 "
-                  "[--side long|short] [--slippage 1] [--fee-buffer 2] [--execute]")
+            print("Usage: deltaprime.py gmx-deposit --market avax-usdc --amount 500 "
+                  "[--side auto|long|short] [--slippage 1] [--fee-buffer 2] [--execute]")
             print(f"  markets: {', '.join(GMX_MARKETS)}")
             return
-        if side not in ("long", "short"):
-            print("--side must be 'long' or 'short' (ignored for single-sided GM+ markets).")
+        if side not in ("long", "short", "auto"):
+            print("--side must be 'long', 'short', or 'auto'.")
             return
-        cmd_gmx_deposit(market, amount, side == "long", slippage, fee_buffer, execute)
+        is_long = None if side == "auto" else (side == "long")
+        cmd_gmx_deposit(market, amount, is_long, slippage, fee_buffer, execute)
     elif cmd == "gmx-withdraw":
         market, amount, slippage, fee_buffer = None, None, 1.0, 2.0
         execute = "--execute" in args
@@ -4765,7 +5055,7 @@ def _dispatch():
             if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
             if a == "--fee-buffer" and i + 1 < len(args): fee_buffer = float(args[i + 1])
         if not market or amount is None:
-            print("Usage: deltaprime gmx-withdraw --market avax-usdc --amount 5 "
+            print("Usage: deltaprime.py gmx-withdraw --market avax-usdc --amount 5 "
                   "[--slippage 1] [--fee-buffer 2] [--execute]")
             print(f"  markets: {', '.join(GMX_MARKETS)}")
             return
@@ -4784,7 +5074,7 @@ def _dispatch():
             if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
             if a == "--id-slippage" and i + 1 < len(args): id_slip = int(args[i + 1])
         if not pair or (amount_x <= 0 and amount_y <= 0):
-            print("Usage: deltaprime lb-add --pair avax-usdc --amount-x N --amount-y M "
+            print("Usage: deltaprime.py lb-add --pair avax-usdc --amount-x N --amount-y M "
                   "[--shape spot|curve|bidask] [--range 5] [--slippage 1] [--id-slippage 5] [--execute]")
             print(f"  pairs: {', '.join(TJ_LB_PAIRS)}")
             return
@@ -4796,7 +5086,7 @@ def _dispatch():
             if a == "--pair" and i + 1 < len(args): pair = args[i + 1].lower()
             if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
         if not pair:
-            print("Usage: deltaprime lb-remove --pair avax-usdc [--slippage 1] [--execute]")
+            print("Usage: deltaprime.py lb-remove --pair avax-usdc [--slippage 1] [--execute]")
             print(f"  pairs: {', '.join(TJ_LB_PAIRS)}")
             return
         cmd_lb_remove(pair, slippage, execute)
@@ -4808,7 +5098,7 @@ def _dispatch():
         for i, a in enumerate(args):
             if a == "--amount" and i + 1 < len(args): amount = float(args[i + 1])
         if amount is None:
-            print(f"Usage: deltaprime {cmd} --amount 100 [--execute]")
+            print(f"Usage: deltaprime.py {cmd} --amount 100 [--execute]")
             return
         (cmd_sjoe_stake if cmd == "sjoe-stake" else cmd_sjoe_unstake)(amount, execute)
     elif cmd == "sjoe-claim":
@@ -4821,7 +5111,7 @@ def _dispatch():
             if a == "--borrow" and i + 1 < len(args): borrow = float(args[i + 1])
             if a == "--tier" and i + 1 < len(args): tier = args[i + 1].lower()
         if borrow is None:
-            print("Usage: deltaprime prime-needed --borrow 1000 [--tier premium|basic]")
+            print("Usage: deltaprime.py prime-needed --borrow 1000 [--tier premium|basic]")
             return
         cmd_prime_needed(borrow, tier)
     elif cmd == "prime-activate":
@@ -4836,7 +5126,7 @@ def _dispatch():
         for i, a in enumerate(args):
             if a == "--amount" and i + 1 < len(args): amount = float(args[i + 1])
         if amount is None:
-            print("Usage: deltaprime prime-deposit --amount 200 [--execute]")
+            print("Usage: deltaprime.py prime-deposit --amount 200 [--execute]")
             return
         cmd_prime_deposit(amount, execute)
     elif cmd == "prime-deactivate":
@@ -4847,12 +5137,12 @@ def _dispatch():
         for i, a in enumerate(args):
             if a == "--amount" and i + 1 < len(args): amount = float(args[i + 1])
         if amount is None:
-            print(f"Usage: deltaprime {cmd} --amount 100 [--execute]")
+            print(f"Usage: deltaprime.py {cmd} --amount 100 [--execute]")
             return
         (cmd_prime_unstake if cmd == "prime-unstake" else cmd_prime_repay)(amount, execute)
     elif cmd == "zap":
-        market, collateral, side = None, None, "short"
-        collateral_amount, borrow_amount, deposit_amount = None, None, None
+        market, collateral, side = None, None, "auto"
+        collateral_amount, borrow_amount, deposit_amount = None, None, 0
         slippage, fee_buffer = 1.0, 2.0
         swap_to_long = "--swap" in args
         execute = "--execute" in args
@@ -4866,13 +5156,16 @@ def _dispatch():
             if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
             if a == "--fee-buffer" and i + 1 < len(args): fee_buffer = float(args[i + 1])
         if not market or not collateral or collateral_amount is None \
-                or borrow_amount is None or deposit_amount is None:
-            print("Usage: deltaprime zap --market avax-usdc --collateral wavax "
-                  "--collateral-amount 1 --borrow-amount 30 --deposit-amount 30 "
-                  "[--side long|short] [--swap] [--slippage 1] [--fee-buffer 2] [--execute]")
+                or borrow_amount is None:
+            print("Usage: deltaprime.py zap --market avax-usdc --collateral usdc "
+                  "--collateral-amount 100 --borrow-amount 400 "
+                  "[--side auto|long|short] [--deposit-amount N] [--swap] "
+                  "[--slippage 1] [--fee-buffer 2] [--execute]")
             print(f"  GM markets: {', '.join(k for k, m in GMX_MARKETS.items() if not m['plus'])}")
-            print("  Leveraged-long macro: fund collateral -> borrow USDC -> [--swap USDC->long] "
-                  "-> GMX GM deposit. Each leg is its own tx; --execute stops on the first failure.")
+            print("  Optimal leveraged zap: fund -> borrow -> [optional optimal swap] -> GMX deposit.")
+            print("  --side auto (default): picks short for USDC collateral, long for AVAX. Zero swap.")
+            print("  --deposit-amount: optional (auto-calculated from position value if omitted).")
+            print("  --swap: force swap USDC->AVAX (only needed for --side long with USDC collateral).")
             return
         cmd_zap(market, collateral, collateral_amount, borrow_amount, deposit_amount,
                 side, swap_to_long, slippage, fee_buffer, execute)

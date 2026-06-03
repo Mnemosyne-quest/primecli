@@ -1,12 +1,10 @@
 # DeltaPrime Capabilities — Build Spec
 
-Per-capability build spec for the full DeltaPrime surface on Avalanche C-chain (chainId 43114), precise enough to wire each one into the `deltaprime` CLI. Verified on-chain 23-05-2026 against the live diamond beacon and the `DeltaPrimeLabs/deltaprime-contracts-v2` source.
+Per-capability build spec for the full DeltaPrime capability surface on Avalanche C-chain (chainId 43114), precise enough to wire each one into `deltaprime.py`. Verified on-chain 23-05-2026 against the live diamond beacon and `DeltaPrimeLabs/deltaprime-contracts-v2` source. Sibling to `deltaprime-reference.md` (which has the high-level model, pools, and the full command table).
 
-**Audience:** contributors (human or agent) who need to extend, debug, or audit the tool's implementation. Pair with [`deltaprime-reference.md`](deltaprime-reference.md) for the protocol model, pool list, facet map, and the user-facing command table.
+**Build status (24-05-2026):** the RedStone payload wrap is shipped, and most of this spec is now tooled — including zaps as tool-level macros (§7) and PRIME leverage tiers (§8). Section headers marked ✅ SHIPPED name the command(s) that implement them; the build detail below each is kept as the verified implementation record. Still untooled: Wombat liquid-staking LP (§6a), GLP (§6c), and PangolinDEX LP (§6d).
 
-**Build status (24-05-2026).** The RedStone payload wrap is shipped, and most capabilities below are tooled. Section headers marked ✅ SHIPPED name the implementing command(s); the build detail under each is the verified implementation record. Still untooled: Wombat liquid-staking LP (§6a), GLP (§6c), and PangolinDEX LP (§6d).
-
-**Where the calls go.** Everything from §3 onwards runs on the Prime Account (the per-user EIP-2535 diamond). Functions are reached by calling the diamond at the Prime Account's own address; the facet logic is shared via the beacon at `0x2916B3bf7C35bd21e63D01C93C62FB0d4994e56D`. Calls originate from the EOA owner; the diamond enforces `onlyOwner` (i.e. `DiamondStorageLib.contractOwner()`, the EOA that created the account).
+**Everything below runs on the Prime Account** (the per-user EIP-2535 diamond). All functions are reached by calling the diamond at the Prime Account's own address — the facet logic is shared via the beacon `0x2916B3bf7C35bd21e63D01C93C62FB0d4994e56D`. Call from the EOA owner; the diamond enforces `onlyOwner` (= `DiamondStorageLib.contractOwner()` = the EOA that created the account).
 
 ---
 
@@ -24,7 +22,7 @@ Per-capability build spec for the full DeltaPrime surface on Avalanche C-chain (
 
 Two aggregator routes (`--via yak` default, or `--via paraswap`). App lets the user pick whichever gives the better quote.
 
-### 1a. ParaSwap (Velora on Avalanche) — `ParaSwapFacet` `0x3732ba82d54568609b2E63cB64487af0D7f3FBcc` — ⚠️ **BLOCKED upstream**
+### 1a. ParaSwap (Velora on Avalanche) — `ParaSwapFacet` `0x3732ba82d54568609b2E63cB64487af0D7f3FBcc`
 
 ```
 paraSwapV6(bytes4 selector, bytes data)
@@ -32,8 +30,6 @@ paraSwapV6(bytes4 selector, bytes data)
 - `selector` + `data` are the **ParaSwap/Velora API swap calldata** (the 4-byte method selector of the ParaSwap Augustus V6 router call, and the ABI-encoded args) obtained from the ParaSwap API `/swap` (or `/transactions`) endpoint for this chain. The facet decodes it (`decodeParaSwapData`), validates srcToken/destToken are supported assets, executes the swap from the account's balance, and re-syncs exposure.
 - Build: query ParaSwap API for a route srcToken→destToken on Avalanche, with the **Prime Account address as the sender/receiver**, extract the call's selector and the remaining calldata, pass them in. Slippage is encoded in the ParaSwap quote (`destAmount`/`minDestAmount`).
 - `paraSwapBeforeLiquidation(bytes4,bytes)` — same but `onlyWhitelistedLiquidators`; liquidation-only, not for us.
-
-**Current breakage (2026-05-29).** ParaSwap's v6.2 API now routinely emits router methods (`directUniV3Swap` 0xa6886da9, `simpleSwap` 0x54e3f31b, `multiSwap` 0xa94e78ef, `megaSwap` 0x46c67b6d) NOT in the facet's `PARASWAP_SUPPORTED_SELECTORS` allowlist (only `0xe3ead59e swapExactAmountIn` and `0x876a02f6 swapExactAmountInOnUniswapV3` decode), and a new executor `0x8faa0000c10015610005ca010ee000d006e0e820` not in `PARASWAP_EXECUTORS`. Until DeltaPrime governance updates the on-chain allowlists, broadcasting reverts. From v0.2.2 the tool refuses cleanly at the entry point — use `--via yak` instead. Tracking: https://github.com/Mnemosyne-quest/primecli/issues/2
 
 ### 1b. YieldYak Swap — `YieldYakSwapFacet` `0x7b90769acaFb6540D00C06c406ba01Ab58B3028C`
 
@@ -49,7 +45,7 @@ yakSwap(uint256 amountIn, uint256 amountOut, address[] path, address[] adapters)
 
 ---
 
-## 2. Swap debt / refinance (Assets tab → Swap Debt) — ⚠️ **BLOCKED upstream** via `swap-debt --from S --to S --amount N` — `SwapDebtFacet` `0x1e36f07aCaB2Ed9989f2364e27FeD7af92C0ff49`
+## 2. Swap debt / refinance (Assets tab → Swap Debt) — ✅ SHIPPED as `swap-debt --from S --to S --amount N` — `SwapDebtFacet` `0x1e36f07aCaB2Ed9989f2364e27FeD7af92C0ff49`
 
 ```
 swapDebtParaSwap(bytes32 _fromAsset, bytes32 _toAsset, uint256 _repayAmount, uint256 _borrowAmount, bytes4 selector, bytes data)
@@ -59,13 +55,11 @@ swapDebtParaSwap(bytes32 _fromAsset, bytes32 _toAsset, uint256 _repayAmount, uin
 - **Hard guard: max 5% USD-value difference** between repay value and borrow value (`maxDiff <= 500` bps), priced via RedStone. `paraSwapDecodedData.fromAmount` must equal `_borrowAmount` exactly.
 - Build: pick from/to symbols, set `_borrowAmount` so its USD value ≈ current debt USD value (within 5%), get ParaSwap calldata for `_toAsset`→`_fromAsset` swapping `_borrowAmount`, pass through.
 
-**Currently blocked.** `SwapDebtFacet` shares the ParaSwap allowlist with `ParaSwapFacet` (§1a). With that allowlist out of date relative to the live ParaSwap API surface, `swap-debt` is dead end-to-end. From v0.2.2 the tool refuses cleanly. **Manual fallback (3 separate txs):** `borrow --pool <new>` → `swap --via yak --from <new> --to <old>` → `repay --pool <old>`. Tracking: https://github.com/Mnemosyne-quest/primecli/issues/2
-
 ---
 
 ## 2b. Lender pool withdraw — ✅ SHIPPED as `withdraw` / `withdrawal-requests` / `execute-withdrawal-request` / `cancel-withdrawal-request`
 
-**There is no instant lender-side withdraw on DeltaPrime today.** The savings-pool's single-arg `withdraw(uint256)` does NOT resolve a named intent (reverts bare `0x`). The matured-intent executor is the two-arg `withdraw(uint256 amount, uint256[] intentIndices)` (selector `0x5915d806`) — the same intent-gated executor as the DegenPrime pool, NOT a re-call of the single-arg form. `instantWithdraw` / `executeWithdrawalIntent(uint256[])` are absent on the pool. The lender side applies the SAME 24h delayed-intent flow that the Prime Account collateral side uses (§3). Verified on the live wavax pool impl `0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E` (proxy `0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4`) 2026-06-02: both selectors exist in bytecode, but only the two-arg form reaches the intent lookup — `withdraw(amount,[0])` against no intent reverts `"Invalid intent index"` (0x08c379a0), while single-arg reverts bare `0x`. Same `IntentInfo` struct shape as `WithdrawalIntentFacet`.
+**There is no instant lender-side withdraw on DeltaPrime today.** The savings-pool's single-arg `withdraw(uint256)` does NOT resolve a named intent (it reverts with a bare `0x`). The matured-intent executor is the two-arg `withdraw(uint256 amount, uint256[] intentIndices)` (selector `0x5915d806`) — the same intent-gated executor as the DegenPrime pool, NOT a re-call of the single-arg form. `instantWithdraw` / `executeWithdrawalIntent(uint256[])` are absent on the pool. The lender side applies the SAME 24h delayed-intent flow that the Prime Account collateral side uses (§3). Verified on the live WAVAX pool impl `0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E` (proxy `0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4`) 2026-06-02: both selectors exist in bytecode, but only the two-arg form reaches the intent lookup — `withdraw(amount,[0])` against no intent reverts `"Invalid intent index"` (0x08c379a0), while single-arg `withdraw(amount)` reverts bare `0x`. Same `IntentInfo` struct shape as `WithdrawalIntentFacet`.
 
 ```
 createWithdrawalIntent(uint256 amount)                       // step 1: register intent
@@ -74,10 +68,10 @@ cancelWithdrawalIntent(uint256 index)                        // abort a pending 
 getUserIntents(address user) -> IntentInfo[]                 // list per-EOA intents
 getTotalIntentAmount(address user) -> uint256                // sum of pending amounts
 ```
-
 - Timing: `actionableAt = createdAt + 24h`, `expiresAt = actionableAt + 48h`. So a 24h time-lock then a **48h** execute window (24h-72h total). Note this differs from the DegenPrime pool (24h window), which re-anchors `expiresAt` to `block.timestamp`.
-- Storage is **per-EOA on the pool** (the wallet address that deposited), NOT per-Prime-Account. Same key shape across both chains.
-- All of these are **oracle-free** — no RedStone payload needed (compare §3 below, where only the create step is oracle-free).
+- Storage is **per-EOA on the pool** (the wallet address that deposited), NOT per-Prime-Account.
+- All of these are **oracle-free** — no RedStone payload needed (compare §3, where only the create step is oracle-free).
+- **Approve target:** none.
 - Build: `withdraw --pool X --amount Y` registers an intent. `execute-withdrawal-request --pool X` calls the pool's `withdraw(intent_amount, [index])` to pull the matured intent — one matured intent per call (`--index` to pick which when several are actionable); an eth_call simulation runs first and refuses to broadcast on revert. `withdrawal-requests` lists pending lender intents per pool. `cancel-withdrawal-request --pool X --index N` cancels a pending one.
 - Distinct from §3 (Prime Account collateral withdraw) — different contract (pool, not facet), different selector signatures, but identical user-facing 24h flow.
 
@@ -294,7 +288,7 @@ shouldLiquidatePrimeDebt() -> bool   // NON-view: MUTATES (snapshots debt). The 
 
 ---
 
-## RedStone wrapping — SHIPPED (`build_redstone_payload` in the `deltaprime` module)
+## RedStone wrapping — ✅ SHIPPED (`build_redstone_payload` in `deltaprime.py`)
 
 This was the gating hurdle; it is now implemented in the tool. Most solvency-gated writes in §1–§6 carry `remainsSolvent`, which calls `SolvencyFacetProdAvalanche` price math that reads RedStone signed prices from **calldata appended after the normal function args**. To broadcast these, the tx calldata must be `<normal abi-encoded call> ++ <RedStone payload>`. The tool replicates the RedStone EVM connector (`@redstone-finance/evm-connector`) wrapping in Python (`build_redstone_payload`): it fetches signed packages from the `redstone-avalanche-prod` gateway, picks 3 unique signers per feed, serialises them to the on-chain byte layout, and appends the payload (terminated by the 9-byte marker). The same wrapped payload also drives the RedStone-gated *read* views (`prime-summary` solvency, `gmx-positions`) via `redstone_view_call`. Reproduced here for reference:
 1. Fetch a signed price package from the RedStone data service used by DeltaPrime (data feed ids = the asset symbols; data service id and unique-signers-threshold are read from `SolvencyFacetProdAvalanche` — selectors `0x360398a3`/`0x7a70bcce`/`0xc3abc376`, the RedStone config getters).

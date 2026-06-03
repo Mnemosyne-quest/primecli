@@ -1,10 +1,10 @@
 # DeltaPrime Reference
 
-Canonical reference for the DeltaPrime protocol on Avalanche C-chain and the `deltaprime` CLI command that drives it. All addresses and behaviours verified on-chain on 23-05-2026 (chainId 43114).
+Canonical, framework-agnostic reference for the DeltaPrime protocol on Avalanche and the `deltaprime.py` tool that drives it. Single source of truth. All addresses and behaviours verified on-chain on 23-05-2026 (Avalanche C-chain, chainId 43114).
 
-**Audience:** anyone (human or agent) who needs to understand the protocol surface, the pool / facet addresses, and what each `deltaprime` subcommand does. Pair with [`deltaprime-capabilities.md`](deltaprime-capabilities.md) when you need the exact function signatures, calldata encoding, approve targets, and oracle / exec-fee requirements.
+The tool that operates this: `/root/.openclaw/workspace/scripts/deltaprime.py` (run with `/root/.openclaw/venv/bin/python3`).
 
-**What the tool covers today:** lending core (deposit / withdraw / borrow / repay / fund), Prime Account create+fund, swaps (YieldYak and ParaSwap / Velora), swap-debt, delayed collateral withdrawal, GMX V2 GM and GM+ LP, TraderJoe V2 LB, sJOE staking, PRIME leverage tiers, and a leveraged-long `zap` macro. The RedStone payload wrap is shipped, so every solvency-gated write can `--execute`. Wombat liquid-staking LP, legacy GLP, and Pangolin LP are documented in the capabilities spec but not yet tooled.
+**Companion doc:** `deltaprime-capabilities.md` — full per-capability build spec (swap, swap-debt, withdraw-collateral, GMX V2 LP, TraderJoe V2 LB, Wombat/sJOE/GLP staking, Pangolin LP, PRIME tiers, zaps) with exact function signatures, parameter encoding, approve targets, slippage/oracle/exec-fee requirements. This file (the reference) carries the high-level model, pools, facet map, and every command the tool ships. The tool now drives the full surface — lending core, swaps (YieldYak + ParaSwap), swap-debt, delayed collateral withdrawal, GMX V2 GM/GM+ LP, TraderJoe V2 LB, sJOE staking, PRIME leverage tiers, and a leveraged-long `zap` macro — with the RedStone payload wrap shipped, so solvency-gated writes can `--execute`. Wombat/GLP staking and Pangolin LP remain documented-but-untooled in the capabilities doc.
 
 ---
 
@@ -12,7 +12,7 @@ Canonical reference for the DeltaPrime protocol on Avalanche C-chain and the `de
 
 A lending and leverage protocol on Avalanche C-chain. Two layers:
 
-1. **Savings pools** — deposit an asset to earn lending yield. Regular wallets (EOAs) deposit directly against the pool contract; withdrawing now runs through a 24h delayed-intent flow (the pool's plain `withdraw(uint256)` reverts — see §7 and the `withdraw` command in §10).
+1. **Savings pools** — deposit an asset to earn lending yield. Regular wallets (EOAs) deposit directly against the pool contract; withdrawing now runs through a 24h delayed-intent flow (the pool's plain `withdraw(uint256)` reverts — see §7).
 2. **Prime Accounts** — per-user smart-contract accounts for leveraged borrowing. You create one, fund it with collateral, then borrow against that collateral. The Prime Account is what talks to the pools on the borrow side.
 
 You don't need a Prime Account to earn yield. You do need one to borrow.
@@ -55,7 +55,7 @@ Resolved from `TokenManager.getPoolAddress()` and verified by matching `totalSup
 | USDT | `USDT` | `0x1b6D7A6044fB68163D8E249Bce86F3eFbb12368e` | `0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7` | 6 |
 | EUROC | (listed in TokenManager) | `0x3144975FC0458eE0BF9BcF4B8226AFfE253E991F` | — | — |
 
-The `deltaprime` command wires up the first five (USDC, WAVAX, WETH, BTC, USDT). EUROC is registered in the TokenManager but not exposed as a tool pool key.
+The `deltaprime.py` tool wires up the first five (USDC, WAVAX, WETH, BTC, USDT). EUROC is registered in the TokenManager but not exposed as a tool pool key.
 
 ### LP / market reference addresses (for the extended capabilities)
 
@@ -100,7 +100,7 @@ These are the stale addresses from the old docs/repo. Their write paths revert; 
 
 ## 5. Prime Account facets
 
-Facet logic is reachable at any Prime Account address (the account delegates to the diamond beacon `0x2916B3bf7C35bd21e63D01C93C62FB0d4994e56D`). The diamond exposes **26 facets / ~170 selectors** — the lending core that the `deltaprime` command drives today uses only a handful. The full per-capability build spec is in `deltaprime-capabilities.md`; this section gives the facet map and the core lending facets the tool currently drives.
+Facet logic is reachable at any Prime Account address (the account delegates to the diamond beacon `0x2916B3bf7C35bd21e63D01C93C62FB0d4994e56D`). The diamond exposes **26 facets / ~170 selectors** — the lending core (`deltaprime.py` today) uses only a handful. The full per-capability build spec is in `deltaprime-capabilities.md`; this section gives the facet map and the core lending facets the tool currently drives.
 
 ### 5.1 Complete facet map (all 26, verified on-chain 23-05-2026 via DiamondLoupe `facets()`)
 
@@ -135,7 +135,7 @@ Facet logic is reachable at any Prime Account address (the account delegates to 
 
 `*` = RedStone-gated (reverts `0xe7764c9e` on a plain `eth_call`; needs signed price calldata appended — see gotcha 3 and the capabilities doc).
 
-### 5.2 Core lending facets (what the `deltaprime` command drives today)
+### 5.2 Core lending facets (what `deltaprime.py` drives today)
 
 **AssetsOperationsAvalancheFacet** `0x5a501B5698eAdE321B3553eA633046c6a91E3763` (state-changing):
 - `borrow(bytes32 asset, uint256 amount)`
@@ -177,7 +177,7 @@ These are the non-obvious bits. They are the reason naïve approaches fail.
 2. **bytes32 asset symbols.** Prime Account functions identify assets by their symbol string encoded as bytes32, right-padded with zero bytes. Use the symbol, not the wrapped-token name:
    - `AVAX` (not `WAVAX`), `USDC`, `ETH` (not `WETH`), `BTC`, `USDT`.
 
-3. **RedStone oracle gating (`0xe7764c9e`, "missing oracle payload").** Functions that compute USD value or check solvency (`getHealthMeter()`, `getAllAssetsBalances()`, and **every state-changing facet function carrying `remainsSolvent`**, which covers all of swap, swap-debt, GMX LP, TraderJoe LP, staking writes, and the execute step of withdraw-collateral) revert on a plain `eth_call` because they need RedStone signed price calldata appended. A real call wraps the tx calldata with the RedStone EVM connector (append the signed price payload bytes after the normal ABI-encoded args). The oracle-free views (`getBalance`, `getDebts`, `getAllOwnedAssets`, `getAvailableBalance`, `getOwnedTraderJoeV2Bins`, Wombat / sJOE balance views) work without it. The tool implements the RedStone wrapping (`build_redstone_payload` appends the signed price packages to the calldata tail), so `prime-summary` reports a real health ratio / total value / debt / solvent flag, and every solvency-gated write (swap, swap-debt, GMX LP, TraderJoe LP, sJOE stake / claim, execute-withdrawal) can `--execute`. It falls back to balances-only if the gateway is unreachable. See the "RedStone wrapping" section in `deltaprime-capabilities.md`.
+3. **RedStone oracle gating (`0xe7764c9e`, "missing oracle payload").** Functions that compute USD value or check solvency — `getHealthMeter()`, `getAllAssetsBalances()`, and **every state-changing facet function carrying `remainsSolvent` (so: all of swap, swap-debt, GMX LP, TraderJoe LP, staking writes, and the execute step of withdraw-collateral)** — revert on a plain `eth_call` because they need RedStone signed price calldata appended to the call. A real call requires wrapping the tx calldata with the RedStone EVM connector (append the signed price payload bytes after the normal ABI-encoded args). The oracle-free views (`getBalance`, `getDebts`, `getAllOwnedAssets`, `getAvailableBalance`, `getOwnedTraderJoeV2Bins`, Wombat/sJOE balance views) work fine without it. The tool now implements this RedStone wrapping (`build_redstone_payload` appends the signed price packages to the calldata tail), so `prime-summary` reports a real health ratio / total value / debt / solvent flag, and every solvency-gated write (swap, swap-debt, GMX LP, TraderJoe LP, sJOE stake/claim, execute-withdrawal) can `--execute`. It falls back to balances-only if the gateway is unreachable. See the "RedStone wrapping" section in `deltaprime-capabilities.md`.
 
 4. **Borrow needs setup.** `createLoan()` makes an EMPTY Prime Account. You must `fund()` it with collateral before `borrow()` will succeed. The EOA needs AVAX for gas. `createAndFundLoan()` does create + fund in one tx.
 
@@ -195,7 +195,7 @@ These are the non-obvious bits. They are the reason naïve approaches fail.
 
 `deposit(uint256)`, `withdraw(uint256,uint256[])` (intent-gated executor, selector `0x5915d806`), `createWithdrawalIntent(uint256)`, `cancelWithdrawalIntent(uint256)`, `totalSupply()`, `totalBorrowed()`, `balanceOf(address)`, `getBorrowed(address)`, `getFullPoolStatus()`, `lockDeposit(uint256, uint256)`. (The single-arg `withdraw(uint256)` exists but reverts bare `0x` — it does not resolve a named intent.)
 
-**Lender withdraw is 24h delayed-intent now.** Withdrawing from a savings pool runs through the same delayed-intent flow the Prime Account collateral side uses: `createWithdrawalIntent(uint256)` → wait 24h → consume the matured intent via the two-arg `withdraw(uint256 amount, uint256[] intentIndices)` (selector `0x5915d806`, the same intent-gated executor as the DegenPrime pool). The single-arg `withdraw(uint256)` does NOT resolve a named intent (reverts bare `0x`); `instantWithdraw` / `executeWithdrawalIntent(uint256[])` are absent on the pool. `cancelWithdrawalIntent(uint256 index)` aborts a pending one; all of these are oracle-free. The intent is stored per-EOA on the pool. The `withdraw` / `withdrawal-requests` / `execute-withdrawal-request` / `cancel-withdrawal-request` commands drive this flow (see §10 and capabilities §2b). Verified on the live WAVAX pool impl `0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E` (proxy `0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4`) 2026-06-02: both `withdraw(uint256)` and `withdraw(uint256,uint256[])` exist in bytecode, but only the two-arg form reaches the intent lookup — differential eth_call against no intent gives `"Invalid intent index"` (two-arg) vs bare `0x` (single-arg). Window: 24h time-lock then a **48h** execute window (24h-72h total).
+**Lender withdraw is 24h delayed-intent now.** Withdrawing from a savings pool runs through the same delayed-intent flow the Prime Account collateral side uses: `createWithdrawalIntent(uint256)` → wait 24h → consume the matured intent via the two-arg `withdraw(uint256 amount, uint256[] intentIndices)` (selector `0x5915d806`, the same intent-gated executor as the DegenPrime pool). The single-arg `withdraw(uint256)` does NOT resolve a named intent (reverts bare `0x`); `instantWithdraw` / `executeWithdrawalIntent(uint256[])` are absent on the pool. `cancelWithdrawalIntent(uint256 index)` aborts a pending one; all of these are oracle-free. The intent is stored per-EOA on the pool. The `withdraw` / `withdrawal-requests` / `execute-withdrawal-request` / `cancel-withdrawal-request` commands drive this flow. Verified on the live WAVAX pool impl `0x1b9BcAC5Ea697f9c3d32F87A98f7520f8Dc3B06E` (proxy `0xaa39f39802F8C44e48d4cc42E088C09EDF4daad4`) 2026-06-02: both `withdraw(uint256)` and `withdraw(uint256,uint256[])` exist in bytecode, but only the two-arg form reaches the intent lookup — differential eth_call against no intent gives `"Invalid intent index"` (two-arg) vs bare `0x` (single-arg). Window: 24h time-lock then a **48h** execute window (24h-72h total; `expiresAt = actionableAt + 48h`).
 
 ---
 
@@ -221,25 +221,35 @@ Early models overestimated two key costs. The corrected figures:
 | PRIME rent debt | 4.5% of debt | **0.5% of debt** | Protocol docs: `tieredPrimeDebtRatio = 0.5e18` (0.5 PRIME/$100/yr), NO leverage multiplier |
 | Combined carry | 11.5% | **~6%** | 5.5% borrow + 0.5% PRIME |
 
-The PRIME debt formula (from protocol docs): `accruedPrimeDebt = totalBorrowedValueUSD * 0.5 * timeElapsed / (100 * 365 days)`. That is 0.5 PRIME per $100 of total borrow, at any leverage tier.
+The PRIME debt formula (from protocol docs): `accruedPrimeDebt = totalBorrowedValueUSD * 0.5 * timeElapsed / (100 * 365 days)` — it is 0.5 PRIME per $100 of total borrow, at any leverage tier.
 
-## 10. The tool: `deltaprime`
+## 10. The tool: `deltaprime.py`
 
-- Installed by `pip install primecli`; entry point is the `deltaprime` console script.
-- Default RPC: `https://api.avax.network/ext/bc/C/rpc`. Override with `DELTAPRIME_RPC` (paid Alchemy/QuickNode/Infura recommended for heavy use).
-- Signing: only under `--execute`, with the key resolved per the precedence below. Real wallet, real funds.
+- Location: `/root/.openclaw/workspace/scripts/deltaprime.py`
+- Run with: `/root/.openclaw/venv/bin/python3 /root/.openclaw/workspace/scripts/deltaprime.py [--as <agent>] <command>`
+- RPC: public `https://api.avax.network/ext/bc/C/rpc`
+- Signing: only under `--execute`, with the **selected agent's** private key (see "Wallet selection" below). Real wallet, real funds.
 
-### Signing key resolution
+### Wallet selection (agent-agnostic)
 
-The Prime Account is derived on-chain from the wallet owner (`getLoanForOwner`), so each user automatically operates on their own Prime Account. No per-user addresses are hardcoded.
+The tool is agent-agnostic: any agent (Parakletos, Paraklaudios, or another of Bruno's) runs the **same** script with its **own** wallet. The Prime Account is derived on-chain from the wallet owner (`getLoanForOwner`), so each agent automatically operates on its own Prime Account — no per-agent addresses are hardcoded.
 
 Key resolution order (first hit wins):
 
-1. `--key <0xhex>` CLI flag → one-off raw key.
-2. `DELTAPRIME_PRIVATE_KEY` env var → raw `0x…` key (the primary path).
-3. `DELTAPRIME_KEY_FILE` env var → path to a file containing the `0x…` key.
+1. `--as <agent>` CLI flag → looks the agent up in the built-in `AGENTS` registry.
+2. `DELTAPRIME_PRIVATE_KEY` env var → a raw `0x…` key (universal escape hatch).
+3. `DELTAPRIME_ENV_FILE` + `DELTAPRIME_KEY_VAR` env vars → read that var from that env file.
+4. `DELTAPRIME_AGENT` env var → registry lookup.
+5. `DEFAULT_AGENT` (currently `parakletos`) → back-compat when nothing is set.
 
-The CLI key (#1) is read at startup; the env vars (#2/#3) are read lazily so read-only commands (`pool-info`, `my-positions`, `prime-summary`, `defi --json`, ...) work without a key configured. Every command prints the resolved `Wallet:` line on write paths, so the active wallet is always visible.
+Built-in `AGENTS` registry (in `deltaprime.py`):
+
+| agent | env file | key var |
+|-------|----------|---------|
+| `parakletos` | `/root/.openclaw/.env` | `PARAKLETOS_EVM_PRIVATE_KEY` |
+| `paraklaudios` | `/root/paraklaudios/.credentials.env` | `PARAKLAUDIOS_EVM_PRIVATE_KEY` |
+
+To add another of Bruno's wallets: add a row to `AGENTS`, or just export `DELTAPRIME_PRIVATE_KEY`. **Footgun:** with no selector the default is Parakletos — a non-Parakletos agent must pass `--as <agent>` (or set the env vars) or it will operate the wrong wallet. Every command prints the resolved `Wallet:` line, so the active wallet is always visible.
 
 ### Commands
 
@@ -249,12 +259,12 @@ The tool ships **32 commands**. State-changing commands default to a PREVIEW; ad
 
 | Command | Type | What it does |
 |---------|------|--------------|
-| `pool-info [usdc\|wavax\|weth\|btc\|usdt\|all] [--json]` | read-only | Pool supply / borrow / utilization / deposit APR / borrow APR / TVL. Defaults to `all`. With `--json`: emits a single JSON object for a named pool, or a `{name: {...}}` dict for `all` (same shape as `degenprime pool-info --json`). |
+| `pool-info [usdc\|wavax\|weth\|btc\|usdt\|all]` | read-only | Pool supply / borrow / utilization / TVL. Defaults to `all`. |
 | `my-positions` | read-only | Wallet balances + pool positions + Prime Account address. |
 | `deposit --pool X --amount Y [--execute]` | state-changing | Deposit into a savings pool. ERC20 approve handled automatically (approves the **pool**). |
 | `withdraw --pool X --amount Y [--execute]` | state-changing | **Step 1 of delayed lender withdraw (24h flow).** Registers a withdrawal intent on the pool via `createWithdrawalIntent(uint256)`. The single-arg `withdraw(uint256)` does not resolve a named intent (reverts bare `0x`) — the savings-pool side has the same time-locked intent flow as the Prime Account collateral side. 24h time-lock, then a **48h** execute window (24h-72h total). Oracle-free; no RedStone payload. |
 | `withdrawal-requests` | read-only | Lists pending **lender / pool-side** withdrawal intents (per pool, with ready/expired state) + current pool deposit. Oracle-free. Distinct from `withdrawal-intents` (which lists Prime Account **collateral** intents). |
-| `execute-withdrawal-request --pool X [--index N] [--execute]` | state-changing | Step 2 of lender pool withdraw: consumes a matured intent via the two-arg `withdraw(uint256 amount, uint256[] intentIndices)` (selector `0x5915d806`, same as the DegenPrime pool — not the single-arg form, which never resolves a named intent). One matured intent is consumed per call (`--index` to pick which when several are actionable); an eth_call simulation runs first and refuses to broadcast on revert. Oracle-free (no RedStone payload — the lender side does not gate on solvency). |
+| `execute-withdrawal-request --pool X [--index N] [--execute]` | state-changing | Step 2 of lender pool withdraw: consumes a matured intent via the two-arg `withdraw(uint256 amount, uint256[] intentIndices)` (selector `0x5915d806`, same as the DegenPrime pool — not the single-arg form, which never resolves a named intent). One matured intent is consumed per call (`--index` to pick which when several are actionable); an eth_call simulation runs first and refuses to broadcast on revert. Oracle-free; no RedStone payload. |
 | `cancel-withdrawal-request --pool X --index N [--execute]` | state-changing | Cancel a pending lender withdrawal intent via `cancelWithdrawalIntent(uint256)`. Useful before maturity to free the balance for another use. |
 | `borrow --pool X --amount Y [--execute]` | state-changing | Calls `borrow()` on the Prime Account. |
 | `repay --pool X --amount Y [--execute]` | state-changing | Calls `repay()` on the Prime Account. |
@@ -331,9 +341,9 @@ Every state-changing command **defaults to a PREVIEW** that prints what it would
 
 ### GMX deposits/withdrawals are async
 
-`gmx-deposit` / `gmx-withdraw` are payable and **asynchronous**: they pay a GMX execution fee as `msg.value`, queue the request on the GMX ExchangeRouter, and a GMX **keeper** executes it some blocks later via a callback. The position does not appear or disappear instantly, and the Prime Account is **frozen until the keeper callback fires**. The freeze is global per-account, not per-market (`DiamondStorageLib.freezeAccount` sets a single `SmartLoanStorage.frozenSince` timestamp; the keeper callback clears it).
+`gmx-deposit` / `gmx-withdraw` are payable and **asynchronous**: they pay a GMX execution fee as `msg.value`, queue the request on the GMX ExchangeRouter, and a GMX **keeper** executes it some blocks later via a callback. The position does not appear/disappear instantly, and the Prime Account is **frozen until the keeper callback fires** (the freeze is global per-account, not per-market — `DiamondStorageLib.freezeAccount` sets a single `SmartLoanStorage.frozenSince` timestamp; the keeper callback clears it).
 
-**On the freeze (not surfaced in the tool).** The freeze clears automatically when the GMX keeper callback fires, normally within minutes. The tool deliberately does not read or display the freeze flag: there is no external getter (`isAccountFrozen()` is `internal`, and reading the raw storage slot proved unreliable), and the manual `unfreezeAccount()` (`AssetsOperationsAvalancheFacet`, selector `0x7c5fc3fb`) is `onlyWhitelistedLiquidators`, so an owner EOA cannot call it and there is no self-recovery. Practical rule: after a `gmx-deposit` / `gmx-withdraw`, wait and re-check `gmx-positions`. The EOA also needs AVAX for its own tx gas on top of the execution fee.
+**On the freeze (not surfaced in the tool).** The freeze clears automatically when the GMX keeper callback fires, normally within minutes. The tool deliberately does not read or display the freeze flag: there is no external getter (`isAccountFrozen()` is `internal`, and reading the raw storage slot proved unreliable), and the manual `unfreezeAccount()` (`AssetsOperationsAvalancheFacet`, selector `0x7c5fc3fb`) is `onlyWhitelistedLiquidators` — an owner EOA cannot call it, so there is no self-recovery anyway. Practical rule: after a `gmx-deposit`/`gmx-withdraw`, wait and re-check `gmx-positions`. The EOA also needs AVAX for its own tx gas on top of the execution fee.
 
 ---
 
@@ -352,7 +362,7 @@ fund --pool X --amount Y --execute       # move collateral in
 borrow --pool X --amount Y --execute     # borrow against collateral
 # ... later ...
 repay  --pool X --amount Y --execute
-withdraw --pool X --amount Z --execute
+withdraw --pool X --amount Z --execute   # registers a 24h withdrawal intent; the pool's plain withdraw reverts now (§7)
 
 # Or collapse the first two steps (ERC20 collateral only):
 create-prime-account --fund-pool usdc --fund-amount 100 --execute
@@ -360,16 +370,25 @@ create-prime-account --fund-pool usdc --fund-amount 100 --execute
 
 ---
 
-## 12. Safety
+## 12. Current state (24-05-2026)
 
-- State-changing commands default to preview; `--execute` is required to broadcast.
-- **Never broadcast a real transaction (`--execute`) without understanding what the preview is about to do.** This is a real wallet with real funds.
-- The private key (env var or file) is never written anywhere by the tool. Treat its storage as a hard secret — never echo, log, or commit it.
-- Confirm the `Wallet:` line shown on write paths matches the wallet you intend before any `--execute`.
+- Parakletos's wallet (`0x0218f5b006FD43181018F584Ed4Be13c356b3428`): Prime Account `0x8c76ccFB9044B2497B06B514C414a997B6BF95Ea` (BASIC tier, no debt / staked PRIME / PRIME balance) holding **0.5 AVAX of collateral ready** but no open GMX (or other) position yet, no pool deposits.
+- Paraklaudios's wallet (`0x8282fb51649Ce5f474db3e274C47ed04C97b504B`): live Prime Account `0xdA0eA0755a3ef86f137323C495147f5f673a3CeE` holding a **GMX V2 AVAX/USDC GM position (~2.76 GM, ~$4.65)** opened from 0.5 AVAX of collateral (see §12), no pool deposits. (Paraklaudios runs its own copy of the tool from `/root/paraklaudios/`; from this OpenClaw tool, operate only Parakletos's wallet.)
+
+Parakletos's Prime Account is funded with 0.5 AVAX and ready — the §12 Open commands would open a GMX position. Run with the right `--as <agent>`. Neither wallet holds PRIME, so PREMIUM-tier activation would require acquiring PRIME first.
 
 ---
 
-## 13. GMX V2 position lifecycle (open / change / close)
+## 13. Safety
+
+- State-changing commands default to preview; `--execute` is required to broadcast.
+- **Never broadcast a real transaction (`--execute`) without Bruno's explicit, specific go-ahead for that transaction.** This is a real wallet with real funds.
+- The selected agent's private key (e.g. `PARAKLETOS_EVM_PRIVATE_KEY` in `/root/.openclaw/.env`, or `PARAKLAUDIOS_EVM_PRIVATE_KEY` in `/root/paraklaudios/.credentials.env`) must never be echoed, logged, or copied anywhere.
+- Confirm the `Wallet:` line matches the agent you intend before any `--execute` — the default selector is Parakletos.
+
+---
+
+## 14. GMX V2 position lifecycle (open / change / close)
 
 The worked, verified path for a GMX V2 LP position. Markets:
 
@@ -408,15 +427,13 @@ gmx-withdraw --market avax-usdc --amount <GM-amount> --execute
 
 `gmx-withdraw` burns `<GM-amount>` GM tokens back into the underlying assets in the account (for a two-sided GM market, both the volatile leg and USDC; for GM+, the single asset). Also async + keeper + execution fee. Size the withdraw against the live GM balance from `gmx-positions` — partial closes are fine; pass the full balance to close out entirely.
 
-### Worked example (verified end-to-end, 24-05-2026)
+### Worked example (real, 24-05-2026)
 
-A live walkthrough: funded 0.5 AVAX into a Prime Account, then `deltaprime gmx-deposit --market avax-usdc --amount 0.5 --side long --execute`; a GMX keeper minted **~2.76 GM (~$4.65)** a few blocks later, confirmed via `gmx-positions`. The first attempt reverted on gotcha (a) below before the fix; the retry succeeded once both fixes landed.
+The Paraklaudios agent ran this end-to-end on its own wallet: funded 0.5 AVAX into its Prime Account, then `gmx-deposit --market avax-usdc --amount 0.5 --side long --execute`; a GMX keeper minted **~2.76 GM (~$4.65)** a few blocks later, confirmed via `gmx-positions`. The very first attempt reverted on gotcha (a) below before the fix; the retry succeeded once both fixes landed. Parakletos's own Prime Account (`0x8c76ccFB9044B2497B06B514C414a997B6BF95Ea`) holds 0.5 AVAX ready but has not opened a GMX position yet — the same two commands would open one.
 
-### Two gotchas (were real bugs, fixed 24-05-2026 — here so the behaviour is understood)
+### Two gotchas (were real bugs, fixed 24-05-2026 in both tool copies — here so the behaviour is understood)
 
 (a) **The deposit must carry the FULL solvency RedStone payload.** Before minting, the facet runs an inline solvency check that prices **every** debt-registry asset — the whole pool set `AVAX, USDC, BTC, ETH, USDT, EUROC` — even ones with zero balance/debt, each needing 3 unique RedStone signers in the appended payload. The tool builds the write payload from `prime_account_price_feeds(account)` + the GM feed. If any required feed is missing, the deposit reverts with `InsufficientNumberOfUniqueSigners(0,3)` (wrapped in DeltaPrime's `ProxyCalldataFailedWithCustomError`). The read path (`gmx-positions`) does **not** hit this, because GM view calls skip the full solvency simulation — only the write triggers it.
-
----
 
 (b) **The execution fee needs a gas-price floor.** GMX keepers require a real execution fee (~0.08–0.19 AVAX), but Avalanche's live base fee can be ~0.01–0.02 gwei, which estimates a uselessly tiny fee the keeper would reject (the request would expire and refund without ever minting). The tool floors the gas price at **25 gwei** in the fee estimator so the `msg.value` clears GMX's requirement; GMX refunds the unused part to the account. The **EOA must hold the execution fee up front** (on top of the deposit amount and gas).
 
@@ -448,7 +465,7 @@ Keyed heuristics: **distance out** (just past edge → WAIT; far past / clearly 
 ### Impermanent loss & fees
 IL is the usual divergence loss (you sell the winner / buy the loser through your bins), but its **severity is set by shape + width**: narrow → fast, abrupt IL (price exits quickly, you're stuck one-sided); wide → slow, gentle. CURVE front-loads conversion at the center; SPOT converts ~linearly with price; BID-ASK back-loads to the edges (recoverable on reversion, punishing on a trend). **Hard truth:** a sustained trend in the volatile asset is *not* out-earnable by fees (a ~5%/day drop would need ~1825% APR to offset) — IL management = exiting/avoiding trends, not farming through them. Per-swap fee = **base fee** (`baseFactor×binStep`; AVAX/USDC = 0.05%) + **variable fee** (`∝ (volatilityAccumulator×binStep)²`, scales quadratically with volatility and decays in quiet periods). Fees are highest exactly during volatile, high-throughput periods — the engine behind **volatility farming** (bid-ask in choppy-but-reverting markets), which only nets positive if price reverts.
 
-> Condensed IF/THEN decision ruleset lives in a downstream skill ("TraderJoe V2 LB — strategy & autonomous decisions"). The CLI itself only ships the mechanical primitives; strategy lives with the operator.
+> Condensed IF/THEN decision ruleset lives in the deltaprime SKILL ("TraderJoe V2 LB — strategy & autonomous decisions").
 
 ## GMX V2 GM pools — strategy
 
@@ -469,4 +486,4 @@ Two-sided X/USDC: ~50% volatile + ~50% USDC backing, ~0.5× asset delta, earns s
 ### Regime logic & comparisons
 PROVIDE when Fee APR is high, utilization healthy (<~90%), OI skew balanced — or one-sided in a direction you expect to lose (counterparty edge) — and the price exposure suits your view. EXIT/AVOID on adverse skew (winning side against your view, Pool PnL APR negative), a strong move against the pool's net position, collapsing volume/Fee APR, turning bearish (esp. GM+), or maxed utilization. Pick the market on best live (Fee APR + non-negative Pool PnL APR), liquidity depth, and aligned/neutral skew; BTC/ETH are deeper and less idiosyncratic than AVAX. **GM vs holding**: GM adds fee yield + a trader-PnL bet on top of the asset; it beats HODL when traders net-lose and fees are strong, underperforms in strong trends where leveraged longs win. **GM vs TraderJoe LB**: GM has no swap-IL and is passive but takes a counterparty bet; LB is active bin management with divergence-loss IL. **DeltaPrime leverage**: borrowing USDC to scale a GM deposit = leveraged-long AVAX (a documented ~3x play), NOT neutral; for delta-neutral, borrow the volatile leg and `swap-debt` so debt composition matches the pool — keep account health well above liquidation.
 
-> Condensed IF/THEN ruleset lives with the operator. The CLI ships the mechanical primitives only; deciding *when* to use them is downstream.
+> Condensed IF/THEN ruleset is in the deltaprime SKILL ("GMX V2 GM pools — strategy & autonomous decisions"). Full decision ruleset + sources: data/gmx-strategy-research.md (working artifact, gitignored).
