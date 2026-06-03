@@ -193,7 +193,7 @@ Only depositPrime (inside prime-activate --amount) is solvency-gated -> RedStone
 prime-* write is onlyOwner and needs no payload. All prime-* views are oracle-free. Preview by default; --execute broadcasts.
 """
 
-import json, os, sys, time, re, base64
+import json, os, sys, time, re, base64, struct
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 import requests
@@ -373,35 +373,10 @@ _GMX_TOKENS = {
 # 29-asset set, so it is intentionally OMITTED.
 GMX_MARKETS = {
     # Two-sided GM markets (volatile leg + USDC). depositXUsdcGmxV2(bool isLongToken, ...).
-    "eth-usdc": {
-        "plus": False, "gm_token": "0x70d95587d40A2caf56bd97485aB3Eec10Bee6336",
-        "long": "ETH", "long_token": _GMX_TOKENS["ETH"], "short": "USDC", "gm_feed": "GM_ETH_WETH_USDC",
-        "deposit_fn": "depositEthUsdcGmxV2", "withdraw_fn": "withdrawEthUsdcGmxV2",
-    },
-    "btc-usdc": {
-        "plus": False, "gm_token": "0x47c031236e19d024b42f8AE6780E44A573170703",
-        "long": "BTC", "long_token": _GMX_TOKENS["BTC"], "short": "USDC", "gm_feed": "GM_BTC_WBTC_USDC",
-        "deposit_fn": "depositBtcUsdcGmxV2", "withdraw_fn": "withdrawBtcUsdcGmxV2",
-    },
     "arb-usdc": {
         "plus": False, "gm_token": "0xC25cEf6061Cf5dE5eb761b50E4743c1F5D7E5407",
         "long": "ARB", "long_token": _GMX_TOKENS["ARB"], "short": "USDC", "gm_feed": "GM_ARB_ARB_USDC",
         "deposit_fn": "depositArbUsdcGmxV2", "withdraw_fn": "withdrawArbUsdcGmxV2",
-    },
-    "link-usdc": {
-        "plus": False, "gm_token": "0x7f1fa204bb700853D36994DA19F830b6Ad18455C",
-        "long": "LINK", "long_token": _GMX_TOKENS["LINK"], "short": "USDC", "gm_feed": "GM_LINK_LINK_USDC",
-        "deposit_fn": "depositLinkUsdcGmxV2", "withdraw_fn": "withdrawLinkUsdcGmxV2",
-    },
-    "uni-usdc": {
-        "plus": False, "gm_token": "0xc7Abb2C5f3BF3CEB389dF0Eecd6120D451170B50",
-        "long": "UNI", "long_token": _GMX_TOKENS["UNI"], "short": "USDC", "gm_feed": "GM_UNI_UNI_USDC",
-        "deposit_fn": "depositUniUsdcGmxV2", "withdraw_fn": "withdrawUniUsdcGmxV2",
-    },
-    "gmx-usdc": {
-        "plus": False, "gm_token": "0x55391D178Ce46e7AC8eaAEa50A72D1A5a8A622Da",
-        "long": "GMX", "long_token": _GMX_TOKENS["GMX"], "short": "USDC", "gm_feed": "GM_GMX_GMX_USDC",
-        "deposit_fn": "depositGmxUsdcGmxV2", "withdraw_fn": "withdrawGmxUsdcGmxV2",
     },
     # Synthetic markets: index token is the synthetic, but the long leg DEPOSITS WETH
     # (facet: isLongToken ? WETH : USDC). Price the long leg off the synthetic's RedStone feed.
@@ -411,18 +386,6 @@ GMX_MARKETS = {
         "synthetic": True,
         "deposit_fn": "depositNearUsdcGmxV2", "withdraw_fn": "withdrawNearUsdcGmxV2",
     },
-    "atom-usdc": {
-        "plus": False, "gm_token": "0x248C35760068cE009a13076D573ed3497A47bCD4",
-        "long": "ATOM", "long_token": _GMX_WETH, "short": "USDC", "gm_feed": "GM_ATOM_WETH_USDC",
-        "synthetic": True,
-        "deposit_fn": "depositAtomUsdcGmxV2", "withdraw_fn": "withdrawAtomUsdcGmxV2",
-    },
-    "sui-usdc": {
-        "plus": False, "gm_token": "0x6Ecf2133E2C9751cAAdCb6958b9654baE198a797",
-        "long": "SUI", "long_token": _GMX_WETH, "short": "USDC", "gm_feed": "GM_SUI_WETH_USDC",
-        "synthetic": True,
-        "deposit_fn": "depositSuiUsdcGmxV2", "withdraw_fn": "withdrawSuiUsdcGmxV2",
-    },
     "sei-usdc": {
         "plus": False, "gm_token": "0xB489711B1cB86afDA48924730084e23310EB4883",
         "long": "SEI", "long_token": _GMX_WETH, "short": "USDC", "gm_feed": "GM_SEI_WETH_USDC",
@@ -431,16 +394,6 @@ GMX_MARKETS = {
     },
     # Single-sided GM+ markets (one asset, no USDC short leg). depositXGmxV2Plus(...).
     # long == short underlying; the facet splits a deposit 50/50 across both legs.
-    "eth+": {
-        "plus": True, "gm_token": "0x450bb6774Dd8a756274E0ab4107953259d2ac541",
-        "long": "ETH", "long_token": _GMX_TOKENS["ETH"], "short": "ETH", "gm_feed": "GM_ETH_WETH",
-        "deposit_fn": "depositEthGmxV2Plus", "withdraw_fn": "withdrawEthGmxV2Plus",
-    },
-    "btc+": {
-        "plus": True, "gm_token": "0x7C11F78Ce78768518D743E81Fdfa2F860C6b9A77",
-        "long": "BTC", "long_token": _GMX_TOKENS["BTC"], "short": "BTC", "gm_feed": "GM_BTC_WBTC",
-        "deposit_fn": "depositBtcGmxV2Plus", "withdraw_fn": "withdrawBtcGmxV2Plus",
-    },
     "gmx+": {
         "plus": True, "gm_token": "0xbD48149673724f9cAeE647bb4e9D9dDaF896Efeb",
         "long": "GMX", "long_token": _GMX_TOKENS["GMX"], "short": "GMX", "gm_feed": "GM_GMX_GMX",
@@ -535,15 +488,7 @@ _T_WEETH  = {"addr": "0x35751007a407ca6FEFfE80b3cB397736D2cf4dbe", "symbol": "we
 TJ_LB_PAIRS = {
     "eth-usdc":    {"pair": "0x69f1216cB2905bf0852f74624D5Fa7b5FC4dA710", "router": TJ_ROUTER_V21, "binStep": 15, "tokenX": _T_WETH,   "tokenY": _T_USDC},
     "eth-usdc-10": {"pair": "0xb7236B927e03542AC3bE0A054F2bEa8868AF9508", "router": TJ_ROUTER_V22, "binStep": 10, "tokenX": _T_WETH,   "tokenY": _T_USDC},
-    "eth-usdt":    {"pair": "0xd387c40a72703B38A5181573724bcaF2Ce6038a5", "router": TJ_ROUTER_V21, "binStep": 15, "tokenX": _T_WETH,   "tokenY": _T_USDT},
-    "eth-usdt-10": {"pair": "0x055f2cF6da90F14598D35C1184ED535C908dE737", "router": TJ_ROUTER_V22, "binStep": 10, "tokenX": _T_WETH,   "tokenY": _T_USDT},
-    "arb-eth":     {"pair": "0x0Be4aC7dA6cd4bAD60d96FbC6d091e1098aFA358", "router": TJ_ROUTER_V21, "binStep": 10, "tokenX": _T_ARB,    "tokenY": _T_WETH},
-    "arb-eth-v22": {"pair": "0xC09F4ad33a164e29DF3c94719ffD5F7B5B057781", "router": TJ_ROUTER_V22, "binStep": 10, "tokenX": _T_ARB,    "tokenY": _T_WETH},
-    "btc-eth":     {"pair": "0xcfA09B20c85933B197e8901226ad0D6dACa7f114", "router": TJ_ROUTER_V21, "binStep": 10, "tokenX": _T_WBTC,   "tokenY": _T_WETH},
-    "gmx-eth":     {"pair": "0x60563686ca7b668e4a2d7D31448e5F10456ecaF8", "router": TJ_ROUTER_V21, "binStep": 20, "tokenX": _T_GMX,    "tokenY": _T_WETH},
-    "joe-eth":     {"pair": "0x4b9bfeD1dD4E6780454b2B02213788f31FfBA74a", "router": TJ_ROUTER_V21, "binStep": 20, "tokenX": _T_JOE,    "tokenY": _T_WETH},
-    "wsteth-eth":  {"pair": "0x71bc33F539f83b99674D71AcFeb2ce0373376512", "router": TJ_ROUTER_V22, "binStep": 5,  "tokenX": _T_WSTETH, "tokenY": _T_WETH},
-    "weeth-eth":   {"pair": "0x2088eB5E23F24458e241430eF155d4EC05BBc9e8", "router": TJ_ROUTER_V22, "binStep": 5,  "tokenX": _T_WEETH,  "tokenY": _T_WETH},
+    "eth-usdt":    {"pair": "0xd387c40a72703B38A5181573724bcaF2Ce6038a5", "router": TJ_ROUTER_V21, "binStep": 15, "tokenX": _T_WETH,   "tokenY": _T_USDC},
 }
 
 # LB pair (ILBPair) reads used for previews + position views. getActiveId is the current
@@ -703,13 +648,25 @@ def get_w3():
     return _W3
 
 def _tx_gas_price(w3) -> int:
-    """Gas price for broadcasts: 2x the current network price with a 0.01 gwei floor.
-    Arbitrum's base fee is tiny (~0.01 gwei), so a 1 gwei floor (Avalanche-level) would
-    be ~100x over market. 0.01 gwei still gives generous headroom for inclusion / replacing
-    a stranded same-nonce tx. NOTE: this is the tx gasPrice; the GMX keeper execution-fee
-    floor (25 gwei) is a separate calc, kept as-is."""
+    """Estimated per-gas cost for balance checks (gas buffer pre-flights). Returns 2x the
+    current base fee with a 0.01 gwei floor. NOTE: _tx_gas_price is NOT used for tx building;
+    use _set_gas_price() for that (it handles chain-specific EIP-1559 vs legacy gas pricing).
+    The GMX keeper execution-fee floor is 1 gwei (see _estimate_gmx_execution_fee)."""
     return max(int(w3.eth.gas_price * 2), 10**7)
 
+def _set_gas_price(w3, tx_dict):
+    """Set appropriate gas price fields for the chain, replacing the legacy gasPrice approach.
+    On EIP-1559 chains (Arbitrum, Base): sets maxFeePerGas + maxPriorityFeePerGas with a 2x
+    base-fee hedge (base + prio + 1 gwei buffer). On Avalanche (legacy): sets gasPrice at
+    2x base fee with a 25 gwei floor, matching the old _tx_gas_price semantics for this chain."""
+    tx_dict.pop("gasPrice", None)
+    if CHAIN_ID in (42161, 8453):  # Arbitrum, Base — EIP-1559
+        base = w3.eth.gas_price
+        prio = w3.eth.max_priority_fee
+        tx_dict["maxFeePerGas"] = max(int(base * 2), base + prio + 10**9)
+        tx_dict["maxPriorityFeePerGas"] = prio
+    else:  # Avalanche (43114) — legacy gasPrice
+        tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 25 * 10**9)
 def _read_env_var(path, var):
     """Return the value of `var` from a KEY=VALUE env file, or None if absent."""
     try:
@@ -1434,8 +1391,9 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
         # 500k clears it cleanly.
         tx = contract.functions.depositNativeToken().build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 500000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID, "value": amount_wei,
+            "gas": 500000, "chainId": CHAIN_ID, "value": amount_wei,
         })
+        _set_gas_price(w3, tx)
         signed = acct.sign_transaction(tx)
     else:
         # Approve
@@ -1444,16 +1402,18 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
         _dep_nonce = w3.eth.get_transaction_count(acct.address)
         app_tx = token.functions.approve(Web3.to_checksum_address(cfg["proxy"]), amount_wei).build_transaction({
             "from": acct.address, "nonce": _dep_nonce,
-            "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 100000, "chainId": CHAIN_ID,
         })
+        _set_gas_price(w3, app_tx)
         signed_app = acct.sign_transaction(app_tx)
         w3.eth.send_raw_transaction(signed_app.raw_transaction)
 
         # Deposit — nonce N+1 because approve (N) is in-flight
         dep_tx = contract.functions.deposit(amount_wei).build_transaction({
             "from": acct.address, "nonce": _dep_nonce + 1,
-            "gas": 200000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 400000, "chainId": CHAIN_ID,
         })
+        _set_gas_price(w3, dep_tx)
         signed = acct.sign_transaction(dep_tx)
 
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -1498,8 +1458,9 @@ def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
 
     tx = contract.functions.createWithdrawalIntent(amount_wei).build_transaction({
         "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 400000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 400000, "chainId": CHAIN_ID,
     })
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -1622,9 +1583,10 @@ def cmd_execute_withdrawal_request(pool_name: str, index: int = None, execute: b
     tx = {
         "from": acct.address, "to": contract.address,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 600000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 600000, "chainId": CHAIN_ID,
         "data": data,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -1661,8 +1623,9 @@ def cmd_cancel_withdrawal_request(pool_name: str, index: int, execute: bool = Fa
 
     tx = contract.functions.cancelWithdrawalIntent(index).build_transaction({
         "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 300000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 300000, "chainId": CHAIN_ID,
     })
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -1728,21 +1691,23 @@ def cmd_create_prime_account(execute: bool = False, fund_pool: str = None, fund_
         _cf_nonce = w3.eth.get_transaction_count(acct.address)
         app_tx = token.functions.approve(factory_cs, amount_wei).build_transaction({
             "from": acct.address, "nonce": _cf_nonce,
-            "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 100000, "chainId": CHAIN_ID,
         })
+        _set_gas_price(w3, app_tx)
         signed_app = acct.sign_transaction(app_tx)
         w3.eth.send_raw_transaction(signed_app.raw_transaction)
 
         # createAndFundLoan — nonce N+1 because approve (N) is in-flight
         tx = factory.functions.createAndFundLoan(asset_b32(symbol), amount_wei).build_transaction({
             "from": acct.address, "nonce": _cf_nonce + 1,
-            "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 4000000, "chainId": CHAIN_ID,
         })
     else:
         tx = factory.functions.createLoan().build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 4000000, "chainId": CHAIN_ID,
         })
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -1799,16 +1764,18 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
     if cfg["native"]:
         tx = account.functions.depositNativeToken().build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID, "value": amount_wei,
+            "gas": 3000000, "chainId": CHAIN_ID, "value": amount_wei,
         })
+        _set_gas_price(w3, tx)
         signed = acct.sign_transaction(tx)
     else:
         token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]),
                                 abi=json.loads('[{"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}]'))
         app_tx = token.functions.approve(pa_cs, amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 100000, "chainId": CHAIN_ID,
         })
+        _set_gas_price(w3, app_tx)
         signed_app = acct.sign_transaction(app_tx)
         w3.eth.send_raw_transaction(signed_app.raw_transaction)
 
@@ -1817,8 +1784,9 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
         _fund_nonce = w3.eth.get_transaction_count(acct.address) + 1
         fund_tx = account.functions.fund(asset_b32(symbol), amount_wei).build_transaction({
             "from": acct.address, "nonce": _fund_nonce,
-            "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 3000000, "chainId": CHAIN_ID,
         })
+        _set_gas_price(w3, fund_tx)
         signed = acct.sign_transaction(fund_tx)
 
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -2032,8 +2000,9 @@ def cmd_borrow(pool_name: str, amount: float, execute: bool = False):
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 4000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -2103,8 +2072,9 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 4000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -2276,8 +2246,9 @@ def _swap_via_paraswap(w3, acct, pa_cs, account, from_sym, to_sym, from_cfg, to_
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 3000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -2384,8 +2355,9 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 3000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -2570,8 +2542,9 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         tx = {
             "from": acct.address, "to": pa_cs, "data": base_borrow + exec_payload.hex(),
             "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 4000000, "chainId": CHAIN_ID,
         }
+        _set_gas_price(w3, tx)
         signed = acct.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -2612,8 +2585,9 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         tx2 = {
             "from": acct.address, "to": pa_cs, "data": base_swap + swap_payload2.hex(),
             "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 3000000, "chainId": CHAIN_ID,
         }
+        _set_gas_price(w3, tx2)
         signed2 = acct.sign_transaction(tx2)
         tx_hash2 = w3.eth.send_raw_transaction(signed2.raw_transaction)
         receipt2 = w3.eth.wait_for_transaction_receipt(tx_hash2, timeout=180)
@@ -2649,8 +2623,9 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         tx3 = {
             "from": acct.address, "to": pa_cs, "data": base_reply + repay_payload3.hex(),
             "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 4000000, "chainId": CHAIN_ID,
         }
+        _set_gas_price(w3, tx3)
         signed3 = acct.sign_transaction(tx3)
         tx_hash3 = w3.eth.send_raw_transaction(signed3.raw_transaction)
         receipt3 = w3.eth.wait_for_transaction_receipt(tx_hash3, timeout=180)
@@ -2727,8 +2702,9 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 4000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -2795,8 +2771,9 @@ def cmd_withdraw_collateral(pool_name: str, amount: float, execute: bool = False
 
     tx = account.functions.createWithdrawalIntent(asset_b32(symbol), amount_wei).build_transaction({
         "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 1000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 1000000, "chainId": CHAIN_ID,
     })
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -2842,8 +2819,9 @@ def cmd_cancel_withdrawal(pool_name: str, index: int, execute: bool = False):
 
     tx = account.functions.cancelWithdrawalIntent(asset_b32(symbol), index).build_transaction({
         "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 500000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 500000, "chainId": CHAIN_ID,
     })
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
@@ -2962,8 +2940,9 @@ def cmd_execute_withdrawal(pool_name: str, index: int = None, execute: bool = Fa
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 3000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -3003,13 +2982,12 @@ def _estimate_gmx_execution_fee(w3, is_deposit: bool, buffer_mult: float = 2.0):
     oracle_count = 2
     estimate = base_gas + GMX_CALLBACK_GAS_LIMIT
     adjusted = base_amount + per_oracle * oracle_count + estimate * mult_factor // 10**30
-    # Floor the gas price (logic unchanged from Avalanche — the brief keeps this as-is). The
-    # floor guarantees executionFee clears the keeper's adjustedGasLimit*tx.gasprice requirement
-    # at execution time even if the live (very low) gas price ticks up before the keeper runs.
-    # On Arbitrum this over-reserves vs the tiny real fee, but GMX REFUNDS any excess to the
-    # account, so it is fail-SAFE (over, never under). NOTE: an over-reservation can block a
-    # deposit on a thin EOA ETH balance — lower --fee-buffer if that bites.
-    gas_price = max(w3.eth.gas_price, 25 * 10**9)
+    # Floor the gas price at 1 gwei as a safety buffer against keeper gas-price spikes.
+    # GMX REFUNDS any excess to the receiver (the Prime Account), so over-reserving is safe
+    # but under-reserving stalls the deposit. 1 gwei is ~50× current Arbitrum gas (0.02 gwei)
+    # and keeps the upfront requirement low (~$10-20 vs the old 25 gwei floor which needed ~$250).
+    # NOTE: an over-reservation still blocks if the EOA's balance is thin — lower --fee-buffer.
+    gas_price = max(w3.eth.gas_price, 1 * 10**9)
     fee_wei = int(adjusted * gas_price * buffer_mult)
     return fee_wei, {"adjusted_gas": adjusted, "gas_price": gas_price, "buffer_mult": buffer_mult}
 
@@ -3315,12 +3293,14 @@ def cmd_gmx_deposit(market: str, amount: float, is_long: bool | None = None,
         print("Run with --execute to broadcast (appends a fresh RedStone price payload).")
         return
 
-    # Pre-check: EOA must hold the execution fee + gas buffer (~0.01 ETH).
+    # Pre-check: EOA must hold the execution fee + tx gas (~0.0004 ETH floor).
     eoa_balance = w3.eth.get_balance(acct.address)
-    min_needed = exec_fee + int(0.01 * 1e18)
+    tx_gas_cost = int(5_000_000 * _tx_gas_price(w3))
+    gas_buf = max(tx_gas_cost, int(0.0004 * 1e18))
+    min_needed = exec_fee + gas_buf
     if eoa_balance < min_needed:
         print(f"✗ EOA balance {eoa_balance / 1e18:.6f} ETH is below the minimum needed "
-              f"({min_needed / 1e18:.6f} ETH: {exec_fee / 1e18:.6f} exec fee + ~0.01 gas).")
+              f"({min_needed / 1e18:.6f} ETH: {exec_fee / 1e18:.6f} exec fee + {gas_buf / 1e18:.6f} tx gas).")
         print("  Transfer more ETH to the EOA before retrying.")
         return
 
@@ -3332,8 +3312,9 @@ def cmd_gmx_deposit(market: str, amount: float, is_long: bool | None = None,
     tx = {
         "from": acct.address, "to": pa_cs, "data": data, "value": exec_fee,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 5000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 5000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -3449,12 +3430,14 @@ def cmd_gmx_withdraw(market: str, amount: float, slippage_pct: float = 1.0,
         print("Run with --execute to broadcast (appends a fresh RedStone price payload).")
         return
 
-    # Pre-check: EOA must hold the execution fee + gas buffer (~0.01 ETH).
+    # Pre-check: EOA must hold the execution fee + tx gas (~0.0004 ETH floor).
     eoa_balance = w3.eth.get_balance(acct.address)
-    min_needed = exec_fee + int(0.01 * 1e18)
+    tx_gas_cost = int(5_000_000 * _tx_gas_price(w3))
+    gas_buf = max(tx_gas_cost, int(0.0004 * 1e18))
+    min_needed = exec_fee + gas_buf
     if eoa_balance < min_needed:
         print(f"✗ EOA balance {eoa_balance / 1e18:.6f} ETH is below the minimum needed "
-              f"({min_needed / 1e18:.6f} ETH: {exec_fee / 1e18:.6f} exec fee + ~0.01 gas).")
+              f"({min_needed / 1e18:.6f} ETH: {exec_fee / 1e18:.6f} exec fee + {gas_buf / 1e18:.6f} tx gas).")
         print("  Transfer more ETH to the EOA before retrying.")
         return
 
@@ -3463,8 +3446,9 @@ def cmd_gmx_withdraw(market: str, amount: float, slippage_pct: float = 1.0,
     tx = {
         "from": acct.address, "to": pa_cs, "data": data, "value": exec_fee,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 5000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 5000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -3669,10 +3653,12 @@ def cmd_glv_deposit(vault_key: str, amount: float, is_long: bool | None = None,
         return
 
     eoa_balance = w3.eth.get_balance(acct.address)
-    min_needed = exec_fee + int(0.01 * 1e18)
+    tx_gas_cost = int(5_000_000 * _tx_gas_price(w3))
+    gas_buf = max(tx_gas_cost, int(0.0004 * 1e18))
+    min_needed = exec_fee + gas_buf
     if eoa_balance < min_needed:
         print(f"✗ EOA balance {eoa_balance / 1e18:.6f} ETH is below the minimum needed "
-              f"({min_needed / 1e18:.6f} ETH: {exec_fee / 1e18:.6f} exec fee + ~0.01 gas).")
+              f"({min_needed / 1e18:.6f} ETH: {exec_fee / 1e18:.6f} exec fee + {gas_buf / 1e18:.6f} tx gas).")
         print("  Transfer more ETH to the EOA before retrying.")
         return
 
@@ -3686,8 +3672,9 @@ def cmd_glv_deposit(vault_key: str, amount: float, is_long: bool | None = None,
     tx = {
         "from": acct.address, "to": pa_cs, "data": data, "value": exec_fee,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 5000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 5000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -3787,10 +3774,12 @@ def cmd_glv_withdraw(vault_key: str, amount: float, target_market: str = None,
         return
 
     eoa_balance = w3.eth.get_balance(acct.address)
-    min_needed = exec_fee + int(0.01 * 1e18)
+    tx_gas_cost = int(5_000_000 * _tx_gas_price(w3))
+    gas_buf = max(tx_gas_cost, int(0.0004 * 1e18))
+    min_needed = exec_fee + gas_buf
     if eoa_balance < min_needed:
         print(f"✗ EOA balance {eoa_balance / 1e18:.6f} ETH is below the minimum needed "
-              f"({min_needed / 1e18:.6f} ETH: {exec_fee / 1e18:.6f} exec fee + ~0.01 gas).")
+              f"({min_needed / 1e18:.6f} ETH: {exec_fee / 1e18:.6f} exec fee + {gas_buf / 1e18:.6f} tx gas).")
         print("  Transfer more ETH to the EOA before retrying.")
         return
 
@@ -3804,8 +3793,9 @@ def cmd_glv_withdraw(vault_key: str, amount: float, target_market: str = None,
     tx = {
         "from": acct.address, "to": pa_cs, "data": data, "value": exec_fee,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 5000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 5000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -4154,8 +4144,9 @@ def cmd_lb_add(pair_key: str, amount_x: float, amount_y: float, shape: str = "sp
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": gas, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": gas, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -4251,8 +4242,9 @@ def cmd_lb_remove(pair_key: str, slippage_pct: float = 1.0, execute: bool = Fals
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 5000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 5000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -4444,15 +4436,17 @@ def cmd_prime_activate(amount: float = None, execute: bool = False):
         nonce = w3.eth.get_transaction_count(acct.address)
         app_tx = prime.functions.approve(pa_cs, deposit_wei).build_transaction({
             "from": acct.address, "nonce": nonce,
-            "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 100000, "chainId": CHAIN_ID,
         })
+        _set_gas_price(w3, app_tx)
         w3.eth.send_raw_transaction(acct.sign_transaction(app_tx).raw_transaction)
         data = account.encode_abi("depositPrime", args=[deposit_wei]) + payload.hex()
         dep_tx = {
             "from": acct.address, "to": pa_cs, "data": data,
             "nonce": nonce + 1,
-            "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 3000000, "chainId": CHAIN_ID,
         }
+        _set_gas_price(w3, dep_tx)
         dep_hash = w3.eth.send_raw_transaction(acct.sign_transaction(dep_tx).raw_transaction)
         dep_ok = w3.eth.wait_for_transaction_receipt(dep_hash, timeout=180)["status"] == 1
         print(f"{'✓' if dep_ok else '✗'} depositPrime {'confirmed' if dep_ok else 'failed'}")
@@ -4469,8 +4463,9 @@ def cmd_prime_activate(amount: float = None, execute: bool = False):
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 3000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     tx_hash = w3.eth.send_raw_transaction(acct.sign_transaction(tx).raw_transaction)
     ok = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)["status"] == 1
     print(f"{'✓' if ok else '✗'} PREMIUM tier {'activated' if ok else 'activation failed'}")
@@ -4519,15 +4514,17 @@ def cmd_prime_deposit(amount: float, execute: bool = False):
     nonce = w3.eth.get_transaction_count(acct.address)
     app_tx = prime.functions.approve(pa_cs, deposit_wei).build_transaction({
         "from": acct.address, "nonce": nonce,
-        "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 100000, "chainId": CHAIN_ID,
     })
+    _set_gas_price(w3, app_tx)
     w3.eth.send_raw_transaction(acct.sign_transaction(app_tx).raw_transaction)
     data = account.encode_abi("depositPrime", args=[deposit_wei]) + payload.hex()
     dep_tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": nonce + 1,
-        "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 3000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, dep_tx)
     dep_hash = w3.eth.send_raw_transaction(acct.sign_transaction(dep_tx).raw_transaction)
     dep_ok = w3.eth.wait_for_transaction_receipt(dep_hash, timeout=180)["status"] == 1
     print(f"{'✓' if dep_ok else '✗'} depositPrime {'confirmed' if dep_ok else 'failed'}")
@@ -4578,8 +4575,9 @@ def cmd_prime_deactivate(withdraw: bool = False, execute: bool = False):
     tx = {
         "from": acct.address, "to": account.address, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 3000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     tx_hash = w3.eth.send_raw_transaction(acct.sign_transaction(tx).raw_transaction)
     ok = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)["status"] == 1
     print(f"{'✓' if ok else '✗'} PREMIUM tier {'deactivated' if ok else 'deactivation failed'}")
@@ -4626,8 +4624,9 @@ def cmd_prime_unstake(amount: float, execute: bool = False):
     tx = {
         "from": acct.address, "to": account.address, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 3000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     tx_hash = w3.eth.send_raw_transaction(acct.sign_transaction(tx).raw_transaction)
     ok = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)["status"] == 1
     print(f"{'✓' if ok else '✗'} PRIME unstake {'confirmed' if ok else 'failed'}")
@@ -4675,8 +4674,9 @@ def cmd_prime_repay(amount: float, execute: bool = False):
     tx = {
         "from": acct.address, "to": pa_cs, "data": base_calldata + payload.hex(),
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 3000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     tx_hash = w3.eth.send_raw_transaction(acct.sign_transaction(tx).raw_transaction)
     ok = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)["status"] == 1
     print(f"{'✓' if ok else '✗'} PRIME debt repay {'confirmed' if ok else 'failed'}")
@@ -5101,6 +5101,154 @@ def cmd_defi(as_json: bool = True):
                 "status": "error", "error": f"{type(e).__name__}: {e}"}
     print(json.dumps(_trim_defi_json(data), indent=2))
 
+# ─── PRIME Cross-Chain Bridge (Avalanche ↔ Arbitrum via LayerZero OFT) ─────────
+
+BRIDGE_CHAIN = {
+    "avax": {"rpc": "https://api.avax.network/ext/bc/C/rpc", "chain_id": 43114,
+             "lz_chain_id": 106, "lz_endpoint": "0x3c2269811836af69497E5F486A85D7316753cf62",
+             "prime_token": "0x33C8036E99082B0C395374832FECF70c42C7F298",
+             "bridge_target": "0x35643752F4ea0ba70456F0CA1e2778f783206a20",
+             "explorer": "https://snowtrace.io/tx", "native": "AVAX"},
+    "arb": {"rpc": ARBITRUM_RPC, "chain_id": 42161,
+            "lz_chain_id": 110, "lz_endpoint": "0x3c2269811836af69497E5F486A85D7316753cf62",
+            "prime_token": "0x3De81CE90f5A27C5E6A5aDb04b54ABA488a6d14E",
+            "bridge_target": "0x3De81CE90f5A27C5E6A5aDb04b54ABA488a6d14E",  # PRIME OFT itself
+            "explorer": "https://arbiscan.io/tx", "native": "ETH"},
+}
+
+BRIDGE_ADAPTER_PARAMS = struct.pack('>H', 1) + struct.pack('>I', 200000).rjust(32, b'\x00')  # v1 + 200k gas
+
+def _bridge_w3(chain_key: str):
+    """Get a w3 for the bridge source chain. Avalanche needs POA middleware."""
+    cfg = BRIDGE_CHAIN[chain_key]
+    w3 = Web3(Web3.HTTPProvider(cfg["rpc"]))
+    if chain_key == "avax":
+        from web3.middleware import ExtraDataToPOAMiddleware
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    return w3
+
+def _bridge_estimate_lz_fee(w3, src_cfg: dict, dst_lz_chain_id: int, amount_wei: int):
+    """Query LZ endpoint for the cross-chain message fee."""
+    ep = w3.eth.contract(address=Web3.to_checksum_address(src_cfg["lz_endpoint"]),
+        abi=json.loads(json.dumps([{
+            "inputs": [{"name": "_dstChainId", "type": "uint16"},
+                       {"name": "_userApplication", "type": "address"},
+                       {"name": "_payload", "type": "bytes"},
+                       {"name": "_payInZRO", "type": "bool"},
+                       {"name": "_adapterParams", "type": "bytes"}],
+            "name": "estimateFees",
+            "outputs": [{"name": "", "type": "uint256"}, {"name": "", "type": "uint256"}],
+            "stateMutability": "view", "type": "function"}])))
+    native, zro = ep.functions.estimateFees(
+        dst_lz_chain_id, Web3.to_checksum_address(src_cfg["bridge_target"]),
+        _bridge_lz_payload(acct.address if 'acct' in dir() else get_account().address, amount_wei),
+        False, BRIDGE_ADAPTER_PARAMS).call()
+    return native, zro
+
+def _bridge_lz_payload(to_addr: str, amount_wei: int) -> bytes:
+    """OFT payload: bytes32(toAddress) + uint256(amount)."""
+    return bytes.fromhex(Web3.to_checksum_address(to_addr)[2:].rjust(64, "0")) + \
+           amount_wei.to_bytes(32, 'big')
+
+def cmd_prime_bridge(from_chain: str = "avax", amount: float = None, execute: bool = False):
+    """Bridge PRIME between Avalanche and Arbitrum via LayerZero OFT.
+    from_chain='avax' bridges Avalanche→Arbitrum (default in arbprime);
+    from_chain='arb' bridges Arbitrum→Avalanche."""
+    if amount is None:
+        print("Usage: arbprime prime-bridge --from avax|arb --amount N [--execute]")
+        return
+    src_key = from_chain.lower()
+    if src_key not in BRIDGE_CHAIN:
+        print(f"Unknown source chain '{from_chain}'. Use 'avax' or 'arb'.")
+        return
+    dst_key = "arb" if src_key == "avax" else "avax"
+    src_cfg = BRIDGE_CHAIN[src_key]
+    dst_cfg = BRIDGE_CHAIN[dst_key]
+    amount_wei = int(amount * 10**18)
+
+    w3 = _bridge_w3(src_key)
+    acct = get_account()
+    wallet = Web3.to_checksum_address(acct.address)
+
+    print(f"\nPRIME Bridge: {src_key} → {dst_key}")
+    print(f"  Amount:    {amount} PRIME")
+    print(f"  Source:    {src_cfg['prime_token'][:12]}... (LZ {src_cfg['lz_chain_id']})")
+    print(f"  Contract:  {src_cfg['bridge_target'][:12]}...")
+    print(f"  Dest:      {dst_cfg['prime_token'][:12]}... (LZ {dst_cfg['lz_chain_id']})")
+
+    # Check balance
+    erc20 = w3.eth.contract(address=Web3.to_checksum_address(src_cfg["prime_token"]),
+        abi=json.loads(json.dumps([{"constant": True, "inputs": [{"name": "_owner", "type": "address"}],
+            "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}])))
+    bal = erc20.functions.balanceOf(wallet).call()
+    print(f"  Balance:   {bal / 1e18:.2f} PRIME")
+
+    # Estimate LZ fee
+    try:
+        native_fee, _ = _bridge_estimate_lz_fee(w3, src_cfg, dst_cfg["lz_chain_id"], amount_wei)
+        print(f"  LZ fee:    {w3.from_wei(native_fee, 'ether')} {src_cfg['native']}")
+    except Exception as e:
+        print(f"  LZ fee:    estimation failed ({e}) — proceeding anyway")
+        native_fee = 0
+
+    if not execute:
+        print(f"\n  Steps:")
+        print(f"    1. approve bridge target ({src_cfg['bridge_target'][:12]}...) for {amount} PRIME")
+        print(f"    2. sendFrom(…) via LZ to chain {dst_cfg['lz_chain_id']}")
+        print(f"  Run with --execute to broadcast")
+        return
+
+    if bal < amount_wei:
+        print(f"  ✗ NOT ENOUGH PRIME! Have {bal/1e18:.2f}, need {amount}")
+        return
+
+    bridge_target = Web3.to_checksum_address(src_cfg["bridge_target"])
+
+    # 1. Approve
+    allow_c = w3.eth.contract(address=Web3.to_checksum_address(src_cfg["prime_token"]),
+        abi=json.loads(json.dumps([{"constant": True, "inputs": [
+            {"name": "_owner", "type": "address"}, {"name": "_spender", "type": "address"}],
+            "name": "allowance", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}])))
+    current_allowance = allow_c.functions.allowance(wallet, bridge_target).call()
+    if current_allowance < amount_wei:
+        print(f"  Approving {amount} PRIME for bridge...")
+        app_c = w3.eth.contract(address=Web3.to_checksum_address(src_cfg["prime_token"]),
+            abi=json.loads(json.dumps([{"constant": False, "inputs": [
+                {"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}],
+                "name": "approve", "outputs": [{"name": "", "type": "bool"}], "type": "function"}])))
+        atx = app_c.functions.approve(bridge_target, amount_wei).build_transaction(
+            {"from": wallet, "nonce": w3.eth.get_transaction_count(wallet),
+             "gas": 100000, "chainId": src_cfg["chain_id"]})
+        _set_gas_price(w3, atx)
+        signed = acct.sign_transaction(atx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        _ = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        time.sleep(2)
+    else:
+        print(f"  Allowance: {current_allowance / 1e18:.2f} PRIME")
+
+    # 2. sendFrom
+    refund = wallet
+    zero = "0x0000000000000000000000000000000000000000"
+    sendfrom_selector = "695ef6bf"  # sendFrom(address,uint16,bytes32,uint256,(address,address,bytes))
+    call_params = (refund, zero, BRIDGE_ADAPTER_PARAMS)
+    calldata_hex = sendfrom_selector + abi_encode(
+        ["address", "uint16", "bytes32", "uint256", "(address,address,bytes)"],
+        [wallet, dst_cfg["lz_chain_id"],
+         bytes.fromhex(wallet.lower()[2:].rjust(64, "0")), amount_wei, call_params]).hex()
+
+    print(f"  sendFrom() via LayerZero (LZ {src_cfg['lz_chain_id']} → {dst_cfg['lz_chain_id']})...")
+    tx = {"from": wallet, "to": bridge_target, "data": bytes.fromhex(calldata_hex),
+          "nonce": w3.eth.get_transaction_count(wallet), "gas": 500000,
+          "value": native_fee, "chainId": src_cfg["chain_id"]}
+    _set_gas_price(w3, tx)
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+    ok = receipt["status"] == 1
+    print(f"{'✓' if ok else '✗'} Bridge {'submitted' if ok else 'failed'}")
+    print(f"  Tx: {src_cfg['explorer']}/{tx_hash.hex()}")
+
 def main():
     args = sys.argv[1:] if len(sys.argv) > 1 else []
     # Global wallet selector: --as <agent>, stripped before command dispatch.
@@ -5455,6 +5603,14 @@ def main():
             return
         cmd_zap(market, collateral, collateral_amount, borrow_amount, deposit_amount,
                 side, swap_to_long, slippage, fee_buffer, execute)
+    elif cmd == "prime-bridge":
+        from_chain = "avax"
+        amount = None
+        execute = "--execute" in args
+        for i, a in enumerate(args):
+            if a == "--from" and i + 1 < len(args): from_chain = args[i + 1]
+            if a == "--amount" and i + 1 < len(args): amount = float(args[i + 1])
+        cmd_prime_bridge(from_chain, amount, execute)
     elif cmd == "health":
         os.environ.setdefault("PRIMECLI_TOOL", sys.argv[0])
         health_monitor.cli()
@@ -5463,3 +5619,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -227,12 +227,24 @@ def get_w3():
     return _W3
 
 def _tx_gas_price(w3) -> int:
-    """Gas price for broadcasts: 2x the current network price with a 0.01 gwei floor.
-    Base's base fee is ~0.001 gwei; a 1 gwei floor (Avalanche-level)
-    was 100x over market and priced out gas-heavy ops like create-account on
-    small ETH balances. 0.01 gwei still gives 10x headroom."""
+    """Estimated per-gas cost for balance checks (gas buffer pre-flights). Returns 2x the
+    current base fee with a 0.01 gwei floor. NOTE: _tx_gas_price is NOT used for tx building;
+    use _set_gas_price() for that (EIP-1559 on Base, with maxFeePerGas + maxPriorityFeePerGas)."""
     return max(int(w3.eth.gas_price * 2), 10**7)
 
+def _set_gas_price(w3, tx_dict):
+    """Set appropriate gas price fields for the chain, replacing the legacy gasPrice approach.
+    On EIP-1559 chains (Arbitrum, Base): sets maxFeePerGas + maxPriorityFeePerGas with a 2x
+    base-fee hedge (base + prio + 1 gwei buffer). On Avalanche (legacy): sets gasPrice at
+    2x base fee with a 25 gwei floor, matching the old _tx_gas_price semantics for this chain."""
+    tx_dict.pop("gasPrice", None)
+    if CHAIN_ID in (42161, 8453):  # Arbitrum, Base — EIP-1559
+        base = w3.eth.gas_price
+        prio = w3.eth.max_priority_fee
+        tx_dict["maxFeePerGas"] = max(int(base * 2), base + prio + 10**9)
+        tx_dict["maxPriorityFeePerGas"] = prio
+    else:  # Avalanche (43114) — legacy gasPrice
+        tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 25 * 10**9)
 def resolve_private_key():
     """Resolve the signing key per the documented precedence:
        1. --key <0xhex> CLI flag
@@ -929,15 +941,17 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
         # ETH -> WETH internally). Same pattern as DeltaPrime's wavax pool.
         tx = contract.functions.deposit(amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 600000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID, "value": amount_wei,
+            "gas": 600000, "chainId": CHAIN_ID, "value": amount_wei,
         })
+        _set_gas_price(w3, tx)
         signed = acct.sign_transaction(tx)
     else:
         token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]), abi=ERC20_ABI)
         app_tx = token.functions.approve(Web3.to_checksum_address(cfg["proxy"]), amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 100000, "chainId": CHAIN_ID,
         })
+        _set_gas_price(w3, app_tx)
         signed_app = acct.sign_transaction(app_tx)
         # Wait for approve to be mined before building the deposit tx (nonce race fix)
         app_hash = w3.eth.send_raw_transaction(signed_app.raw_transaction)
@@ -945,8 +959,9 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
 
         dep_tx = contract.functions.deposit(amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 600000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 600000, "chainId": CHAIN_ID,
         })
+        _set_gas_price(w3, dep_tx)
         signed = acct.sign_transaction(dep_tx)
 
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -987,11 +1002,12 @@ def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
         "to": contract.address,
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 600000,
-        "gasPrice": _tx_gas_price(w3),
+        
         "chainId": CHAIN_ID,
         "data": "0x" + Web3.keccak(text="createWithdrawalIntent(uint256)")[:4].hex() +
                 amount_wei.to_bytes(32, "big").hex(),
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -1083,10 +1099,11 @@ def cmd_execute_pool_withdrawal(pool_name: str, index: int, execute: bool = Fals
         "to": contract.address,
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 600000,
-        "gasPrice": _tx_gas_price(w3),
+        
         "chainId": CHAIN_ID,
         "data": data,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -1149,8 +1166,9 @@ def cmd_create_account(execute: bool = False, fund_pool: str = None, fund_amount
         token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]), abi=ERC20_ABI)
         app_tx = token.functions.approve(factory_cs, amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 100000, "chainId": CHAIN_ID,
         })
+        _set_gas_price(w3, app_tx)
         signed_app = acct.sign_transaction(app_tx)
         # Wait for approve to be mined before calling createAndFundLoan (nonce race fix)
         app_hash = w3.eth.send_raw_transaction(signed_app.raw_transaction)
@@ -1158,13 +1176,14 @@ def cmd_create_account(execute: bool = False, fund_pool: str = None, fund_amount
 
         tx = factory.functions.createAndFundLoan(asset_b32(symbol), amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 4000000, "chainId": CHAIN_ID,
         })
     else:
         tx = factory.functions.createLoan().build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 4000000, "chainId": CHAIN_ID,
         })
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -1222,15 +1241,17 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
     if cfg["native"]:
         tx = account.functions.depositNativeToken().build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID, "value": amount_wei,
+            "gas": 3000000, "chainId": CHAIN_ID, "value": amount_wei,
         })
+        _set_gas_price(w3, tx)
         signed = acct.sign_transaction(tx)
     else:
         token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]), abi=ERC20_ABI)
         app_tx = token.functions.approve(pa_cs, amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 100000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 100000, "chainId": CHAIN_ID,
         })
+        _set_gas_price(w3, app_tx)
         signed_app = acct.sign_transaction(app_tx)
         # Wait for approve to be mined before building the fund tx (nonce race fix)
         app_hash = w3.eth.send_raw_transaction(signed_app.raw_transaction)
@@ -1238,8 +1259,9 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
 
         fund_tx = account.functions.fund(asset_b32(symbol), amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+            "gas": 3000000, "chainId": CHAIN_ID,
         })
+        _set_gas_price(w3, fund_tx)
         signed = acct.sign_transaction(fund_tx)
 
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -1513,8 +1535,9 @@ def cmd_borrow(pool_name: str, amount: float, execute: bool = False):
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 4000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -1591,8 +1614,9 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 4000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -1791,8 +1815,9 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 3000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -1930,8 +1955,9 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 4000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 4000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -1998,8 +2024,9 @@ def cmd_withdraw_collateral(pool_name: str, amount: float, execute: bool = False
 
     tx = account.functions.createWithdrawalIntent(asset_b32(symbol), amount_wei).build_transaction({
         "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 1000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 1000000, "chainId": CHAIN_ID,
     })
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -2116,8 +2143,9 @@ def cmd_execute_withdrawal(pool_name: str, index: int = None, execute: bool = Fa
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 3000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 3000000, "chainId": CHAIN_ID,
     }
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -2163,8 +2191,9 @@ def cmd_cancel_withdrawal(pool_name: str, index: int, execute: bool = False):
 
     tx = account.functions.cancelWithdrawalIntent(asset_b32(symbol), index).build_transaction({
         "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 1000000, "gasPrice": _tx_gas_price(w3), "chainId": CHAIN_ID,
+        "gas": 1000000, "chainId": CHAIN_ID,
     })
+    _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
@@ -2396,3 +2425,4 @@ def _dispatch():
 
 if __name__ == "__main__":
     main()
+
