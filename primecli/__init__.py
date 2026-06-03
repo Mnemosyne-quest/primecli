@@ -1,4 +1,4 @@
-"""primecli - command-line tools for DeltaPrime (Avalanche) and DegenPrime (Base)."""
+"""primecli - command-line tools for DeltaPrime (Avalanche + Arbitrum) and DegenPrime (Base)."""
 
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 

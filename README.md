@@ -119,6 +119,23 @@ Pools (v1): `usdc`, `weth`, `cbbtc`, `aero`, `brett`, `kaito`, `cbdoge`, `cbxrp`
 
 Full per-command reference: [docs/degenprime-reference.md](docs/degenprime-reference.md). Per-capability build spec: [docs/degenprime-capabilities.md](docs/degenprime-capabilities.md).
 
+### `arbprime` (Arbitrum One)
+
+| Group | Commands |
+|-------|----------|
+| Lending core | `pool-info [--json]`, `my-positions`, `deposit`, `withdraw` (24h delayed lender flow, step 1), `withdrawal-requests`, `execute-withdrawal-request --pool X [--index N]`, `cancel-withdrawal-request --pool X --index N`, `borrow`, `repay`, `fund` |
+| Prime Account | `create-prime-account` (alias `create-account`), `prime-summary`, `defi --json`, `withdraw-collateral`, `withdrawal-intents`, `execute-withdrawal`, `cancel-withdrawal` |
+| Swaps | `swap --from S --to S --amount N [--via yak\|paraswap] [--slippage P]`, `swap-debt --from S --to S --amount N [--slippage P]` |
+| GMX V2 LP (async, keeper-executed) | `gmx-positions`, `gmx-deposit --market M --amount N [--side auto\|long\|short]`, `gmx-withdraw --market M --amount N` |
+| GMX GLV vaults (async, keeper-executed) | `glv-positions`, `glv-deposit --vault V --amount N [--side auto\|long\|short] [--target-market GM]`, `glv-withdraw --vault V --amount N [--target-market GM]` |
+| TraderJoe V2 LB | stubbed in v1 — pair whitelist pending on-chain verification (`lb-*` commands error cleanly) |
+| PRIME leverage tiers | `prime-tier`, `prime-needed --borrow X [--tier premium\|basic]`, `prime-deposit --amount N`, `prime-activate [--amount N]`, `prime-deactivate [--withdraw]`, `prime-unstake --amount N`, `prime-repay --amount N` |
+| Zaps (multi-tx macro) | `zap --market M --collateral P --collateral-amount N --borrow-amount N [--deposit-amount N] [--side auto\|long\|short] [--swap]` |
+
+Pools: `usdc`, `eth`, `arb`, `btc` (native-wrapped asset is WETH, account symbol `ETH`). GM markets (two-sided, all vs USDC): `eth-usdc`, `btc-usdc`, `arb-usdc`, `link-usdc`, `uni-usdc`, `gmx-usdc`, `near-usdc`, `atom-usdc`, `sui-usdc`, `sei-usdc`; single-sided GM+: `eth+`, `btc+`, `gmx+`. GLV vaults: `weth-usdc`, `btc-usdc`. Beyond the 4 lendable pools, the live TokenManager registers 29 collateral symbols (GMX, LINK, UNI, weETH, wstETH, JOE, PRIME, the GM/GLV baskets, …) usable as collateral and for `swap` / `swap-debt`.
+
+Note: DeltaPrime has TWO deployments on Arbitrum; `arbprime` targets the live one used by app.deltaprime.io (factory `0xFf5e…c20`, TokenManager `0x0a0D…E255`), with every address verified on-chain against the live SmartLoanDiamondBeacon. The stale artifact deployment (factory `0x97f4…E4E`) only carries ETH+USDC pools — don't use addresses from the repo's `deployments/arbitrum/*TUP.json` artifacts.
+
 ## Configuration
 
 | Env var | Default | Purpose |
@@ -129,6 +146,9 @@ Full per-command reference: [docs/degenprime-reference.md](docs/degenprime-refer
 | `DEGENPRIME_PRIVATE_KEY` | falls back to `DELTAPRIME_PRIVATE_KEY` | Your Base signing key. Same EVM key works on both chains. |
 | `DEGENPRIME_KEY_FILE` | falls back to `DELTAPRIME_KEY_FILE` | Path to key file for Base. |
 | `DEGENPRIME_RPC` | `https://base.publicnode.com` | Base RPC. |
+| `ARBPRIME_PRIVATE_KEY` | falls back to `DELTAPRIME_PRIVATE_KEY` | Your Arbitrum signing key. Same EVM key works on all three chains. |
+| `ARBPRIME_AGENT` | falls back to `DELTAPRIME_AGENT` | Named-agent key selection (multi-wallet setups). |
+| `ARBPRIME_RPC` | `https://arb1.arbitrum.io/rpc` | Arbitrum One RPC. |
 
 The CLI also accepts a per-command `--key <0xhex>` override that takes precedence over all env vars. Handy for one-off operations from a shell where you don't want to persist the key.
 
@@ -167,6 +187,23 @@ A copy-paste template is at [examples/env.example](examples/env.example).
 | Aerodrome positions | read-only (tokenId inventory) |
 | Aerodrome write paths (claim, decrease, add, stake) | deferred to v2 |
 | `$DgP` staking | not deployed on-chain yet |
+
+### `arbprime` (Arbitrum One)
+
+| Area | Status |
+|------|--------|
+| Savings pools (USDC, ETH, ARB, BTC) | full read + write |
+| Prime Account creation and funding | full |
+| Borrow / repay / fund / withdraw-collateral | full (24h+48h intent flow, same as Avalanche) |
+| Solvency views (health ratio, total value, debt, solvent flag) | full (RedStone-gated reads, `redstone-primary-prod`) |
+| Swap (YieldYak + ParaSwap v6) | full (Arbitrum Yak router) |
+| Swap-debt (debt refinancing) | full |
+| GMX V2 LP (GM ×10 + GM+ ×3 markets) | full (async, account freezes until keeper callback) |
+| GMX GLV vaults (×2, Arbitrum-only) | full (deposit / withdraw / positions, `targetMarket` routing) |
+| TraderJoe V2 LB | stubbed (facet live; pair whitelist pending verification) |
+| PRIME leverage tiers (BASIC / PREMIUM) | full (PRIME-WETH LP pair, not PRIME-WAVAX) |
+| Leveraged-long zap macro | full (GM-terminal) |
+| Penpie / Beefy / Sushi facets | not yet (live on-chain; deferred by scope) |
 
 ## Documentation
 

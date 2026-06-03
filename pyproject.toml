@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "primecli"
-version = "0.2.7"
-description = "Agent-friendly CLI tools for the DeltaPrime (Avalanche) and DegenPrime (Base) lending and leverage protocols. Preview-by-default; no Etherscan key required."
+version = "0.3.0"
+description = "Agent-friendly CLI tools for the DeltaPrime (Avalanche + Arbitrum) and DegenPrime (Base) lending and leverage protocols. Preview-by-default; no Etherscan key required."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Mnemosyne-quest contributors"}]
-keywords = ["defi", "deltaprime", "degenprime", "avalanche", "base", "lending", "leverage", "ethereum", "web3", "agent", "cli"]
+keywords = ["defi", "deltaprime", "degenprime", "arbprime", "avalanche", "base", "arbitrum", "lending", "leverage", "ethereum", "web3", "agent", "cli"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -41,6 +41,7 @@ Documentation = "https://github.com/Mnemosyne-quest/primecli/tree/main/docs"
 [project.scripts]
 deltaprime = "primecli.deltaprime:main"
 degenprime = "primecli.degenprime:main"
+arbprime = "primecli.arbprime:main"
 
 [tool.setuptools.packages.find]
 include = ["primecli*"]
