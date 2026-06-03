@@ -211,6 +211,25 @@ from eth_abi import encode as abi_encode, decode as abi_decode
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
+# Health monitoring sub-system
+# Try both package import (installed) and local import (standalone script)
+_hm = None
+for _mod in ('primecli.health_monitor', 'health_monitor'):
+    try:
+        _hm = __import__(_mod, fromlist=['cli'])
+        break
+    except ImportError:
+        continue
+if _hm is None:
+    # Last resort: find health_monitor.py next to this script
+    import importlib.util
+    _hm_path = Path(__file__).parent / 'health_monitor.py'
+    if _hm_path.exists():
+        _spec = importlib.util.spec_from_file_location('health_monitor', _hm_path)
+        _hm = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_hm)
+health_monitor = _hm
+
 AVALANCHE_RPC = "https://api.avax.network/ext/bc/C/rpc"
 EXPLORER = "https://snowtrace.io"
 CHAIN_ID = 43114
@@ -5169,6 +5188,9 @@ def main():
             return
         cmd_zap(market, collateral, collateral_amount, borrow_amount, deposit_amount,
                 side, swap_to_long, slippage, fee_buffer, execute)
+    elif cmd == "health":
+        os.environ.setdefault("PRIMECLI_TOOL", sys.argv[0])
+        health_monitor.cli()
     else:
         print(f"Unknown command: {cmd}\n{__doc__}")
 

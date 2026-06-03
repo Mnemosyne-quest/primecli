@@ -86,6 +86,23 @@ from eth_keys import keys as eth_keys
 from eth_abi import decode as abi_decode
 from web3 import Web3
 
+# Health monitoring sub-system
+_hm = None
+for _mod in ('primecli.health_monitor', 'health_monitor'):
+    try:
+        _hm = __import__(_mod, fromlist=['cli'])
+        break
+    except ImportError:
+        continue
+if _hm is None:
+    import importlib
+    _hm_path = Path(__file__).parent / 'health_monitor.py'
+    if _hm_path.exists():
+        _spec = importlib.util.spec_from_file_location('health_monitor', _hm_path)
+        _hm = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_hm)
+health_monitor = _hm
+
 # Default Base RPC. mainnet.base.org rate-limits hard (429 within a few calls); the
 # publicnode endpoint is fronted by a load balancer with much higher anonymous limits
 # and has been the most reliable free option for this tool's traffic pattern (lots of
@@ -2368,6 +2385,12 @@ def _dispatch():
         cmd_execute_pool_withdrawal(pool, index, execute)
     elif cmd == "aerodrome-positions":
         cmd_aerodrome_positions()
+    elif cmd == "health":
+        os.environ.setdefault("PRIMECLI_TOOL", sys.argv[0])
+        if health_monitor:
+            health_monitor.cli()
+        else:
+            print("health_monitor module not available")
     else:
         print(f"Unknown command: {cmd}\n{__doc__}")
 
