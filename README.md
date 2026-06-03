@@ -222,6 +222,36 @@ If your failure is not on this list and the on-chain revert reason is opaque, ca
 - Per-version release notes: <https://github.com/Mnemosyne-quest/primecli/releases>.
 - The `main` branch may be ahead of the latest tagged release; install from git if you need the bleeding edge.
 
+## Health Math (0-100% Scale)
+
+The protocol's health meter runs from 0% (liquidation) to 100% (no debt).
+The tool reports `health_ratio` from the SolvencyFacet (1.0 = liquidation line),
+but the frontend-friendly 0-100% scale is computed as:
+
+```
+equity = total_supplied_usd - total_debt_usd
+max_debt = equity * (tier - 1)    # PREMIUM=10, BASIC=5
+health_pct = (max_debt - debt) / max_debt * 100
+```
+
+Key insight: **LP tokens (GMX, LB, Aerodrome CL) don't count as full-rate
+collateral.** Using gross `supplied_usd` as the borrowing base inflates `max_debt`
+and overstates health. The formula above uses `equity` only, which matches the
+protocol's cross-margin calculation within ~3pp.
+
+### Rebalancing
+
+Auto-rebalance within a configurable range (e.g. 30-70%) by borrowing more
+(deploy into existing position) or repaying debt. A 1h cooldown prevents
+frequent toggling. Below 20% the cooldown is bypassed and the agent is escalated.
+
+### Stop Loss (Equity Drawdown)
+
+Track a baseline equity (recorded at position open) and trigger a full close
+if equity drops X% below that baseline. Withdraw from the position, swap to
+USDC, repay all debt. See `examples/health-monitoring/` for a reference
+implementation.
+
 ## Contributing
 
 PRs welcome. Open an issue first if you are planning anything non-trivial (new facet support, new chain, write paths for Aerodrome). Pinning ABIs and verifying on-chain shapes takes a real probe pass, and it is worth aligning before doing the work.
