@@ -134,6 +134,8 @@ Full per-command reference: [docs/degenprime-reference.md](docs/degenprime-refer
 
 Pools: `usdc`, `eth`, `arb`, `btc` (native-wrapped asset is WETH, account symbol `ETH`). GM markets (two-sided, all vs USDC): `eth-usdc`, `btc-usdc`, `arb-usdc`, `link-usdc`, `uni-usdc`, `gmx-usdc`, `near-usdc`, `atom-usdc`, `sui-usdc`, `sei-usdc`; single-sided GM+: `eth+`, `btc+`, `gmx+`. GLV vaults: `weth-usdc`, `btc-usdc`. LB pairs: `eth-usdc`, `eth-usdc-10`, `eth-usdt`, `eth-usdt-10`, `arb-eth`, `arb-eth-v22`, `btc-eth`, `gmx-eth`, `joe-eth`, `wsteth-eth`, `weeth-eth`. Beyond the 4 lendable pools, the live TokenManager registers 29 collateral symbols (GMX, LINK, UNI, weETH, wstETH, JOE, PRIME, the GM/GLV baskets, …) usable as collateral and for `swap` / `swap-debt`.
 
+Full per-command + address reference: [docs/arbprime-reference.md](docs/arbprime-reference.md).
+
 Note: DeltaPrime has TWO deployments on Arbitrum; `arbprime` targets the live one used by app.deltaprime.io (factory `0xFf5e…c20`, TokenManager `0x0a0D…E255`), with every address verified on-chain against the live SmartLoanDiamondBeacon. The stale artifact deployment (factory `0x97f4…E4E`) only carries ETH+USDC pools — don't use addresses from the repo's `deployments/arbitrum/*TUP.json` artifacts.
 
 ## Configuration
