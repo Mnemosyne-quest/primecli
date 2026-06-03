@@ -1,12 +1,12 @@
 # primecli
 
-> Command-line tools for the **DeltaPrime** (Avalanche C-chain) and **DegenPrime** (Base) lending and leverage protocols.
+> Command-line tools for the **DeltaPrime** (Avalanche C-chain + Arbitrum One) and **DegenPrime** (Base) lending and leverage protocols.
 
 [![PyPI](https://img.shields.io/pypi/v/primecli.svg)](https://pypi.org/project/primecli/)
 [![Python](https://img.shields.io/pypi/pyversions/primecli.svg)](https://pypi.org/project/primecli/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-`primecli` installs two console commands, `deltaprime` and `degenprime`, that drive the lending and leverage protocols built by the DeltaPrimeLabs team on Avalanche C-chain and Base respectively. Both share a per-user smart-account architecture (EIP-2535 diamond) and are operated through the same CLI shape: savings pools, per-user Prime / Degen Accounts, borrow / repay / fund, swaps, debt refinancing, delayed collateral withdrawals. The Avalanche side additionally exposes GMX V2 LP (GM and GM+), TraderJoe V2 LB, sJOE staking, PRIME leverage tiers, and a leveraged-long zap macro. The Base side ships a read-only Aerodrome position inventory; write paths are deferred to v2.
+`primecli` installs three console commands, `deltaprime`, `degenprime`, and `arbprime`, that drive the lending and leverage protocols built by the DeltaPrimeLabs team on Avalanche C-chain, Base, and Arbitrum One respectively. All share a per-user smart-account architecture (EIP-2535 diamond) and are operated through the same CLI shape: savings pools, per-user Prime / Degen Accounts, borrow / repay / fund, swaps, debt refinancing, delayed collateral withdrawals. The Avalanche side additionally exposes GMX V2 LP (GM and GM+), TraderJoe V2 LB, sJOE staking, PRIME leverage tiers, and a leveraged-long zap macro. The Arbitrum side carries the same leverage stack adapted to GMX's home chain — 10 GM + 3 GM+ markets, GLV vaults, 11 TraderJoe LB pairs, PRIME tiers, zap (no sJOE). The Base side ships a read-only Aerodrome position inventory; write paths are deferred to v2.
 
 Built for agent use:
 
@@ -16,7 +16,7 @@ Built for agent use:
 - RedStone-signed solvency math handled internally, with a regression test pinning the half-boundary `toFixed(8)` encoding.
 - ParaSwap calldata validated client-side against the on-chain executor allowlist before broadcast.
 
-**Current version:** 0.1.2. The 0.x line is pre-1.0, so breaking changes are possible. See [Releases](https://github.com/Mnemosyne-quest/primecli/releases).
+**Current version:** 0.3.0. The 0.x line is pre-1.0, so breaking changes are possible. See [Releases](https://github.com/Mnemosyne-quest/primecli/releases).
 
 ## Security and trust
 
@@ -128,11 +128,11 @@ Full per-command reference: [docs/degenprime-reference.md](docs/degenprime-refer
 | Swaps | `swap --from S --to S --amount N [--via yak\|paraswap] [--slippage P]`, `swap-debt --from S --to S --amount N [--slippage P]` |
 | GMX V2 LP (async, keeper-executed) | `gmx-positions`, `gmx-deposit --market M --amount N [--side auto\|long\|short]`, `gmx-withdraw --market M --amount N` |
 | GMX GLV vaults (async, keeper-executed) | `glv-positions`, `glv-deposit --vault V --amount N [--side auto\|long\|short] [--target-market GM]`, `glv-withdraw --vault V --amount N [--target-market GM]` |
-| TraderJoe V2 LB | stubbed in v1 — pair whitelist pending on-chain verification (`lb-*` commands error cleanly) |
+| TraderJoe V2 LB | `lb-positions`, `lb-add --pair P --amount-x N --amount-y N [--shape spot\|curve\|bidask] [--range R]`, `lb-remove --pair P` |
 | PRIME leverage tiers | `prime-tier`, `prime-needed --borrow X [--tier premium\|basic]`, `prime-deposit --amount N`, `prime-activate [--amount N]`, `prime-deactivate [--withdraw]`, `prime-unstake --amount N`, `prime-repay --amount N` |
 | Zaps (multi-tx macro) | `zap --market M --collateral P --collateral-amount N --borrow-amount N [--deposit-amount N] [--side auto\|long\|short] [--swap]` |
 
-Pools: `usdc`, `eth`, `arb`, `btc` (native-wrapped asset is WETH, account symbol `ETH`). GM markets (two-sided, all vs USDC): `eth-usdc`, `btc-usdc`, `arb-usdc`, `link-usdc`, `uni-usdc`, `gmx-usdc`, `near-usdc`, `atom-usdc`, `sui-usdc`, `sei-usdc`; single-sided GM+: `eth+`, `btc+`, `gmx+`. GLV vaults: `weth-usdc`, `btc-usdc`. Beyond the 4 lendable pools, the live TokenManager registers 29 collateral symbols (GMX, LINK, UNI, weETH, wstETH, JOE, PRIME, the GM/GLV baskets, …) usable as collateral and for `swap` / `swap-debt`.
+Pools: `usdc`, `eth`, `arb`, `btc` (native-wrapped asset is WETH, account symbol `ETH`). GM markets (two-sided, all vs USDC): `eth-usdc`, `btc-usdc`, `arb-usdc`, `link-usdc`, `uni-usdc`, `gmx-usdc`, `near-usdc`, `atom-usdc`, `sui-usdc`, `sei-usdc`; single-sided GM+: `eth+`, `btc+`, `gmx+`. GLV vaults: `weth-usdc`, `btc-usdc`. LB pairs: `eth-usdc`, `eth-usdc-10`, `eth-usdt`, `eth-usdt-10`, `arb-eth`, `arb-eth-v22`, `btc-eth`, `gmx-eth`, `joe-eth`, `wsteth-eth`, `weeth-eth`. Beyond the 4 lendable pools, the live TokenManager registers 29 collateral symbols (GMX, LINK, UNI, weETH, wstETH, JOE, PRIME, the GM/GLV baskets, …) usable as collateral and for `swap` / `swap-debt`.
 
 Note: DeltaPrime has TWO deployments on Arbitrum; `arbprime` targets the live one used by app.deltaprime.io (factory `0xFf5e…c20`, TokenManager `0x0a0D…E255`), with every address verified on-chain against the live SmartLoanDiamondBeacon. The stale artifact deployment (factory `0x97f4…E4E`) only carries ETH+USDC pools — don't use addresses from the repo's `deployments/arbitrum/*TUP.json` artifacts.
 
@@ -200,7 +200,7 @@ A copy-paste template is at [examples/env.example](examples/env.example).
 | Swap-debt (debt refinancing) | full |
 | GMX V2 LP (GM ×10 + GM+ ×3 markets) | full (async, account freezes until keeper callback) |
 | GMX GLV vaults (×2, Arbitrum-only) | full (deposit / withdraw / positions, `targetMarket` routing) |
-| TraderJoe V2 LB | stubbed (facet live; pair whitelist pending verification) |
+| TraderJoe V2 LB (11 whitelisted pairs) | full (max 300 bins per account — Arbitrum facet override) |
 | PRIME leverage tiers (BASIC / PREMIUM) | full (PRIME-WETH LP pair, not PRIME-WAVAX) |
 | Leveraged-long zap macro | full (GM-terminal) |
 | Penpie / Beefy / Sushi facets | not yet (live on-chain; deferred by scope) |

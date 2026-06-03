@@ -36,8 +36,9 @@ Usage:
   arbprime glv-deposit --vault weth-usdc --amount 500 [--side auto|long|short] [--target-market GM_ETH_WETH_USDC] [--slippage 1] [--fee-buffer 2] [--execute]
   arbprime glv-withdraw --vault weth-usdc --amount 5 [--target-market GM_ETH_WETH_USDC] [--slippage 1] [--fee-buffer 2] [--execute]
   arbprime lb-positions
-  arbprime lb-add --pair PAIR --amount-x 1 --amount-y 30 [...]   (TODO: not configured on Arbitrum)
-  arbprime lb-remove --pair PAIR [--slippage 1] [--execute]      (TODO: not configured on Arbitrum)
+  arbprime lb-add --pair eth-usdc --amount-x 0.1 --amount-y 300 [--shape spot|curve|bidask] [--range 5] [--slippage 1] [--id-slippage 5] [--execute]
+  arbprime lb-remove --pair eth-usdc [--slippage 1] [--execute]
+  arbprime lb-positions
   arbprime prime-tier
   arbprime prime-needed --borrow 1000 [--tier premium|basic]
   arbprime prime-deposit --amount 200 [--execute]
@@ -139,11 +140,16 @@ mechanic as GMX V2. --target-market defaults to the vault's primary GM market an
 overridden. glv-positions is a best-effort balance read (GLV token balanceOf + gateway price
 where available).
 
-lb-add / lb-remove / lb-positions: TraderJoe V2 Liquidity Book. The TraderJoeV2ArbitrumFacet
-exists on Arbitrum but the DeltaPrime-whitelisted LB pair set + canonical token order + bin
-steps were NOT verified for this port, so TJ_LB_PAIRS is empty and the LB commands are STUBBED
-(they print "not yet configured for Arbitrum (TODO)"). Do not populate pair addresses without
-on-chain verification — this is a signing tool. (TODO: verify Arbitrum LB pairs + routers.)
+lb-add / lb-remove open/close TraderJoe (LFJ) V2 Liquidity Book positions on the Prime
+Account via TraderJoeV2ArbitrumFacet (addLiquidityTraderJoeV2 / removeLiquidityTraderJoeV2),
+exactly as on Avalanche: deltaIds[] bin offsets + distributionX/Y weightings (--shape
+spot|curve|bidask over --range bins each side), amountX/Y slippage floors, --id-slippage
+active-bin guard. addLiquidity is RedStone-gated; removeLiquidity is not. lb-remove closes
+the account's ENTIRE position for the pair. lb-positions is the oracle-free position view.
+Pairs (11, both tokens registered assets; facet whitelist verified on-chain 03-06-2026):
+eth-usdc, eth-usdc-10, eth-usdt, eth-usdt-10, arb-eth, arb-eth-v22, btc-eth, gmx-eth,
+joe-eth, wsteth-eth, weeth-eth. Max 300 bins per Prime Account on Arbitrum (the facet
+overrides Avalanche's 80); both the preview and the on-chain facet enforce it.
 
 zap is a tool-level MACRO (zaps are NOT a separate on-chain facet — they are front-end orchestration
 that chains the existing primitives, capabilities §7). One bounded "leveraged long" flow, composing
@@ -491,19 +497,54 @@ GLV_TOKEN_DECIMALS = 18  # GLV LP tokens are 18-dec
 # balance read; if a GLV gateway price feed is unavailable, USD is left null.
 GLV_READER = "0x2C670A23f1E798184647288072e84054938B5497"
 
-# ─── TraderJoe V2 Liquidity Book (STUBBED on Arbitrum) ───────────────────────
-# The TraderJoeV2ArbitrumFacet (0x9DB8016429f61a0562f20D2C1aC7FA01dFe0aFe4) exists on the
-# live diamond, but the DeltaPrime-whitelisted Arbitrum LB pair set — pair addresses, the
-# canonical getTokenX()/getTokenY() order, bin steps, and the correct LB routers — was NOT
-# verified for this port. Since lb-add signs a transaction (router + pair must be exactly
-# right), TJ_LB_PAIRS is left EMPTY and lb-add/lb-remove/lb-positions print a "not yet
-# configured for Arbitrum (TODO)" message rather than guessing addresses.
-# TODO: verify Arbitrum LB pairs (DeltaPrime repo common/addresses/arbitrum/ or on-chain
-# via the TJ factory), then populate TJ_LB_FACET/TJ_ROUTER_*/TJ_LB_PAIRS and re-enable.
-TJ_LB_FACET = "0x9DB8016429f61a0562f20D2C1aC7FA01dFe0aFe4"  # facet present; pairs unverified
-TJ_LB_ROUTER = None  # TODO: verified Arbitrum LB router(s) needed before any lb-add/lb-remove
-TJ_MAX_BINS = 80
-TJ_LB_PAIRS = {}  # TODO: populate with on-chain-verified Arbitrum pairs (see note above)
+# ─── TraderJoe V2 Liquidity Book (concentrated liquidity) ────────────────────
+# DeltaPrime LPs into TraderJoe (LFJ) V2 LB pairs through TraderJoeV2ArbitrumFacet
+# (0x9DB8016429f61a0562f20D2C1aC7FA01dFe0aFe4), reachable at any Prime Account. The
+# whitelist below is the facet's own getWhitelistedTraderJoeV2Pairs() (verified source,
+# contracts/facets/arbitrum/TraderJoeV2ArbitrumFacet.sol, fetched 03-06-2026), filtered to
+# pairs whose BOTH tokens are registered in the live TokenManager 29-asset set — the
+# source list also whitelists DAI/USDC.e/WOO/GRAIL/MAGIC/ezETH pairs whose tokens are NOT
+# registered assets (the facet's _getAvailableBalance(symbol) lookup would fail), so those
+# are omitted. Every pair below was verified on-chain 03-06-2026 against arb1.arbitrum.io:
+# eth_getCode > 0, canonical getTokenX()/getTokenY() order, and getBinStep() as listed.
+# The two LB routers are LFJ's deterministic cross-chain deployments (same addresses as
+# Avalanche), straight from the base facet's isRouterWhitelisted(); both verified to have
+# code on Arbitrum. NOTE: maxBinsPerPrimeAccount() is 300 on Arbitrum (vs 80 on Avalanche)
+# — the Arbitrum facet overrides it.
+TJ_LB_FACET = "0x9DB8016429f61a0562f20D2C1aC7FA01dFe0aFe4"
+TJ_ROUTER_V21 = "0xb4315e873dBcf96Ffd0acd8EA43f689D8c20fB30"
+TJ_ROUTER_V22 = "0x18556DA13313f3532c54711497A8FedAC273220E"
+TJ_MAX_BINS = 300
+
+# Per-pair token metadata: ERC20 address, the account bytes32 symbol (for in-account
+# balance reads + the RedStone feed), and decimals. Symbols are the live TokenManager
+# registrations (note exact case on wstETH / weETH).
+_T_WETH   = {"addr": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", "symbol": "ETH",    "decimals": 18}
+_T_USDC   = {"addr": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", "symbol": "USDC",   "decimals": 6}
+_T_USDT   = {"addr": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", "symbol": "USDT",   "decimals": 6}
+_T_ARB    = {"addr": "0x912CE59144191C1204E64559FE8253a0e49E6548", "symbol": "ARB",    "decimals": 18}
+_T_WBTC   = {"addr": "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f", "symbol": "BTC",    "decimals": 8}
+_T_GMX    = {"addr": "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a", "symbol": "GMX",    "decimals": 18}
+_T_JOE    = {"addr": "0x371c7ec6D8039ff7933a2AA28EB827Ffe1F52f07", "symbol": "JOE",    "decimals": 18}
+_T_WSTETH = {"addr": "0x5979D7b546E38E414F7E9822514be443A4800529", "symbol": "wstETH", "decimals": 18}
+_T_WEETH  = {"addr": "0x35751007a407ca6FEFfE80b3cB397736D2cf4dbe", "symbol": "weETH",  "decimals": 18}
+
+# Keys follow the deltaprime convention: tokenX-tokenY, with a binStep suffix where the
+# same pair exists at two steps ("eth-usdc" bs15 v2.1 vs "eth-usdc-10" bs10 v2.2) and a
+# version suffix where the binStep collides ("arb-eth" v2.1 vs "arb-eth-v22", both bs10).
+TJ_LB_PAIRS = {
+    "eth-usdc":    {"pair": "0x69f1216cB2905bf0852f74624D5Fa7b5FC4dA710", "router": TJ_ROUTER_V21, "binStep": 15, "tokenX": _T_WETH,   "tokenY": _T_USDC},
+    "eth-usdc-10": {"pair": "0xb7236B927e03542AC3bE0A054F2bEa8868AF9508", "router": TJ_ROUTER_V22, "binStep": 10, "tokenX": _T_WETH,   "tokenY": _T_USDC},
+    "eth-usdt":    {"pair": "0xd387c40a72703B38A5181573724bcaF2Ce6038a5", "router": TJ_ROUTER_V21, "binStep": 15, "tokenX": _T_WETH,   "tokenY": _T_USDT},
+    "eth-usdt-10": {"pair": "0x055f2cF6da90F14598D35C1184ED535C908dE737", "router": TJ_ROUTER_V22, "binStep": 10, "tokenX": _T_WETH,   "tokenY": _T_USDT},
+    "arb-eth":     {"pair": "0x0Be4aC7dA6cd4bAD60d96FbC6d091e1098aFA358", "router": TJ_ROUTER_V21, "binStep": 10, "tokenX": _T_ARB,    "tokenY": _T_WETH},
+    "arb-eth-v22": {"pair": "0xC09F4ad33a164e29DF3c94719ffD5F7B5B057781", "router": TJ_ROUTER_V22, "binStep": 10, "tokenX": _T_ARB,    "tokenY": _T_WETH},
+    "btc-eth":     {"pair": "0xcfA09B20c85933B197e8901226ad0D6dACa7f114", "router": TJ_ROUTER_V21, "binStep": 10, "tokenX": _T_WBTC,   "tokenY": _T_WETH},
+    "gmx-eth":     {"pair": "0x60563686ca7b668e4a2d7D31448e5F10456ecaF8", "router": TJ_ROUTER_V21, "binStep": 20, "tokenX": _T_GMX,    "tokenY": _T_WETH},
+    "joe-eth":     {"pair": "0x4b9bfeD1dD4E6780454b2B02213788f31FfBA74a", "router": TJ_ROUTER_V21, "binStep": 20, "tokenX": _T_JOE,    "tokenY": _T_WETH},
+    "wsteth-eth":  {"pair": "0x71bc33F539f83b99674D71AcFeb2ce0373376512", "router": TJ_ROUTER_V22, "binStep": 5,  "tokenX": _T_WSTETH, "tokenY": _T_WETH},
+    "weeth-eth":   {"pair": "0x2088eB5E23F24458e241430eF155d4EC05BBc9e8", "router": TJ_ROUTER_V22, "binStep": 5,  "tokenX": _T_WEETH,  "tokenY": _T_WETH},
+}
 
 # LB pair (ILBPair) reads used for previews + position views. getActiveId is the current
 # price bin; getTokenX/Y the canonical order; getBin(id) the bin's reserves; balanceOf /
