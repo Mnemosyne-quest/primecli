@@ -104,6 +104,12 @@ if _hm is None:
         _spec.loader.exec_module(_hm)
 health_monitor = _hm
 
+# Version check (silent on network failure or old install)
+try:
+    from primecli import check_version
+except ImportError:
+    def check_version(*a, **kw): pass
+
 # Default Base RPC. mainnet.base.org rate-limits hard (429 within a few calls); the
 # publicnode endpoint is fronted by a load balancer with much higher anonymous limits
 # and has been the most reliable free option for this tool's traffic pattern (lots of
@@ -2425,6 +2431,7 @@ def cmd_aerodrome_positions():
     print("  v1 lists tokenIds only. Composition + write paths deferred to v2.")
 
 def main():
+    check_version()
     try:
         _dispatch()
     except RuntimeError as e:

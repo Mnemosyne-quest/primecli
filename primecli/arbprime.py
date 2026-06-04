@@ -228,6 +228,12 @@ if _hm is None:
         _spec.loader.exec_module(_hm)
 health_monitor = _hm
 
+# Version check (silent on network failure or old install)
+try:
+    from primecli import check_version
+except ImportError:
+    def check_version(*a, **kw): pass
+
 # Arbitrum One RPC. Override with ARBPRIME_RPC for a paid Alchemy/Infura endpoint.
 ARBITRUM_RPC = os.environ.get("ARBPRIME_RPC", "https://arb1.arbitrum.io/rpc")
 EXPLORER = "https://arbiscan.io"  # display/links only — never used for ABI fetch
@@ -5360,6 +5366,7 @@ def cmd_prime_bridge(from_chain: str = "avax", amount: float = None, execute: bo
     print(f"  Tx: {src_cfg['explorer']}/{tx_hash.hex()}")
 
 def main():
+    check_version()
     args = sys.argv[1:] if len(sys.argv) > 1 else []
     # Global wallet selector: --as <agent>, stripped before command dispatch.
     global _SELECTED_AGENT, _CLI_KEY

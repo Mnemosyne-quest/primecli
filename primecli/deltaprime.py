@@ -237,6 +237,12 @@ if _hm is None:
         _spec.loader.exec_module(_hm)
 health_monitor = _hm
 
+# Version check (silent on network failure or old install)
+try:
+    from primecli import check_version
+except ImportError:
+    def check_version(*a, **kw): pass
+
 AVALANCHE_RPC = os.environ.get("DELTAPRIME_RPC", "https://api.avax.network/ext/bc/C/rpc")
 EXPLORER = "https://snowtrace.io"
 CHAIN_ID = 43114
@@ -5145,6 +5151,7 @@ def cmd_defi(as_json: bool = True):
     print(json.dumps(_trim_defi_json(data), indent=2))
 
 def main():
+    check_version()
     args = sys.argv[1:] if len(sys.argv) > 1 else []
     # Global wallet selector: --as <agent>, stripped before command dispatch.
     global _SELECTED_AGENT, _CLI_KEY
