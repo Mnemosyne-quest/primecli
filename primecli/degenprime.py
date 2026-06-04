@@ -112,6 +112,7 @@ health_monitor = _hm
 BASE_RPC = os.environ.get("DEGENPRIME_RPC", "https://base.publicnode.com")
 EXPLORER = "https://basescan.org"
 CHAIN_ID = 8453
+DEGEN_MAX_MULT = 5  # Fixed max leverage multiplier (no tier system on DegenPrime)
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 # ── Signing key resolution ──────────────────────────────────────────────────
@@ -569,6 +570,41 @@ def _asset_meta(w3, symbol: str):
 # Per-run cache for the RedStone gateway response - so a single summary call hits the
 # gateway once instead of per-feed-symbol. Cleared implicitly when the process exits.
 _redstone_gateway_cache = None
+
+def _compute_health_pct(supplied: list, borrowed: list, max_mult: int = None) -> dict:
+    """Compute equity-based health (0-100%) from per-asset supplied/borrowed data.
+
+    0% = liquidation, 50% = half borrowing power used, 100% = no debt.
+    Formula:
+      equity    = supplied_usd - debt_usd
+      max_mult  = 5 (fixed for DegenPrime; no tier system)
+      max_debt  = equity * (max_mult - 1)
+      health_pct = (max_debt - debt_usd) / max_debt * 100
+
+    Returns dict with keys: health_pct, supplied_usd, debt_usd, equity, max_debt, or error.
+    """
+    if max_mult is None:
+        max_mult = DEGEN_MAX_MULT
+    supplied_usd = sum(r.get("usd", 0) or 0 for r in supplied)
+    debt_usd = sum(r.get("usd", 0) or 0 for r in borrowed)
+    equity = supplied_usd - debt_usd
+
+    if equity <= 0.01:
+        return {"health_pct": 0.0, "supplied_usd": round(supplied_usd, 2),
+                "debt_usd": round(debt_usd, 2), "equity": round(equity, 2),
+                "max_debt": 0.0, "error": "equity near zero"}
+
+    max_debt = equity * (max_mult - 1)
+    if max_debt > 0 and debt_usd >= 0:
+        health_pct = (max_debt - min(debt_usd, max_debt)) / max_debt * 100
+        health_pct = max(0.0, min(100.0, health_pct))
+    else:
+        health_pct = 100.0
+
+    return {"health_pct": round(health_pct, 1), "supplied_usd": round(supplied_usd, 2),
+            "debt_usd": round(debt_usd, 2), "equity": round(equity, 2),
+            "max_debt": round(max_debt, 2), "tier": "FIXED_5X"}
+
 
 def _redstone_fetch_packages(use_cache: bool = True) -> dict:
     """Fetch the latest signed price packages from the RedStone gateway. Returns the
@@ -1458,11 +1494,19 @@ def gather_defi() -> dict:
                 row["usd"] = round(amt * usd, 2)
             return row
 
+        _rows_supplied = [_row(r) for r in supplied]
+        _rows_borrowed = [_row(r) for r in borrowed]
+
+        # Compute equity-based health (0-100%)
+        _hp = _compute_health_pct(_rows_supplied, _rows_borrowed)
+        result["health_pct"] = _hp.get("health_pct")
+
         if supplied or borrowed:
             result["groups"].append({
                 "type": "Lending / Leverage", "health_ratio": solvency["ratio"],
-                "supplied": [_row(r) for r in supplied],
-                "borrowed": [_row(r) for r in borrowed],
+                "health_pct": result["health_pct"],
+                "supplied": _rows_supplied,
+                "borrowed": _rows_borrowed,
             })
 
     # Savings: the EOA's own pool deposits ("Diamond Hands"), independent of the Degen
@@ -1578,16 +1622,22 @@ def cmd_summary(as_json: bool = False):
                 row["usd"] = round(row["amount"] * usd, 2)
             return row
 
+        # Compute equity-based health (0-100%)
+        _hp_rows = [_asset_row(r) for r in supplied]
+        _hp_borrowed = [_asset_row(r) for r in borrowed]
+        _hp = _compute_health_pct(_hp_rows, _hp_borrowed)
+
         out = {
             "wallet": acct.address,
             "account": pa,
             "nativeBalance": pa_eth if pa_eth >= 1e-9 else None,
-            "supplied": [_asset_row(r) for r in supplied],
-            "borrowed": [_asset_row(r) for r in borrowed],
+            "supplied": _hp_rows,
+            "borrowed": _hp_borrowed,
             "poolDeposits": [_asset_row(r) for r in pool_deposits],
             "totalValueUsd": solvency["total"],
             "debtUsd": solvency["debt"],
             "healthRatio": solvency["ratio"],
+            "healthPct": _hp.get("health_pct"),
             "solvent": solvency["solvent"],
             "solvencyError": solvency["error"],
         }
@@ -1626,7 +1676,22 @@ def cmd_summary(as_json: bool = False):
         print(f"  Total value:        ${solvency['total']:,.2f}")
         print(f"  Debt:               ${solvency['debt']:,.2f}")
         ratio_str = ">1000.00 (negligible debt)" if solvency["ratio"] is None else f"{solvency['ratio']:.4f}"
-        print(f"  Health ratio:       {ratio_str}  (>1.0 = solvent)")
+        print(f"  Health ratio (chain): {ratio_str}  (>1.0 = solvent, 1.0 = liquidation)")
+        # ─── Equity-based health (0-100%) ───
+        # Different from health_ratio!
+        hp = _compute_health_pct(
+            [{"symbol": r["symbol"], "balance": "0", "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)}
+             for r in supplied if solvency["prices"].get(r["symbol"])],
+            [{"symbol": r["symbol"], "balance": "0", "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)}
+             for r in borrowed if solvency["prices"].get(r["symbol"])],
+        )
+        if "error" not in hp:
+            print(f"  Health (0-100%): {hp['health_pct']:.1f}%")
+            print(f"    (supplied=${hp['supplied_usd']:.2f}, debt=${hp['debt_usd']:.2f},"
+                  f" equity=${hp['equity']:.2f}, max_debt=${hp['max_debt']:.2f}, {hp.get('tier','')})")
+            print(f"    0%=liquidation  50%=half borrowing power used  100%=no debt")
+        else:
+            print(f"  Health (0-100%): N/A ({hp['error']})")
         print(f"  Solvent:            {'yes' if solvency['solvent'] else 'NO - liquidatable'}")
     else:
         print(f"  Health/solvency:    RedStone fetch/call failed ({solvency['error']}); showing balances only")

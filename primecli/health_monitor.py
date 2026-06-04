@@ -37,10 +37,10 @@ TIER_MAX = {"basic": 5, "premium": 10}
 # ════════════════════════════════════════════════════════════════════
 
 def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
-    """Compute Bruno's 0-100% health scale from defi --json data.
+    """Compute equity-based health (0-100%) from defi --json data.
 
-    PREFERS the precomputed ``bruno_pct`` from defi --json (which primecli now
-    includes as of 2026-06-04), falling back to manual calculation when absent.
+    PREFERS the precomputed ``health_pct`` from defi --json (which primecli >= 0.5.4
+    includes), falling back to manual calculation when absent.
 
     Formula:
       equity = total_supplied_usd - total_debt_usd
@@ -49,7 +49,7 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
 
     This is DIFFERENT from getHealthRatio (the on-chain ratio where 1.0 = liquidation).
     Do NOT convert between the two. The ``health_ratio`` metric is the on-chain value
-    (1.0=liquidation, >1.0=solvent). The ``bruno_pct`` is the equity-based frontend
+    (1.0=liquidation, >1.0=solvent). The ``health_pct`` is the equity-based frontend
     measurement (0%=liquidation, 50%=half borrowing power used, 100%=no debt).
 
     Returns dict with health metrics or error.
@@ -61,8 +61,8 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
         supplied = g.get("supplied", [])
         borrowed = g.get("borrowed", [])
         health_ratio = g.get("health_ratio", 0) or 0
-        # Use precomputed bruno_pct from defi --json if available (primecli >= 0.5.0)
-        precomputed = g.get("bruno_pct")
+        # Use precomputed health_pct from defi --json if available (primecli >= 0.5.4)
+        precomputed = g.get("health_pct") or g.get("bruno_pct")  # bruno_pct for backward compat
         if precomputed is not None:
             # Early return: precomputed value exists, enrich with detail fields
             supplied_usd = sum(s.get("usd", 0) or 0 for s in supplied)
@@ -74,7 +74,7 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
             has_lb = any(sym in ("LB_AVAX_USDC", "LB_WAVAX_USDC", "JOE") or "TRADERJOE" in sym.upper() for sym in symbols)
             has_aero = any("AERO" in sym.upper() or "CL_POSITION" in sym.upper() for sym in symbols)
             return {
-                "bruno_pct": float(precomputed),
+                "health_pct": float(precomputed),
                 "health_ratio": round(health_ratio, 4),
                 "supplied_usd": round(supplied_usd, 2),
                 "debt_usd": round(debt_usd, 2),
@@ -84,7 +84,7 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
                 "has_gmx": has_gmx,
                 "has_lb": has_lb,
                 "has_aero": has_aero,
-                "action": "computed from defi --json bruno_pct",
+                "action": "computed from defi --json health_pct",
             }
     else:
         supplied = defi_data.get("supplied", [])
@@ -97,7 +97,7 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
 
     if equity <= 0.01:
         return {
-            "bruno_pct": 0.0,
+            "health_pct": 0.0,
             "health_ratio": round(health_ratio, 4),
             "supplied_usd": round(supplied_usd, 2),
             "debt_usd": round(debt_usd, 2),
@@ -121,15 +121,15 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
     has_aero = any("AERO" in sym.upper() or "CL_POSITION" in sym.upper() for sym in symbols)
 
     if max_debt > 0 and debt_usd >= 0:
-        bruno_pct = (max_debt - min(debt_usd, max_debt)) / max_debt * 100
-        bruno_pct = max(0.0, min(100.0, bruno_pct))
+        health_pct = (max_debt - min(debt_usd, max_debt)) / max_debt * 100
+        health_pct = max(0.0, min(100.0, health_pct))
     else:
-        bruno_pct = 100.0
+        health_pct = 100.0
 
     delta_debt = (max_debt * 0.5) - debt_usd  # center target = 50%
 
     return {
-        "bruno_pct": round(bruno_pct, 1),
+        "health_pct": round(health_pct, 1),
         "health_ratio": round(health_ratio, 4),
         "supplied_usd": round(supplied_usd, 2),
         "debt_usd": round(debt_usd, 2),
@@ -320,7 +320,7 @@ def run_tick(
             "reason": "equity_near_zero",
             "equity": health["equity"],
             "debt": health["debt_usd"],
-            "health_pct": health["bruno_pct"],
+            "health_pct": health["health_pct"],
             "label": label,
         })
         result.update(health)
@@ -336,23 +336,23 @@ def run_tick(
 
     # 5. Health swing detection (always)
     last_pct = load_last_health(state_dir)
-    if last_pct is not None and health["bruno_pct"] is not None:
-        diff = abs(health["bruno_pct"] - last_pct)
+    if last_pct is not None and health["health_pct"] is not None:
+        diff = abs(health["health_pct"] - last_pct)
         if diff > 10:
             write_escalation(state_dir, "health-swing", {
                 "reason": "health_swing",
                 "from_pct": last_pct,
-                "to_pct": health["bruno_pct"],
+                "to_pct": health["health_pct"],
                 "delta": diff,
                 "label": label,
             })
             result["escalation"] = "health_swing"
-    save_last_health(state_dir, health["bruno_pct"] or 0.0)
+    save_last_health(state_dir, health["health_pct"] or 0.0)
 
     # 6. Append to history
     entry = {
         "ts": now_iso, "mode": mode,
-        "pct": health["bruno_pct"],
+        "pct": health["health_pct"],
         "equity": health["equity"],
         "debt": health["debt_usd"],
         "hr": health["health_ratio"],
@@ -369,7 +369,7 @@ def run_tick(
             write_escalation(state_dir, "incomplete-valuation", {
                 "reason": "incomplete_valuation",
                 "detail": val_reason,
-                "health_pct": health["bruno_pct"],
+                "health_pct": health["health_pct"],
                 "equity": health["equity"],
                 "debt": health["debt_usd"],
                 "label": label,
@@ -387,7 +387,7 @@ def run_tick(
         side = strategy.get("side", "short")
         low, high = target_range[0], target_range[1]
 
-        pct = health["bruno_pct"]
+        pct = health["health_pct"]
         equity = health["equity"]
         debt = health["debt_usd"]
         raw_usdc = health["raw_usdc"]
