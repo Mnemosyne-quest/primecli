@@ -242,19 +242,25 @@ def _tx_gas_price(w3) -> int:
 
 def _set_gas_price(w3, tx_dict):
     """Set appropriate gas price fields for the chain, replacing the legacy gasPrice approach.
-    On EIP-1559 chains (Arbitrum, Base): sets maxFeePerGas + maxPriorityFeePerGas with a 2x
-    base-fee hedge (base + prio + 1 gwei buffer). On Avalanche (legacy): sets gasPrice at
-    2x base fee with a 1 gwei floor. (25 gwei was the pre-Etna C-chain minimum;
-    ACP-125 (Dec 2024) lowered the min base fee to 1 nAVAX — base now sits at ~0.01
-    nAVAX, so a 25 gwei floor overpaid ~2500x and inflated the upfront balance
-    requirement past small EOAs.)"""
+    On EIP-1559 chains (Arbitrum, Base, Avalanche post-Etna): sets maxFeePerGas +
+    maxPriorityFeePerGas with a 2x base-fee hedge (base + prio + 1 gwei buffer).
+    Falls back to legacy gasPrice only if the tx dict already lacks EIP-1559 fields
+    and the chain doesn't support max_priority_fee.
+    (25 gwei was the pre-Etna C-chain minimum; ACP-125 (Dec 2024) lowered the min base
+    fee to 1 nAVAX — base now sits at ~0.01 nAVAX, so a 25 gwei floor overpaid ~2500x
+    and inflated the upfront balance requirement past small EOAs.)"""
+    # If build_transaction already set EIP-1559 fields, don't touch them
+    if "maxFeePerGas" in tx_dict or "maxPriorityFeePerGas" in tx_dict:
+        tx_dict.pop("gasPrice", None)
+        return
     tx_dict.pop("gasPrice", None)
-    if CHAIN_ID in (42161, 8453):  # Arbitrum, Base — EIP-1559
+    try:
         base = w3.eth.gas_price
         prio = w3.eth.max_priority_fee
         tx_dict["maxFeePerGas"] = max(int(base * 2), base + prio + 10**9)
         tx_dict["maxPriorityFeePerGas"] = prio
-    else:  # Avalanche (43114) — legacy gasPrice
+    except Exception:
+        # Legacy chain — use gasPrice instead
         tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 1 * 10**9)
 def resolve_private_key():
     """Resolve the signing key per the documented precedence:
@@ -1983,12 +1989,39 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
     selector_hex, data_bytes = "0x" + full[:4].hex(), full[4:]
     _exec, _src, _dest, _from_amt, min_out = _paraswap_decode_and_check(
         selector_hex, data_bytes, from_cfg["token"], to_cfg["token"], amount_in, pa_cs)
-    if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
-        fallback_bytes = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:])
-        data_bytes = fallback_bytes + data_bytes[32:]
-        print(f"  ⚠ Executor {_exec} not whitelisted; patching to {_PARASWAP_FALLBACK_EXECUTOR}")
-        _paraswap_decode_and_check(selector_hex, data_bytes, from_cfg["token"], to_cfg["token"],
-                                   amount_in, pa_cs)
+    # Simulate-first executor handling (see cmd_swap_debt rationale): keep the API
+    # executor when the exact tx simulates clean; only fall back to the legacy
+    # executor if the unpatched calldata reverts.
+    feeds = degen_account_price_feeds(account)
+    for s in (from_sym, to_sym):
+        if s in REDSTONE_AVAILABLE_FEEDS and s not in feeds:
+            feeds.append(s)
+    payload = build_redstone_payload(feeds)
+    def _sim_paraswap(db):
+        base = account.encode_abi("paraSwapV6", args=[full[:4], db])
+        try:
+            w3.eth.call({"from": acct.address, "to": pa_cs,
+                         "data": base + payload.hex(), "gas": 8000000})
+            return True, None
+        except Exception as e:
+            return False, str(e)
+    sim_ok, sim_err = _sim_paraswap(data_bytes)
+    if sim_ok:
+        if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
+            print(f"  ✓ Executor {_exec} not in the static whitelist, but the full tx "
+                  f"simulates clean — using the API calldata as-is.")
+    else:
+        print(f"  ✗ Simulation with API executor {_exec} reverted: {sim_err}")
+        patched = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:]) + data_bytes[32:]
+        sim_ok, err2 = _sim_paraswap(patched)
+        if sim_ok:
+            print(f"  ⚠ Falling back to legacy executor {_PARASWAP_FALLBACK_EXECUTOR} "
+                  f"(simulates clean).")
+            data_bytes = patched
+            _paraswap_decode_and_check(selector_hex, data_bytes, from_cfg["token"],
+                                       to_cfg["token"], amount_in, pa_cs)
+        else:
+            print(f"  ✗ Legacy-executor fallback also reverted: {err2}")
 
     print(f"Swap {amount} {from_sym} -> {to_sym} on Degen Account {pa_cs}  (via ParaSwap/Velora)")
     print(f"  Router method: {price_route['contractMethod']} ({selector_hex})")
@@ -2003,10 +2036,12 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
         print("Run with --execute to broadcast (appends a fresh RedStone price payload).")
         return
 
-    feeds = degen_account_price_feeds(account)
-    for s in (from_sym, to_sym):
-        if s in REDSTONE_AVAILABLE_FEEDS and s not in feeds:
-            feeds.append(s)
+    if not sim_ok:
+        print("✗ Refusing to broadcast: simulation reverted for both executor variants.")
+        return
+
+    # Rebuild the payload fresh for broadcast (the sim payload may be near the
+    # RedStone staleness window by now).
     payload = build_redstone_payload(feeds)
     base_calldata = account.encode_abi("paraSwapV6", args=[full[:4], data_bytes])
     data = base_calldata + payload.hex()
@@ -2112,12 +2147,36 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     selector_hex, data_bytes = "0x" + full[:4].hex(), full[4:]
     _exec, _src, _dest, _swap_from_amt, swap_min_out = _paraswap_decode_and_check(
         selector_hex, data_bytes, to_cfg["token"], from_cfg["token"], borrow_amount, pa_cs)
-    if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
-        fallback_bytes = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:])
-        data_bytes = fallback_bytes + data_bytes[32:]
-        print(f"  ⚠ Executor {_exec} not whitelisted; patching to {_PARASWAP_FALLBACK_EXECUTOR}")
-        _paraswap_decode_and_check(selector_hex, data_bytes, to_cfg["token"], from_cfg["token"],
-                                   borrow_amount, pa_cs)
+    # Simulate-first executor handling (protocol-level facet fix confirmed 2026-06-04;
+    # Velora rotates executors per quote): keep the API executor when the exact tx
+    # simulates clean; only fall back to the legacy executor if it reverts.
+    def _sim_swap_debt(db):
+        base = account.encode_abi("swapDebtParaSwap", args=[
+            asset_b32(from_sym), asset_b32(to_sym), repay_amount, borrow_amount,
+            full[:4], db])
+        try:
+            w3.eth.call({"from": acct.address, "to": pa_cs,
+                         "data": base + payload.hex(), "gas": 8000000})
+            return True, None
+        except Exception as e:
+            return False, str(e)
+    sim_ok, sim_err = _sim_swap_debt(data_bytes)
+    if sim_ok:
+        if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
+            print(f"  ✓ Executor {_exec} not in the static whitelist, but the full tx "
+                  f"simulates clean — using the API calldata as-is.")
+    else:
+        print(f"  ✗ Simulation with API executor {_exec} reverted: {sim_err}")
+        patched = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:]) + data_bytes[32:]
+        sim_ok, err2 = _sim_swap_debt(patched)
+        if sim_ok:
+            print(f"  ⚠ Falling back to legacy executor {_PARASWAP_FALLBACK_EXECUTOR} "
+                  f"(simulates clean).")
+            data_bytes = patched
+            _paraswap_decode_and_check(selector_hex, data_bytes, to_cfg["token"],
+                                       from_cfg["token"], borrow_amount, pa_cs)
+        else:
+            print(f"  ✗ Legacy-executor fallback also reverted: {err2}")
 
     print(f"Swap debt on Degen Account {pa}")
     print(f"  Refinance: {from_sym} debt -> {to_sym} debt")
@@ -2143,6 +2202,10 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
 
     if not execute:
         print("Run with --execute to broadcast (appends a fresh RedStone price payload).")
+        return
+
+    if not sim_ok:
+        print("✗ Refusing to broadcast: simulation reverted for both executor variants.")
         return
 
     base_calldata = account.encode_abi("swapDebtParaSwap", args=[

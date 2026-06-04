@@ -57,8 +57,8 @@ def test_compute_health_lever_branch_high_pct():
         max_mult=10,
     )
     assert h["equity"] == 2000
-    assert h["bruno_pct"] == 85.0
-    assert h["bruno_pct"] > 70  # lever territory
+    assert h["health_pct"] == 85.0
+    assert h["health_pct"] > 70  # lever territory
 
 
 def test_compute_health_in_range_branch():
@@ -71,8 +71,8 @@ def test_compute_health_in_range_branch():
         max_mult=10,
     )
     assert h["equity"] == 2000
-    assert h["bruno_pct"] == 50.0
-    assert 30 <= h["bruno_pct"] <= 70
+    assert h["health_pct"] == 50.0
+    assert 30 <= h["health_pct"] <= 70
 
 
 def test_compute_health_delever_branch_low_pct():
@@ -85,8 +85,8 @@ def test_compute_health_delever_branch_low_pct():
         max_mult=10,
     )
     assert h["equity"] == 2000
-    assert h["bruno_pct"] == 10.0
-    assert h["bruno_pct"] < 30  # de-lever territory
+    assert h["health_pct"] == 10.0
+    assert h["health_pct"] < 30  # de-lever territory
 
 
 def test_compute_health_equity_near_zero_errors():
@@ -99,7 +99,7 @@ def test_compute_health_equity_near_zero_errors():
         max_mult=10,
     )
     assert h["error"] == "equity near zero"
-    assert h["bruno_pct"] == 0.0
+    assert h["health_pct"] == 0.0
 
 
 def test_compute_health_basic_tier_lower_ceiling():
@@ -112,7 +112,7 @@ def test_compute_health_basic_tier_lower_ceiling():
     assert basic["equity"] == premium["equity"] == 2000
     assert basic["max_debt"] == 2000 * 4
     assert premium["max_debt"] == 2000 * 9
-    assert basic["bruno_pct"] < premium["bruno_pct"]
+    assert basic["health_pct"] < premium["health_pct"]
 
 
 def test_compute_health_flat_format_and_position_detection():

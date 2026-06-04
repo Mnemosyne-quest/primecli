@@ -4,6 +4,53 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.5.6] - 2026-06-04
+
+### Fixed
+- **Velora/ParaSwap executor handling is now simulate-first** (all three tools, both
+  the `swap --via paraswap` leg and `swap-debt`). DeltaPrime fixed the protocol-level
+  facet bug that rejected rotating Velora executors (`InvalidExecutor`); since the fix,
+  API-built calldata passes with its own executor while the old hard-patch to the
+  legacy executor *reverts* (executor-specific calldata mismatch). The tools now
+  `eth_call`-simulate the exact tx (calldata + RedStone payload) and keep the API
+  executor when the simulation passes, fall back to the legacy executor only if the
+  unpatched calldata reverts, and refuse to broadcast when both variants revert.
+  Verified live on Avalanche: swap-debt USDC→AVAX ($31) through Velora executor
+  `0x8faa…e820`, tx `22390b83…4013`. The static `PARASWAP_EXECUTORS` set is now
+  label-only (known vs new executor in output), no longer a gate.
+- **Completed the EIP-1559 gas refactor across siblings.** `_set_gas_price` /
+  `_set_gas_price_for` had been modernized in deltaprime only (try EIP-1559 with a
+  legacy-gasPrice fallback, honour pre-set fee fields), leaving arbprime/degenprime
+  on the old chain-id-keyed logic and breaking the cross-file identity guard.
+  arbprime + degenprime now match deltaprime byte-for-byte; `test_gas_pricing.py`
+  rewritten for the new behaviour (EIP-1559 on Avalanche post-Etna, legacy only as
+  fallback, pre-set fields preserved).
+- Tests still asserting the pre-0.5.4 `bruno_pct` key updated to `health_pct`;
+  removed the `bruno_pct` backward-compat read in `health_monitor.py`. Full suite
+  green again (101 passed).
+
+## [0.5.5] - 2026-06-04
+
+### Added
+- Startup version check for outdated installs (silent on network failure).
+- _(Backfilled entry — released without a changelog entry.)_
+
+## [0.5.4] - 2026-06-04
+
+### Changed
+- Depersonalized health metric names (`bruno_pct` → `health_pct`, "Health (Bruno
+  0-100%)" → "Health (0-100%)"); added the metric to degenprime.
+- _(Backfilled entry — released without a changelog entry.)_
+
+## [0.5.3] - 2026-06-04
+
+### Added
+- Equity-based 0-100% health metric in `prime-summary` and `defi --json`.
+
+### Fixed
+- Pin `setuptools<73` for twine compatibility.
+- _(Backfilled entry — released without a changelog entry.)_
+
 ## [0.5.2] - 2026-06-04
 
 ### Added

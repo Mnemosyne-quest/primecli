@@ -294,16 +294,16 @@ PARASWAP_AUGUSTUS = "0x6A000F20005980200259B80c5102003040001068"
 PARASWAP_SUPPORTED_SELECTORS = {"0xe3ead59e", "0x876a02f6"}
 # Executors the facet whitelists (ParaSwapHelper._checkExecutorAddress). Lowercased.
 PARASWAP_EXECUTORS = {
-    # Must match the ParaSwap executor whitelist on DeltaPrime's ParaSwapFacet and
-    # SwapDebtFacet. The ParaSwap API can return new executors that aren't whitelisted
-    # yet — those cause on-chain InvalidExecutor() reverts. Only add executors verified
-    # to be whitelisted on-chain.
+    # Historical static whitelist. Since the protocol-level facet fix (confirmed
+    # 2026-06-04), API-returned executors outside this set can be VALID — Velora
+    # rotates executors per quote (seen: 0x8faa…e820, 0x6f05…0900). The swap paths
+    # now decide by eth_call simulation of the exact tx, not by this set; it's kept
+    # only to label "known" vs "new" executors in output.
     "0xdef171fe48cf0115b1d80b88dc8eab59176fee57",
     "0x6a000f20005980200259b80c5102003040001068",
     "0x000010036c0190e009a000d0fc3541100a07380a",
     "0x00c600b30fb0400701010f4b080409018b9006e0",
     "0xa0f408a000017007015e0f00320e470d00090a5b",
-    # 0x8faa... (Velora) returned by API but NOT whitelisted on-chain — confirmed 2026-05-28 & 2026-05-29
 }
 
 # RedStone on-demand oracle config for DeltaPrime on Arbitrum — IDENTICAL to Avalanche
@@ -671,33 +671,42 @@ def _tx_gas_price(w3) -> int:
 
 def _set_gas_price(w3, tx_dict):
     """Set appropriate gas price fields for the chain, replacing the legacy gasPrice approach.
-    On EIP-1559 chains (Arbitrum, Base): sets maxFeePerGas + maxPriorityFeePerGas with a 2x
-    base-fee hedge (base + prio + 1 gwei buffer). On Avalanche (legacy): sets gasPrice at
-    2x base fee with a 1 gwei floor. (25 gwei was the pre-Etna C-chain minimum;
-    ACP-125 (Dec 2024) lowered the min base fee to 1 nAVAX — base now sits at ~0.01
-    nAVAX, so a 25 gwei floor overpaid ~2500x and inflated the upfront balance
-    requirement past small EOAs.)"""
+    On EIP-1559 chains (Arbitrum, Base, Avalanche post-Etna): sets maxFeePerGas +
+    maxPriorityFeePerGas with a 2x base-fee hedge (base + prio + 1 gwei buffer).
+    Falls back to legacy gasPrice only if the tx dict already lacks EIP-1559 fields
+    and the chain doesn't support max_priority_fee.
+    (25 gwei was the pre-Etna C-chain minimum; ACP-125 (Dec 2024) lowered the min base
+    fee to 1 nAVAX — base now sits at ~0.01 nAVAX, so a 25 gwei floor overpaid ~2500x
+    and inflated the upfront balance requirement past small EOAs.)"""
+    # If build_transaction already set EIP-1559 fields, don't touch them
+    if "maxFeePerGas" in tx_dict or "maxPriorityFeePerGas" in tx_dict:
+        tx_dict.pop("gasPrice", None)
+        return
     tx_dict.pop("gasPrice", None)
-    if CHAIN_ID in (42161, 8453):  # Arbitrum, Base — EIP-1559
+    try:
         base = w3.eth.gas_price
         prio = w3.eth.max_priority_fee
         tx_dict["maxFeePerGas"] = max(int(base * 2), base + prio + 10**9)
         tx_dict["maxPriorityFeePerGas"] = prio
-    else:  # Avalanche (43114) — legacy gasPrice
+    except Exception:
+        # Legacy chain — use gasPrice instead
         tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 1 * 10**9)
 
 def _set_gas_price_for(chain_id, w3, tx_dict):
     """Set gas fields for an EXPLICIT chain_id rather than the module CHAIN_ID. Needed by
     cross-chain flows (prime-bridge) where a tx may target Avalanche or Arbitrum regardless
-    of which tool built it. Arbitrum/Base (EIP-1559): maxFeePerGas + maxPriorityFeePerGas;
-    Avalanche (legacy): gasPrice with a 1 gwei floor (post-Etna; see _set_gas_price)."""
+    of which tool built it."""
+    # If build_transaction already set EIP-1559 fields, don't touch them
+    if "maxFeePerGas" in tx_dict or "maxPriorityFeePerGas" in tx_dict:
+        tx_dict.pop("gasPrice", None)
+        return
     tx_dict.pop("gasPrice", None)
-    if chain_id in (42161, 8453):  # Arbitrum, Base — EIP-1559
+    try:
         base = w3.eth.gas_price
         prio = w3.eth.max_priority_fee
         tx_dict["maxFeePerGas"] = max(int(base * 2), base + prio + 10**9)
         tx_dict["maxPriorityFeePerGas"] = prio
-    else:  # Avalanche (43114) — legacy gasPrice
+    except Exception:
         tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 1 * 10**9)
 
 def _read_env_var(path, var):
@@ -2326,14 +2335,40 @@ def _swap_via_paraswap(w3, acct, pa_cs, account, from_sym, to_sym, from_cfg, to_
     selector_hex, data_bytes = "0x" + full[:4].hex(), full[4:]
     _exec, _src, _dest, from_amt, min_out = _paraswap_decode_and_check(
         selector_hex, data_bytes, from_cfg["token"], to_cfg["token"], amount_in, pa_cs)
-    # Same executor-patching as swap-debt (see cmd_swap_debt for full rationale).
+    # Same simulate-first executor handling as swap-debt (see cmd_swap_debt for full
+    # rationale): keep the API executor when the exact tx simulates clean; only fall
+    # back to the legacy executor if the unpatched calldata reverts.
     _PARASWAP_FALLBACK_EXECUTOR = "0x000010036C0190E009a000d0fc3541100A07380A"
-    if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
-        fallback_bytes = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:])
-        data_bytes = fallback_bytes + data_bytes[32:]
-        print(f"  ⚠ Executor {_exec} not whitelisted; patching to {_PARASWAP_FALLBACK_EXECUTOR}")
-        _paraswap_decode_and_check(selector_hex, data_bytes, from_cfg["token"], to_cfg["token"],
-                                   amount_in, pa_cs)
+    feeds = prime_account_price_feeds(account)
+    for s in (from_sym, to_sym):
+        if s not in feeds:
+            feeds.append(s)
+    payload = build_redstone_payload(feeds)
+    def _sim_paraswap(db):
+        base = account.encode_abi("paraSwapV6", args=[full[:4], db])
+        try:
+            w3.eth.call({"from": acct.address, "to": pa_cs,
+                         "data": base + payload.hex(), "gas": 8000000})
+            return True, None
+        except Exception as e:
+            return False, str(e)
+    sim_ok, sim_err = _sim_paraswap(data_bytes)
+    if sim_ok:
+        if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
+            print(f"  ✓ Executor {_exec} not in the static whitelist, but the full tx "
+                  f"simulates clean — using the API calldata as-is.")
+    else:
+        print(f"  ✗ Simulation with API executor {_exec} reverted: {sim_err}")
+        patched = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:]) + data_bytes[32:]
+        sim_ok, err2 = _sim_paraswap(patched)
+        if sim_ok:
+            print(f"  ⚠ Falling back to legacy executor {_PARASWAP_FALLBACK_EXECUTOR} "
+                  f"(simulates clean).")
+            data_bytes = patched
+            _paraswap_decode_and_check(selector_hex, data_bytes, from_cfg["token"],
+                                       to_cfg["token"], amount_in, pa_cs)
+        else:
+            print(f"  ✗ Legacy-executor fallback also reverted: {err2}")
 
     print(f"Swap {amount} {from_sym} -> {to_sym} on Prime Account {pa_cs}  (via ParaSwap/Velora)")
     print(f"  Router method: {price_route['contractMethod']} ({selector_hex})")
@@ -2348,10 +2383,12 @@ def _swap_via_paraswap(w3, acct, pa_cs, account, from_sym, to_sym, from_cfg, to_
         print("Run with --execute to broadcast (appends a fresh RedStone price payload).")
         return
 
-    feeds = prime_account_price_feeds(account)
-    for s in (from_sym, to_sym):
-        if s not in feeds:
-            feeds.append(s)
+    if not sim_ok:
+        print("✗ Refusing to broadcast: simulation reverted for both executor variants.")
+        return
+
+    # Rebuild the payload fresh for broadcast (the sim payload may be near the
+    # RedStone staleness window by now).
     payload = build_redstone_payload(feeds)
     base_calldata = account.encode_abi("paraSwapV6", args=[full[:4], data_bytes])
     data = base_calldata + payload.hex()
@@ -2544,7 +2581,8 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
 
     Default (one-tx): SwapDebtFacet.swapDebtParaSwap — borrows _borrowAmount of _toAsset,
     ParaSwaps it into _fromAsset, and repays _repayAmount of _fromAsset debt in a single tx.
-    Broken on-chain due to a protocol-level bug on the Velora/ParaSwap facet (as of 2026-05-30).
+    (Was broken on-chain 2026-05-30 by a protocol-level Velora/ParaSwap facet bug; the
+    DeltaPrime team fixed it — re-verified working via eth_call + live tx 2026-06-04.)
 
     --fallback (manual 3-tx via YieldYak):
       1. borrow to_sym  — borrow the new debt asset into the account
@@ -2766,16 +2804,40 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     _exec, _src, _dest, swap_from_amt, swap_min_out = _paraswap_decode_and_check(
         selector_hex, data_bytes, to_cfg["token"], from_cfg["token"], borrow_amount, pa_cs)
 
-    # If the ParaSwap API returned a new executor not on the DeltaPrime whitelist, patch
-    # it to EXECUTOR_3 (0x00001003…A07380A) — the only legacy executor whose calldata
-    # format is compatible with the current API's output (tested on-chain 2026-05-28).
+    # Velora/ParaSwap executors rotate per quote and the facet's on-chain executor
+    # check was fixed at the protocol level (DeltaPrime team, confirmed by eth_call
+    # 2026-06-04) — API-built calldata now passes with its own executor, while the old
+    # hard-patch to the legacy executor REVERTS (executor-specific calldata mismatch).
+    # So: simulate the exact tx first and keep the API executor when it passes; only
+    # fall back to the legacy executor if the unpatched calldata reverts.
     _PARASWAP_FALLBACK_EXECUTOR = "0x000010036C0190E009a000d0fc3541100A07380A"
-    if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
-        fallback_bytes = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:])
-        data_bytes = fallback_bytes + data_bytes[32:]
-        print(f"  ⚠ Executor {_exec} not whitelisted; patching to {_PARASWAP_FALLBACK_EXECUTOR}")
-        _paraswap_decode_and_check(selector_hex, data_bytes, to_cfg["token"], from_cfg["token"],
-                                   borrow_amount, pa_cs)
+    def _sim_swap_debt(db):
+        base = account.encode_abi("swapDebtParaSwap", args=[
+            asset_b32(from_sym), asset_b32(to_sym), repay_amount, borrow_amount,
+            full_data[:4], db])
+        try:
+            w3.eth.call({"from": acct.address, "to": pa_cs,
+                         "data": base + payload.hex(), "gas": 8000000})
+            return True, None
+        except Exception as e:
+            return False, str(e)
+    sim_ok, sim_err = _sim_swap_debt(data_bytes)
+    if sim_ok:
+        if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
+            print(f"  ✓ Executor {_exec} not in the static whitelist, but the full tx "
+                  f"simulates clean — using the API calldata as-is.")
+    else:
+        print(f"  ✗ Simulation with API executor {_exec} reverted: {sim_err}")
+        patched = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:]) + data_bytes[32:]
+        sim_ok, err2 = _sim_swap_debt(patched)
+        if sim_ok:
+            print(f"  ⚠ Falling back to legacy executor {_PARASWAP_FALLBACK_EXECUTOR} "
+                  f"(simulates clean).")
+            data_bytes = patched
+            _paraswap_decode_and_check(selector_hex, data_bytes, to_cfg["token"],
+                                       from_cfg["token"], borrow_amount, pa_cs)
+        else:
+            print(f"  ✗ Legacy-executor fallback also reverted: {err2}")
 
     from_pool, _, _ = get_pool_contract(_SYMBOL_TO_POOL[from_sym])
     borrowed = from_pool.functions.getBorrowed(pa_cs).call()
@@ -2804,6 +2866,10 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
 
     if not execute:
         print("Run with --execute to broadcast (appends a fresh RedStone price payload).")
+        return
+
+    if not sim_ok:
+        print("✗ Refusing to broadcast: simulation reverted for both executor variants.")
         return
 
     base_calldata = account.encode_abi("swapDebtParaSwap", args=[

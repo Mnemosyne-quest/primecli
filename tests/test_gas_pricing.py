@@ -1,10 +1,13 @@
 """Offline tests for `_set_gas_price_for(chain_id, w3, tx)` in deltaprime and arbprime.
 
-This helper sets gas fields for an explicit chain id (used by cross-chain flows
-like prime-bridge), so it must pick the right fee model per chain:
-  * Arbitrum (42161) / Base (8453): EIP-1559 — maxFeePerGas + maxPriorityFeePerGas,
+This helper sets gas fields for cross-chain flows (like prime-bridge). All three
+supported chains (Arbitrum 42161, Base 8453, Avalanche 43114 post-Etna) speak
+EIP-1559, so the helper now tries EIP-1559 first regardless of chain id:
+  * `eth.max_priority_fee` works → maxFeePerGas + maxPriorityFeePerGas,
     and NO legacy gasPrice.
-  * Avalanche (43114): legacy gasPrice with a 1 gwei floor (post-Etna), and NO EIP-1559 fields.
+  * `eth.max_priority_fee` raises (legacy-only chain/RPC) → legacy gasPrice with
+    a 1 gwei floor, and NO EIP-1559 fields.
+  * EIP-1559 fields already present on the tx → left untouched (stale gasPrice dropped).
 
 No RPC is made: we feed a stub w3 whose `eth.gas_price` / `eth.max_priority_fee`
 return canned values. The helper is duplicated in both modules, so both are tested.
@@ -24,7 +27,13 @@ MODULES = ["primecli.deltaprime", "primecli.arbprime"]
 class _StubEth:
     def __init__(self, gas_price, max_priority_fee):
         self.gas_price = gas_price
-        self.max_priority_fee = max_priority_fee
+        self._max_priority_fee = max_priority_fee
+
+    @property
+    def max_priority_fee(self):
+        if isinstance(self._max_priority_fee, Exception):
+            raise self._max_priority_fee
+        return self._max_priority_fee
 
 
 class _StubW3:
@@ -82,12 +91,33 @@ def test_base_sets_eip1559_no_gasprice(mod):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Avalanche (43114) — legacy gasPrice with 1 gwei floor (post-Etna ACP-125)
+# Avalanche (43114) — EIP-1559 post-Etna (ACP-125); legacy gasPrice only as fallback
 
 
-def test_avalanche_sets_legacy_gasprice_no_eip1559(mod):
-    # gas_price*2 (60 gwei) > 1 gwei floor → uses doubled value
+def test_avalanche_uses_eip1559_when_priority_fee_available(mod):
     w3 = _StubW3(gas_price=30 * GWEI, max_priority_fee=1 * GWEI)
+    tx = {"gasPrice": 1}  # stale value dropped, not added-to
+    mod._set_gas_price_for(43114, w3, tx)
+    assert "gasPrice" not in tx
+    # max(base*2, base + prio + 1gwei) = max(60, 32) = 60 gwei
+    assert tx["maxFeePerGas"] == 60 * GWEI
+    assert tx["maxPriorityFeePerGas"] == 1 * GWEI
+
+
+def test_legacy_fallback_applies_1_gwei_floor(mod):
+    # max_priority_fee unsupported (raises) → legacy gasPrice path with the 1 gwei
+    # floor: gas_price*2 (0.02 gwei, realistic post-Etna base) < 1 gwei → floor wins
+    w3 = _StubW3(gas_price=GWEI // 100, max_priority_fee=ValueError("no eip-1559"))
+    tx = {"gasPrice": 1}  # stale value replaced, not added-to
+    mod._set_gas_price_for(43114, w3, tx)
+    assert tx["gasPrice"] == 1 * GWEI
+    assert "maxFeePerGas" not in tx
+    assert "maxPriorityFeePerGas" not in tx
+
+
+def test_legacy_fallback_doubles_above_floor(mod):
+    # max_priority_fee unsupported → legacy path: gas_price*2 (60 gwei) > 1 gwei floor
+    w3 = _StubW3(gas_price=30 * GWEI, max_priority_fee=ValueError("no eip-1559"))
     tx = {}
     mod._set_gas_price_for(43114, w3, tx)
     assert tx["gasPrice"] == 60 * GWEI
@@ -95,11 +125,12 @@ def test_avalanche_sets_legacy_gasprice_no_eip1559(mod):
     assert "maxPriorityFeePerGas" not in tx
 
 
-def test_avalanche_applies_1_gwei_floor(mod):
-    # gas_price*2 (0.02 gwei, realistic post-Etna base) < 1 gwei floor → floor wins
-    w3 = _StubW3(gas_price=GWEI // 100, max_priority_fee=1 * GWEI)
-    tx = {"gasPrice": 1}  # stale value replaced, not added-to
+def test_preset_eip1559_fields_left_untouched(mod):
+    # build_transaction already set the fee fields → helper must not override them,
+    # but must still drop a stale legacy gasPrice
+    w3 = _StubW3(gas_price=30 * GWEI, max_priority_fee=1 * GWEI)
+    tx = {"maxFeePerGas": 5 * GWEI, "maxPriorityFeePerGas": 2 * GWEI, "gasPrice": 1}
     mod._set_gas_price_for(43114, w3, tx)
-    assert tx["gasPrice"] == 1 * GWEI
-    assert "maxFeePerGas" not in tx
-    assert "maxPriorityFeePerGas" not in tx
+    assert tx["maxFeePerGas"] == 5 * GWEI
+    assert tx["maxPriorityFeePerGas"] == 2 * GWEI
+    assert "gasPrice" not in tx

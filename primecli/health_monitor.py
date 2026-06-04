@@ -62,7 +62,7 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
         borrowed = g.get("borrowed", [])
         health_ratio = g.get("health_ratio", 0) or 0
         # Use precomputed health_pct from defi --json if available (primecli >= 0.5.4)
-        precomputed = g.get("health_pct") or g.get("bruno_pct")  # bruno_pct for backward compat
+        precomputed = g.get("health_pct")
         if precomputed is not None:
             # Early return: precomputed value exists, enrich with detail fields
             supplied_usd = sum(s.get("usd", 0) or 0 for s in supplied)
