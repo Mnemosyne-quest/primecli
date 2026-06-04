@@ -110,6 +110,38 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
     }
 
 
+def valuation_complete(defi_data: dict) -> tuple[bool, str]:
+    """Gate auto-actions on complete, trustworthy valuation data.
+
+    Returns (ok, reason). Auto-lever/de-lever must NEVER run on incomplete data: a
+    missing RedStone feed leaves a position unpriced, so equity/debt/health are wrong
+    and a borrow/repay sized from them is dangerous.
+
+    `defi --json` is trimmed (null/empty fields are dropped), so a position whose feed
+    was missing comes back as a row WITHOUT a `usd` key, and `solvent: None` is dropped
+    entirely. Checks: (a) top-level status == "ok", (b) no solvency_error key, (c)
+    solvent is True, (d) every supplied/borrowed row carries a usd value."""
+    if defi_data.get("status") != "ok":
+        return False, f"status={defi_data.get('status')!r}"
+    if "solvency_error" in defi_data:
+        return False, f"solvency_error={defi_data['solvency_error']!r}"
+    if defi_data.get("solvent") is not True:
+        return False, f"solvent={defi_data.get('solvent')!r}"
+    groups = defi_data.get("groups", [])
+    rows = []
+    if groups:
+        for g in groups:
+            rows.extend(g.get("supplied", []))
+            rows.extend(g.get("borrowed", []))
+    else:
+        rows.extend(defi_data.get("supplied", []))
+        rows.extend(defi_data.get("borrowed", []))
+    for r in rows:
+        if r.get("usd") is None:
+            return False, f"unpriced position: {r.get('symbol', '?')}"
+    return True, "ok"
+
+
 # ════════════════════════════════════════════════════════════════════
 # Strategy loading
 # ════════════════════════════════════════════════════════════════════
@@ -296,6 +328,23 @@ def run_tick(
 
     # 7. Rebalance mode logic
     if mode == "rebalance":
+        # Valuation gate: never auto-lever/de-lever on incomplete or untrustworthy data
+        # (missing RedStone feed → unpriced position → wrong equity/debt/health). Escalate
+        # and fall back to observe-only.
+        val_ok, val_reason = valuation_complete(defi_data)
+        if not val_ok:
+            write_escalation(state_dir, "incomplete-valuation", {
+                "reason": "incomplete_valuation",
+                "detail": val_reason,
+                "health_pct": health["bruno_pct"],
+                "equity": health["equity"],
+                "debt": health["debt_usd"],
+                "label": label,
+            })
+            result["escalation"] = "incomplete_valuation"
+            result["action"] = "observe (incomplete valuation)"
+            return result
+
         target_range = strategy.get("target_range", [30, 70])
         center = strategy.get("center", 50)
         cooldown_secs = strategy.get("cooldown_secs", 3600)

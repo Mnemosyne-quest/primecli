@@ -274,6 +274,10 @@ def resolve_private_key():
 def get_account() -> Account:
     return Account.from_key(resolve_private_key())
 
+def to_wei_units(amount, decimals):
+    """Convert a human amount to integer base units without float drift."""
+    return int(Decimal(str(amount)) * (10 ** int(decimals)))
+
 # Basescan's v1 API is deprecated (returns "switch to Etherscan API V2" since 2026),
 # and the v2 multichain endpoint (api.etherscan.io/v2/api?chainid=8453) requires an API
 # key with no anonymous reads. Rather than depend on an API key for what is a tiny,
@@ -928,7 +932,7 @@ def cmd_my_positions():
 def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
     contract, cfg, w3 = get_pool_contract(pool_name)
     acct = get_account()
-    amount_wei = int(amount * 10**cfg["decimals"])
+    amount_wei = to_wei_units(amount, cfg["decimals"])
     print(f"Wallet: {acct.address}")
 
     if not execute:
@@ -984,7 +988,7 @@ def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
     The pool also exposes withdrawNativeToken — future --native flag could opt in."""
     contract, cfg, w3 = get_pool_contract(pool_name)
     acct = get_account()
-    amount_wei = int(amount * 10**cfg["decimals"])
+    amount_wei = to_wei_units(amount, cfg["decimals"])
     print(f"Wallet: {acct.address}")
 
     if not execute:
@@ -1149,7 +1153,7 @@ def cmd_create_account(execute: bool = False, fund_pool: str = None, fund_amount
         print(f"Preview: Create a new Degen Account for {acct.address}")
         if funding:
             symbol = cfg["symbol"]
-            amount_wei = int(fund_amount * 10**cfg["decimals"])
+            amount_wei = to_wei_units(fund_amount, cfg["decimals"])
             print(f"  Factory: {FACTORY_PROXY} (SmartLoansFactory.createAndFundLoan())")
             print(f"  Approves the factory to spend {fund_amount} {symbol}, then")
             print(f"  calls createAndFundLoan(bytes32 '{symbol}', {amount_wei}) - creates + funds in one go.")
@@ -1162,7 +1166,7 @@ def cmd_create_account(execute: bool = False, fund_pool: str = None, fund_amount
 
     if funding:
         symbol = cfg["symbol"]
-        amount_wei = int(fund_amount * 10**cfg["decimals"])
+        amount_wei = to_wei_units(fund_amount, cfg["decimals"])
         token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]), abi=ERC20_ABI)
         app_tx = token.functions.approve(factory_cs, amount_wei).build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
@@ -1223,7 +1227,7 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
         return
 
     symbol = pool_to_asset_symbol(pool_name)
-    amount_wei = int(amount * 10**cfg["decimals"])
+    amount_wei = to_wei_units(amount, cfg["decimals"])
     pa_cs = Web3.to_checksum_address(pa)
 
     if not execute:
@@ -1515,7 +1519,7 @@ def cmd_borrow(pool_name: str, amount: float, execute: bool = False):
         return
 
     symbol = pool_to_asset_symbol(pool_name)
-    amount_wei = int(amount * 10**cfg["decimals"])
+    amount_wei = to_wei_units(amount, cfg["decimals"])
     if not execute:
         print(f"Preview: Borrow {amount} {symbol} into Degen Account {pa}")
         print(f"  Calls borrow(bytes32 '{symbol}', {amount_wei}) on the Degen Account")
@@ -1569,7 +1573,7 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
     pool, _, _ = get_pool_contract(pool_name)
-    requested_wei = int(amount * 10**cfg["decimals"])
+    requested_wei = to_wei_units(amount, cfg["decimals"])
     debt_wei = pool.functions.getBorrowed(pa_cs).call()
     in_acct_wei = account.functions.getBalance(asset_b32(symbol)).call()
     if debt_wei == 0:
@@ -1767,7 +1771,7 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
               "or any TokenManager-listed collateral symbol.")
         return
 
-    amount_in = int(amount * 10**from_cfg["decimals"])
+    amount_in = to_wei_units(amount, from_cfg["decimals"])
     in_balance = account.functions.getBalance(asset_b32(from_sym)).call()
     if amount_in > in_balance:
         print(f"Degen Account holds only {in_balance / 10**from_cfg['decimals']:.6f} {from_sym} "
@@ -1884,7 +1888,7 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     if borrowed == 0:
         print(f"Degen Account has no {from_sym} debt to refinance.")
         return
-    repay_amount = min(int(amount * 10**from_cfg["decimals"]), borrowed)
+    repay_amount = min(to_wei_units(amount, from_cfg["decimals"]), borrowed)
 
     feeds = degen_account_price_feeds(account)
     for s in (from_sym, to_sym):
@@ -2003,7 +2007,7 @@ def cmd_withdraw_collateral(pool_name: str, amount: float, execute: bool = False
         return
 
     symbol = pool_to_asset_symbol(pool_name)
-    amount_wei = int(amount * 10**cfg["decimals"])
+    amount_wei = to_wei_units(amount, cfg["decimals"])
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
 

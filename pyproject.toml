@@ -29,7 +29,7 @@ dependencies = [
     "web3>=7.0,<8",
     "eth-account>=0.13",
     "eth-keys>=0.5",
-    "eth-abi>=5.0",
+    "eth-abi>=5.0,<7",
     "requests>=2.31",
 ]
 

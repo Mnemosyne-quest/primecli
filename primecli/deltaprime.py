@@ -230,7 +230,7 @@ if _hm is None:
         _spec.loader.exec_module(_hm)
 health_monitor = _hm
 
-AVALANCHE_RPC = "https://api.avax.network/ext/bc/C/rpc"
+AVALANCHE_RPC = os.environ.get("DELTAPRIME_RPC", "https://api.avax.network/ext/bc/C/rpc")
 EXPLORER = "https://snowtrace.io"
 CHAIN_ID = 43114
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
@@ -241,19 +241,21 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 # Prime Account — no per-agent addresses are hardcoded.
 #
 # Key resolution order (first hit wins; see resolve_private_key):
-#   1. --as <agent> CLI flag                     -> AGENTS[<agent>]
-#   2. DELTAPRIME_PRIVATE_KEY env var            -> raw 0x… key (universal escape hatch)
-#   3. DELTAPRIME_ENV_FILE + DELTAPRIME_KEY_VAR  -> read <var> from <file>
-#   4. DELTAPRIME_AGENT env var                  -> AGENTS[<agent>]
-#   5. DEFAULT_AGENT                             -> AGENTS[DEFAULT_AGENT] (back-compat)
+#   1. --key <0xhex> CLI flag                    -> raw 0x… key (one-off escape hatch)
+#   2. --as <agent> CLI flag                     -> AGENTS[<agent>]
+#   3. DELTAPRIME_PRIVATE_KEY env var            -> raw 0x… key
+#   4. DELTAPRIME_KEY_FILE env var               -> path to a file containing the 0x key
+#   5. DELTAPRIME_ENV_FILE + DELTAPRIME_KEY_VAR  -> read <var> from <file>
+#   6. DELTAPRIME_AGENT env var                  -> AGENTS[<agent>]
+# If none resolve, fail closed (no silent default key).
 #
-# To add another wallet: add a row to AGENTS, or export DELTAPRIME_PRIVATE_KEY.
+# To add another wallet: add a row to AGENTS, export DELTAPRIME_PRIVATE_KEY, or pass --key.
 AGENTS = {
     "parakletos":   ("/root/.openclaw/.env",                "PARAKLETOS_EVM_PRIVATE_KEY"),
     "paraklaudios": ("/root/paraklaudios/.credentials.env", "PARAKLAUDIOS_EVM_PRIVATE_KEY"),
 }
-DEFAULT_AGENT = "parakletos"  # preserves original behavior when nothing else is set
 _SELECTED_AGENT = None        # set by the --as CLI flag in main()
+_CLI_KEY = None               # set by the --key CLI flag in main()
 SNOWTRACE = "https://api.snowtrace.io/api"
 FACTORY_PROXY = "0x3Ea9D480295A73fd2aF95b4D96c2afF88b21B03D"
 # On-chain registry of active pools. getPoolAddress(bytes32 asset) is the source
@@ -667,6 +669,21 @@ def _set_gas_price(w3, tx_dict):
         tx_dict["maxPriorityFeePerGas"] = prio
     else:  # Avalanche (43114) — legacy gasPrice
         tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 25 * 10**9)
+
+def _set_gas_price_for(chain_id, w3, tx_dict):
+    """Set gas fields for an EXPLICIT chain_id rather than the module CHAIN_ID. Needed by
+    cross-chain flows (prime-bridge) where a tx may target Avalanche or Arbitrum regardless
+    of which tool built it. Arbitrum/Base (EIP-1559): maxFeePerGas + maxPriorityFeePerGas;
+    Avalanche (legacy): gasPrice with a 25 gwei floor."""
+    tx_dict.pop("gasPrice", None)
+    if chain_id in (42161, 8453):  # Arbitrum, Base — EIP-1559
+        base = w3.eth.gas_price
+        prio = w3.eth.max_priority_fee
+        tx_dict["maxFeePerGas"] = max(int(base * 2), base + prio + 10**9)
+        tx_dict["maxPriorityFeePerGas"] = prio
+    else:  # Avalanche (43114) — legacy gasPrice
+        tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 25 * 10**9)
+
 def _read_env_var(path, var):
     """Return the value of `var` from a KEY=VALUE env file, or None if absent."""
     try:
@@ -691,14 +708,24 @@ def _agent_key(agent):
     return key
 
 def resolve_private_key():
-    # 1. --as <agent> CLI flag (set in main)
+    # 1. --key <0xhex> CLI flag (set in main)
+    if _CLI_KEY:
+        return _CLI_KEY.strip()
+    # 2. --as <agent> CLI flag (set in main)
     if _SELECTED_AGENT:
         return _agent_key(_SELECTED_AGENT)
-    # 2. raw key directly in the environment
+    # 3. raw key directly in the environment
     raw = os.environ.get("DELTAPRIME_PRIVATE_KEY")
     if raw:
         return raw.strip()
-    # 3. explicit env-file + var-name
+    # 4. path to a file containing the 0x key
+    key_file = os.environ.get("DELTAPRIME_KEY_FILE")
+    if key_file:
+        try:
+            return Path(key_file).read_text().strip()
+        except FileNotFoundError:
+            raise RuntimeError(f"DELTAPRIME_KEY_FILE points at {key_file} but the file does not exist.")
+    # 5. explicit env-file + var-name
     env_file = os.environ.get("DELTAPRIME_ENV_FILE")
     key_var = os.environ.get("DELTAPRIME_KEY_VAR")
     if env_file and key_var:
@@ -706,15 +733,23 @@ def resolve_private_key():
         if not key:
             raise RuntimeError(f"{key_var} not found in {env_file}.")
         return key
-    # 4. named agent in the environment
+    # 6. named agent in the environment
     agent = os.environ.get("DELTAPRIME_AGENT")
     if agent:
         return _agent_key(agent)
-    # 5. default agent (back-compat with the original Parakletos-only behavior)
-    return _agent_key(DEFAULT_AGENT)
+    # No silent default — fail closed.
+    raise RuntimeError(
+        "No signing key found. Pass --key <0xhex> or --as <agent>, or set "
+        "DELTAPRIME_PRIVATE_KEY (raw 0x... key), DELTAPRIME_KEY_FILE (path to a file "
+        "with the key), or DELTAPRIME_ENV_FILE + DELTAPRIME_KEY_VAR."
+    )
 
 def get_account() -> Account:
     return Account.from_key(resolve_private_key())
+
+def to_wei_units(amount, decimals):
+    """Convert a human amount to integer base units without float drift."""
+    return int(Decimal(str(amount)) * (10 ** int(decimals)))
 
 def fetch_json(url, params):
     r = requests.get(url, params=params, timeout=15)
@@ -1394,7 +1429,7 @@ def cmd_my_positions():
 def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
     contract, cfg, w3 = get_pool_contract(pool_name)
     acct = get_account()
-    amount_wei = int(amount * 10**cfg["decimals"])
+    amount_wei = to_wei_units(amount, cfg["decimals"])
 
     if not execute:
         print(f"Preview: Deposit {amount} {cfg['symbol']} into {pool_name.upper()} pool")
@@ -1451,7 +1486,7 @@ def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
     """
     contract, cfg, w3 = get_pool_contract(pool_name)
     acct = get_account()
-    amount_wei = int(amount * 10**cfg["decimals"])
+    amount_wei = to_wei_units(amount, cfg["decimals"])
 
     # getBalanceOf is the lender's current deposit balance — sane upper bound for
     # the intent amount. The pool reverts "Amount must be greater than zero" on 0,
@@ -1690,7 +1725,7 @@ def cmd_create_prime_account(execute: bool = False, fund_pool: str = None, fund_
         print(f"Preview: Create a new Prime Account for {acct.address}")
         if funding:
             symbol = cfg["symbol"]
-            amount_wei = int(fund_amount * 10**cfg["decimals"])
+            amount_wei = to_wei_units(fund_amount, cfg["decimals"])
             print(f"  Factory: {FACTORY_PROXY} (SmartLoansFactory.createAndFundLoan())")
             print(f"  Approves the factory to spend {fund_amount} {symbol}, then")
             print(f"  calls createAndFundLoan(bytes32 '{symbol}', {amount_wei}) — creates + funds in one go.")
@@ -1703,7 +1738,7 @@ def cmd_create_prime_account(execute: bool = False, fund_pool: str = None, fund_
 
     if funding:
         symbol = cfg["symbol"]
-        amount_wei = int(fund_amount * 10**cfg["decimals"])
+        amount_wei = to_wei_units(fund_amount, cfg["decimals"])
         # createAndFundLoan does token.transferFrom(msg.sender, factory, amount),
         # so approve the factory first.
         token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]),
@@ -1766,7 +1801,7 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
         return
 
     symbol = pool_to_asset_symbol(pool_name)
-    amount_wei = int(amount * 10**cfg["decimals"])
+    amount_wei = to_wei_units(amount, cfg["decimals"])
     pa_cs = Web3.to_checksum_address(pa)
 
     if not execute:
@@ -2000,7 +2035,7 @@ def cmd_borrow(pool_name: str, amount: float, execute: bool = False):
         return
 
     symbol = pool_to_asset_symbol(pool_name)
-    amount_wei = int(amount * 10**cfg["decimals"])
+    amount_wei = to_wei_units(amount, cfg["decimals"])
     if not execute:
         print(f"Preview: Borrow {amount} {symbol} into Prime Account {pa}")
         print(f"  Calls borrow(bytes32 '{symbol}', {amount_wei}) on the Prime Account")
@@ -2047,7 +2082,7 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     # The facet's repay reverts if amount > debt OR amount > in-account balance.
     # Cap to min(requested, debt, in_account) so callers don't need to know either
     # exact figure — pass an overshoot like 9999 and it clips cleanly.
-    requested_wei = int(amount * 10**cfg["decimals"])
+    requested_wei = to_wei_units(amount, cfg["decimals"])
     debt_wei = pool.functions.getBorrowed(pa_cs).call()
     in_acct_wei = account.functions.getBalance(asset_b32(symbol)).call()
     if debt_wei == 0:
@@ -2316,7 +2351,7 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
 
     from_cfg, to_cfg = SWAP_ASSETS[from_sym], SWAP_ASSETS[to_sym]
-    amount_in = int(amount * 10**from_cfg["decimals"])
+    amount_in = to_wei_units(amount, from_cfg["decimals"])
 
     # In-account balance check (oracle-free view).
     in_balance = account.functions.getBalance(asset_b32(from_sym)).call()
@@ -2414,7 +2449,7 @@ def _calc_swap_debt_amounts(w3, account, from_sym, to_sym, amount):
     borrowed = from_pool.functions.getBorrowed(pa_cs).call()
     if borrowed == 0:
         raise ValueError("zero_old_debt")
-    repay_amount = min(int(amount * 10**from_cfg["decimals"]), borrowed)
+    repay_amount = min(to_wei_units(amount, from_cfg["decimals"]), borrowed)
 
     # Value-match the new borrow to the repay using the facet's own RedStone prices.
     feeds = prime_account_price_feeds(account)
@@ -2768,7 +2803,7 @@ def cmd_withdraw_collateral(pool_name: str, amount: float, execute: bool = False
         return
 
     symbol = pool_to_asset_symbol(pool_name)
-    amount_wei = int(amount * 10**cfg["decimals"])
+    amount_wei = to_wei_units(amount, cfg["decimals"])
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
 
@@ -3242,7 +3277,7 @@ def cmd_gmx_deposit(market: str, amount: float, is_long: bool | None = None,
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
 
-    amount_wei = int(amount * 10**dep_cfg["decimals"])
+    amount_wei = to_wei_units(amount, dep_cfg["decimals"])
     in_balance = account.functions.getBalance(asset_b32(dep_sym)).call()
     if amount_wei > in_balance:
         print(f"Prime Account holds only {in_balance / 10**dep_cfg['decimals']:.6f} {dep_sym} "
@@ -3351,7 +3386,7 @@ def cmd_gmx_withdraw(market: str, amount: float, slippage_pct: float = 1.0,
     gm_cs = Web3.to_checksum_address(mkt["gm_token"])
     erc = json.loads('[{"inputs":[{"name":"a","type":"address"}],"name":"balanceOf","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}]')
     gm_bal = w3.eth.contract(address=gm_cs, abi=erc).functions.balanceOf(pa_cs).call()
-    gm_amount = int(amount * 10**GM_TOKEN_DECIMALS)
+    gm_amount = to_wei_units(amount, GM_TOKEN_DECIMALS)
     if gm_bal == 0:
         print(f"Prime Account holds no {mkt['gm_feed']} GM tokens — nothing to withdraw.")
         return
@@ -3679,8 +3714,8 @@ def cmd_lb_add(pair_key: str, amount_x: float, amount_y: float, shape: str = "sp
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
 
-    amount_x_wei = int(amount_x * 10**x_cfg["decimals"]) if has_x else 0
-    amount_y_wei = int(amount_y * 10**y_cfg["decimals"]) if has_y else 0
+    amount_x_wei = to_wei_units(amount_x, x_cfg["decimals"]) if has_x else 0
+    amount_y_wei = to_wei_units(amount_y, y_cfg["decimals"]) if has_y else 0
 
     # In-account balances (oracle-free), keyed by the TokenManager symbol the facet uses.
     bal_x = account.functions.getBalance(asset_b32(x_cfg["symbol"])).call()
@@ -3944,7 +3979,7 @@ def cmd_sjoe_stake(amount: float, execute: bool = False):
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
 
-    amount_wei = int(amount * 10**SJOE_JOE["decimals"])
+    amount_wei = to_wei_units(amount, SJOE_JOE["decimals"])
     in_balance = account.functions.getBalance(asset_b32(SJOE_JOE["symbol"])).call()
     print(f"sJOE stake: {amount} JOE from Prime Account {pa}")
     print(f"  In-account JOE: {in_balance / 10**SJOE_JOE['decimals']:,.6f}")
@@ -4002,7 +4037,7 @@ def cmd_sjoe_unstake(amount: float, execute: bool = False):
     if staked == 0:
         print(f"Prime Account {pa} has no staked JOE in sJOE — nothing to unstake.")
         return
-    amount_wei = int(amount * 10**SJOE_JOE["decimals"])
+    amount_wei = to_wei_units(amount, SJOE_JOE["decimals"])
     if amount_wei > staked:
         print(f"Staked balance is {staked / 10**SJOE_JOE['decimals']:,.6f} JOE; "
               f"clamping unstake to that.")
@@ -4189,7 +4224,7 @@ def cmd_prime_activate(amount: float = None, execute: bool = False):
         print(f"Prime Account {pa} is already in PREMIUM tier — nothing to do.")
         return
 
-    deposit_wei = int(amount * 10**PRIME_TOKEN["decimals"]) if amount else 0
+    deposit_wei = to_wei_units(amount, PRIME_TOKEN["decimals"]) if amount else 0
     eoa_prime = prime.functions.balanceOf(acct.address).call()
     in_acct_prime = account.functions.getBalance(asset_b32(PRIME_TOKEN["symbol"])).call()
     # depositPrime caps to the EOA balance on-chain; mirror that for an honest preview.
@@ -4297,7 +4332,7 @@ def cmd_prime_deposit(amount: float, execute: bool = False):
 
     eoa_prime = prime.functions.balanceOf(acct.address).call()
     in_acct_prime = account.functions.getBalance(asset_b32(PRIME_TOKEN["symbol"])).call()
-    deposit_wei = int(amount * 10**PRIME_TOKEN["decimals"])
+    deposit_wei = to_wei_units(amount, PRIME_TOKEN["decimals"])
     deposit_wei = min(deposit_wei, eoa_prime)  # depositPrime caps to the EOA balance on-chain
 
     print(f"PRIME deposit into Prime Account {pa}")
@@ -4428,11 +4463,11 @@ def cmd_prime_bridge(from_chain: str = "arb", amount: float = None, execute: boo
     dst_key = "arb" if src_key == "avax" else "avax"
     src_cfg = BRIDGE_CHAIN[src_key]
     dst_cfg = BRIDGE_CHAIN[dst_key]
-    wallet = Web3.to_checksum_address(acct.address if 'acct' in dir() else "0x0218f5b006FD43181018F584Ed4Be13c356b3428")
-    amount_wei = int(amount * 10**18)
+    src_chain_id = src_cfg["chain_id"]
+    amount_wei = to_wei_units(amount, 18)
 
     w3 = _bridge_w3(src_key)
-    local_acct = w3.eth.account.from_key(os.environ.get("DELTAPRIME_PRIVATE_KEY", ""))
+    local_acct = get_account()
     wallet = Web3.to_checksum_address(local_acct.address)
 
     print(f"\nPRIME Bridge: {src_key} -> {dst_key}")
@@ -4486,8 +4521,9 @@ def cmd_prime_bridge(from_chain: str = "arb", amount: float = None, execute: boo
                 {"name": "_value", "type": "uint256"}], "name": "approve",
                 "outputs": [{"name": "", "type": "bool"}], "type": "function"}]))
         atx = app_c.functions.approve(bridge_target, amount_wei).build_transaction(
-            {"from": wallet, "gas": 100000, "nonce": w3.eth.get_transaction_count(wallet)})
-        _set_gas_price(w3, atx)
+            {"from": wallet, "gas": 100000, "nonce": w3.eth.get_transaction_count(wallet),
+             "chainId": src_chain_id})
+        _set_gas_price_for(src_chain_id, w3, atx)
         signed = local_acct.sign_transaction(atx)
         w3.eth.wait_for_transaction_receipt(w3.eth.send_raw_transaction(signed.raw_transaction), timeout=120)
         import time; time.sleep(2)
@@ -4503,8 +4539,8 @@ def cmd_prime_bridge(from_chain: str = "arb", amount: float = None, execute: boo
     print(f"  sendFrom() via LayerZero...")
     tx = {"from": wallet, "to": bridge_target, "data": bytes.fromhex(calldata_hex),
           "gas": 500000, "value": native_fee,
-          "nonce": w3.eth.get_transaction_count(wallet)}
-    _set_gas_price(w3, tx)
+          "nonce": w3.eth.get_transaction_count(wallet), "chainId": src_chain_id}
+    _set_gas_price_for(src_chain_id, w3, tx)
     signed = local_acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
@@ -4531,7 +4567,7 @@ def cmd_prime_unstake(amount: float, execute: bool = False):
     if staked == 0:
         print(f"Prime Account {pa} has no staked PRIME — nothing to unstake.")
         return
-    amount_wei = int(amount * 10**PRIME_TOKEN["decimals"])
+    amount_wei = to_wei_units(amount, PRIME_TOKEN["decimals"])
     if amount_wei > staked:
         print(f"Staked PRIME is {staked / 10**PRIME_TOKEN['decimals']:,.6f}; clamping unstake to that.")
         amount_wei = staked
@@ -4578,7 +4614,7 @@ def cmd_prime_repay(amount: float, execute: bool = False):
 
     _tier, _staked, recorded_debt = account.functions.getLeverageTierFullInfo().call()
     in_acct_prime = account.functions.getBalance(asset_b32(PRIME_TOKEN["symbol"])).call()
-    amount_wei = int(amount * 10**PRIME_TOKEN["decimals"])
+    amount_wei = to_wei_units(amount, PRIME_TOKEN["decimals"])
 
     print(f"PRIME repay debt: {amount} PRIME on Prime Account {pa}")
     print(f"  Recorded PRIME debt: {recorded_debt / 10**PRIME_TOKEN['decimals']:,.6f}  "
@@ -5030,13 +5066,21 @@ def cmd_defi(as_json: bool = True):
 def main():
     args = sys.argv[1:] if len(sys.argv) > 1 else []
     # Global wallet selector: --as <agent>, stripped before command dispatch.
-    global _SELECTED_AGENT
+    global _SELECTED_AGENT, _CLI_KEY
     if "--as" in args:
         i = args.index("--as")
         if i + 1 >= len(args):
             print(f"--as requires an agent name. Known: {', '.join(AGENTS)}")
             return
         _SELECTED_AGENT = args[i + 1]
+        del args[i:i + 2]
+    # Global signing-key override: --key <0xhex>, stripped before command dispatch.
+    if "--key" in args:
+        i = args.index("--key")
+        if i + 1 >= len(args):
+            print("--key requires a hex key. Example: --key 0xabc...")
+            return
+        _CLI_KEY = args[i + 1]
         del args[i:i + 2]
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)
