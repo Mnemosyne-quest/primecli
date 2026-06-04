@@ -187,7 +187,7 @@ These are the non-obvious bits. They are the reason naïve approaches fail.
 
 7. **GMX deposit needs the FULL solvency RedStone payload (real bug, fixed 24-05-2026).** Before minting GM tokens, the deposit facet runs an inline solvency check that prices **every** debt-registry asset — the whole pool set `AVAX, USDC, BTC, ETH, USDT, EUROC`, even ones with zero balance/debt — each needing 3 unique RedStone signers in the appended payload. The tool builds the write payload from `prime_account_price_feeds(account)` + the GM feed; a missing feed reverts the deposit with `InsufficientNumberOfUniqueSigners(0,3)` (wrapped in `ProxyCalldataFailedWithCustomError`). The read path (`gmx-positions`) does NOT hit this — GM view calls skip the full solvency simulation, so a read can succeed while a naive write reverts. See §12.
 
-8. **GMX execution fee needs a gas-price floor (real bug, fixed 24-05-2026).** GMX keepers require a real execution fee (~0.08–0.19 AVAX), but Avalanche's live base fee can be ~0.01–0.02 gwei, which estimates a uselessly tiny fee the keeper rejects (the request expires and refunds without minting). The tool floors the gas price at **25 gwei** in the fee estimator so the `msg.value` clears GMX's requirement; GMX refunds the unused part to the account. The EOA must hold the execution fee up front (on top of the deposit amount and gas). See §12.
+8. **GMX execution fee needs a gas-price floor (real bug, fixed 24-05-2026).** GMX keepers require a real execution fee (~0.08–0.19 AVAX), but Avalanche's live base fee can be ~0.01–0.02 gwei, which estimates a uselessly tiny fee the keeper rejects (the request expires and refunds without minting). The tool floors the gas price at **1 gwei** in the fee estimator and pads the estimate by a buffer multiplier (2×) so the `msg.value` clears GMX's requirement even if gas rises before the keeper executes; GMX refunds the unused part to the account. The EOA must hold the execution fee up front (on top of the deposit amount and gas). See §12.
 
 ---
 
@@ -236,11 +236,13 @@ The tool is agent-agnostic: any agent (Parakletos, Paraklaudios, or another of B
 
 Key resolution order (first hit wins):
 
-1. `--as <agent>` CLI flag → looks the agent up in the built-in `AGENTS` registry.
-2. `DELTAPRIME_PRIVATE_KEY` env var → a raw `0x…` key (universal escape hatch).
-3. `DELTAPRIME_ENV_FILE` + `DELTAPRIME_KEY_VAR` env vars → read that var from that env file.
-4. `DELTAPRIME_AGENT` env var → registry lookup.
-5. `DEFAULT_AGENT` (currently `parakletos`) → back-compat when nothing is set.
+1. `--key <0xhex>` CLI flag → a raw `0x…` key (one-off escape hatch).
+2. `--as <agent>` CLI flag → looks the agent up in the built-in `AGENTS` registry.
+3. `DELTAPRIME_PRIVATE_KEY` env var → a raw `0x…` key.
+4. `DELTAPRIME_KEY_FILE` env var → a path to a file containing the `0x…` key.
+5. `DELTAPRIME_ENV_FILE` + `DELTAPRIME_KEY_VAR` env vars → read that var from that env file.
+6. `DELTAPRIME_AGENT` env var → registry lookup.
+7. Otherwise: **error**. There is no default — the tool fails closed with `No signing key found...` (see [Security](security.md)).
 
 Built-in `AGENTS` registry (in `deltaprime.py`):
 
@@ -249,7 +251,7 @@ Built-in `AGENTS` registry (in `deltaprime.py`):
 | `parakletos` | `/root/.openclaw/.env` | `PARAKLETOS_EVM_PRIVATE_KEY` |
 | `paraklaudios` | `/root/paraklaudios/.credentials.env` | `PARAKLAUDIOS_EVM_PRIVATE_KEY` |
 
-To add another of Bruno's wallets: add a row to `AGENTS`, or just export `DELTAPRIME_PRIVATE_KEY`. **Footgun:** with no selector the default is Parakletos — a non-Parakletos agent must pass `--as <agent>` (or set the env vars) or it will operate the wrong wallet. Every command prints the resolved `Wallet:` line, so the active wallet is always visible.
+The registry rows are server-specific paths from this project's own deployment; treat the table as a pattern for multi-wallet setups, not something a general install needs. To add another wallet: add a row to `AGENTS`, or just export `DELTAPRIME_PRIVATE_KEY` / point `DELTAPRIME_KEY_FILE` at a key file. Every command prints the resolved `Wallet:` line, so the active wallet is always visible.
 
 ### Commands
 
@@ -435,7 +437,7 @@ The Paraklaudios agent ran this end-to-end on its own wallet: funded 0.5 AVAX in
 
 (a) **The deposit must carry the FULL solvency RedStone payload.** Before minting, the facet runs an inline solvency check that prices **every** debt-registry asset — the whole pool set `AVAX, USDC, BTC, ETH, USDT, EUROC` — even ones with zero balance/debt, each needing 3 unique RedStone signers in the appended payload. The tool builds the write payload from `prime_account_price_feeds(account)` + the GM feed. If any required feed is missing, the deposit reverts with `InsufficientNumberOfUniqueSigners(0,3)` (wrapped in DeltaPrime's `ProxyCalldataFailedWithCustomError`). The read path (`gmx-positions`) does **not** hit this, because GM view calls skip the full solvency simulation — only the write triggers it.
 
-(b) **The execution fee needs a gas-price floor.** GMX keepers require a real execution fee (~0.08–0.19 AVAX), but Avalanche's live base fee can be ~0.01–0.02 gwei, which estimates a uselessly tiny fee the keeper would reject (the request would expire and refund without ever minting). The tool floors the gas price at **25 gwei** in the fee estimator so the `msg.value` clears GMX's requirement; GMX refunds the unused part to the account. The **EOA must hold the execution fee up front** (on top of the deposit amount and gas).
+(b) **The execution fee needs a gas-price floor.** GMX keepers require a real execution fee (~0.08–0.19 AVAX), but Avalanche's live base fee can be ~0.01–0.02 gwei, which estimates a uselessly tiny fee the keeper would reject (the request would expire and refund without ever minting). The tool floors the gas price at **1 gwei** in the fee estimator and pads the estimate by a buffer multiplier (2×) so the `msg.value` clears GMX's requirement even if gas rises before the keeper executes; GMX refunds the unused part to the account. The **EOA must hold the execution fee up front** (on top of the deposit amount and gas).
 
 ## TraderJoe V2 Liquidity Book — strategy
 

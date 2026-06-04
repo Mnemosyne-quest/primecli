@@ -152,7 +152,7 @@ Same `PrimeLeverageFacet` mechanism as Avalanche (BASIC ~5x / PREMIUM 10x; stake
 
 ## 10. Key resolution / env
 
-`ARBPRIME_PRIVATE_KEY` → `DELTAPRIME_PRIVATE_KEY` → `ARBPRIME_ENV_FILE`+`ARBPRIME_KEY_VAR` (→ `DELTAPRIME_*`) → `ARBPRIME_AGENT` → `DELTAPRIME_AGENT` → `DEFAULT_AGENT` (= `parakletos`, the original back-compat default). `--as <agent>` CLI flag beats everything. `ARBPRIME_RPC` overrides the RPC. Same EVM key works on all three chains.
+Resolution order (first hit wins): `--key <0xhex>` → `--as <agent>` → `ARBPRIME_PRIVATE_KEY` → `ARBPRIME_KEY_FILE` → `ARBPRIME_ENV_FILE`+`ARBPRIME_KEY_VAR` → `ARBPRIME_AGENT` → **error**. Each `ARBPRIME_*` env var falls back to its `DELTAPRIME_*` equivalent if unset (same EVM key works on all three chains). The `AGENTS` registry (`--as` / `*_AGENT`) holds server-specific paths from this deployment — treat it as a multi-wallet pattern, not a requirement. **There is no default agent** (0.5.0 breaking change): with nothing configured the tool fails closed with `No signing key found...`, it does not fall back to `parakletos`. `ARBPRIME_RPC` (→ `DELTAPRIME_RPC`) overrides the RPC.
 
 ## 11. Not yet tooled (live on-chain, deferred by scope)
 

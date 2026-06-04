@@ -16,13 +16,15 @@ Built for agent use:
 - RedStone-signed solvency math handled internally, with a regression test pinning the half-boundary `toFixed(8)` encoding.
 - ParaSwap calldata validated client-side against the on-chain executor allowlist before broadcast.
 
-**Current version:** 0.3.0. The 0.x line is pre-1.0, so breaking changes are possible. See [Releases](https://github.com/Mnemosyne-quest/primecli/releases).
+**Current version:** 0.5.0. The 0.x line is pre-1.0, so breaking changes are possible. See [Releases](https://github.com/Mnemosyne-quest/primecli/releases).
+
+> **Breaking change in 0.5.0:** there is no longer a default signing key. Earlier versions silently fell back to a baked-in agent when no key was configured; that fallback has been removed. With no key configured, every command now fails closed with `No signing key found...`. Set a key explicitly (see [Configuration](#configuration)).
 
 ## Security and trust
 
 **This tool moves real on-chain funds.** Read before using.
 
-- You manage your own private key. The tool reads it from `DELTAPRIME_PRIVATE_KEY` or `DEGENPRIME_PRIVATE_KEY` (or a file path you point at via `*_KEY_FILE`, or a one-shot `--key` flag). It never writes the key anywhere.
+- You manage your own private key. The tool reads it from `<TOOL>_PRIVATE_KEY` (e.g. `DELTAPRIME_PRIVATE_KEY`), or a file path you point at via `<TOOL>_KEY_FILE`, or a one-shot `--key` flag. It never writes the key anywhere. There is no default key: with nothing configured, commands fail closed.
 - Every state-changing command **previews by default**. You must pass `--execute` to broadcast. Don't pass `--execute` until you have read the preview and understand what it is about to do.
 - The RedStone payload, ParaSwap executor allowlist, and facet ABIs are pinned to specific on-chain state at the dates noted in the source. If DeltaPrime or DegenPrime upgrade their diamonds, the tool may need updating. Open an issue.
 - The DeltaPrimeLabs team is not affiliated with this project. This is community-maintained tooling.
@@ -91,7 +93,7 @@ State-changing commands preview by default. Add `--execute` to broadcast.
 |-------|----------|
 | Lending core | `pool-info [--json]`, `my-positions`, `deposit`, `withdraw` (24h delayed lender flow, step 1), `withdrawal-requests`, `execute-withdrawal-request --pool X [--index N]`, `cancel-withdrawal-request --pool X --index N`, `borrow`, `repay`, `fund` |
 | Prime Account | `create-prime-account` (alias `create-account`), `prime-summary`, `defi --json`, `withdraw-collateral`, `withdrawal-intents`, `execute-withdrawal` |
-| Swaps | `swap --from S --to S --amount N [--via yak\|paraswap] [--slippage P]` (⚠️ `--via paraswap` blocked upstream, see [issue #2](https://github.com/Mnemosyne-quest/primecli/issues/2)), `swap-debt --from S --to S --amount N [--slippage P]` (⚠️ also blocked upstream — same allowlist) |
+| Swaps | `swap --from S --to S --amount N [--via yak\|paraswap] [--slippage P]` (`--via yak` default; `--via paraswap` validates the API calldata and patches a non-whitelisted executor to a known-good one before broadcast), `swap-debt --from S --to S --amount N [--slippage P]` (same ParaSwap executor handling) |
 | GMX V2 LP (async, keeper-executed) | `gmx-positions`, `gmx-deposit --market M --amount N [--side long\|short]`, `gmx-withdraw --market M --amount N` |
 | TraderJoe V2 LB | `lb-positions`, `lb-add --pair P --amount-x N --amount-y N [--shape spot\|curve\|bidask] [--range R]`, `lb-remove --pair P` |
 | sJOE staking | `sjoe-position`, `sjoe-stake --amount N`, `sjoe-unstake --amount N`, `sjoe-claim` |
@@ -149,10 +151,13 @@ Note: DeltaPrime has TWO deployments on Arbitrum; `arbprime` targets the live on
 | `DEGENPRIME_KEY_FILE` | falls back to `DELTAPRIME_KEY_FILE` | Path to key file for Base. |
 | `DEGENPRIME_RPC` | `https://base.publicnode.com` | Base RPC. |
 | `ARBPRIME_PRIVATE_KEY` | falls back to `DELTAPRIME_PRIVATE_KEY` | Your Arbitrum signing key. Same EVM key works on all three chains. |
+| `ARBPRIME_KEY_FILE` | falls back to `DELTAPRIME_KEY_FILE` | Path to key file for Arbitrum. |
 | `ARBPRIME_AGENT` | falls back to `DELTAPRIME_AGENT` | Named-agent key selection (multi-wallet setups). |
 | `ARBPRIME_RPC` | `https://arb1.arbitrum.io/rpc` | Arbitrum One RPC. |
 
 The CLI also accepts a per-command `--key <0xhex>` override that takes precedence over all env vars. Handy for one-off operations from a shell where you don't want to persist the key.
+
+**Key resolution.** `deltaprime` and `arbprime` resolve the signing key in this order (first hit wins): `--key` > `--as <agent>` > `<TOOL>_PRIVATE_KEY` > `<TOOL>_KEY_FILE` > `<TOOL>_ENV_FILE` + `<TOOL>_KEY_VAR` > `<TOOL>_AGENT` env > error. `arbprime`'s `ARBPRIME_*` vars each fall back to the `DELTAPRIME_*` equivalent. `degenprime` is simpler — `--key` > `DEGENPRIME_PRIVATE_KEY` > `DEGENPRIME_KEY_FILE`, with `DELTAPRIME_PRIVATE_KEY` / `DELTAPRIME_KEY_FILE` as fallbacks (it has no `--as` / agent-table mechanism). If none resolve, the command exits 1 with `No signing key found...`.
 
 A copy-paste template is at [examples/env.example](examples/env.example).
 
@@ -207,6 +212,19 @@ A copy-paste template is at [examples/env.example](examples/env.example).
 | Leveraged-long zap macro | full (GM-terminal) |
 | Penpie / Beefy / Sushi facets | not yet (live on-chain; deferred by scope) |
 
+### PRIME bridge (`deltaprime` and `arbprime`)
+
+Both tools expose a `prime-bridge` subcommand that moves the PRIME token between Avalanche and Arbitrum over LayerZero's OFT:
+
+```bash
+deltaprime prime-bridge --from arb  --amount 100 [--execute]   # Arbitrum -> Avalanche
+arbprime   prime-bridge --from avax --amount 100 [--execute]   # Avalanche -> Arbitrum
+```
+
+`--from` takes `avax` or `arb` (the source chain; destination is the other one). The default `--from` differs per tool — `arb` for `deltaprime`, `avax` for `arbprime` — so always pass it explicitly. Without `--execute` it previews the LayerZero native fee, balance, and the two steps (ERC-20 approve, then `sendFrom()`); with `--execute` it broadcasts both. Gas price and `chainId` are set per the source chain.
+
+The standalone `prime-bridge.py` script that shipped earlier was removed in 0.5.0 — the subcommand is the only supported entry point.
+
 ## Documentation
 
 - [DeltaPrime reference](docs/deltaprime-reference.md): protocol model, addresses, facet map, RedStone integration, full command table, GMX / LB / PRIME flows.
@@ -221,7 +239,7 @@ A copy-paste template is at [examples/env.example](examples/env.example).
 
 1. **Preview by default.** Every state-changing command prints a structured preview and stops unless `--execute` is passed. An agent can call any command speculatively, parse the preview, decide whether to broadcast, then re-run with `--execute`.
 2. **Predictable, parseable stdout.** Read-only commands (`pool-info` (also `--json`), `my-positions`, `prime-summary`, `summary`, `withdrawal-intents`, `lb-positions`, `gmx-positions`, `aerodrome-positions`, `sjoe-position`, `prime-tier`, `defi --json`) emit fixed-format tables or JSON. `defi --json` is a one-shot full positions snapshot.
-3. **Clean failure modes.** Configuration errors do not print stack traces. A missing key prints `deltaprime: No signing key found. Set DELTAPRIME_PRIVATE_KEY ...` to stderr and exits 1.
+3. **Clean failure modes.** Configuration errors do not print stack traces. A missing key prints `deltaprime: No signing key found. Pass --key <0xhex> or --as <agent>, or set DELTAPRIME_PRIVATE_KEY ...` to stderr and exits 1.
 
 Full agent integration guide (Claude Code skill template, MCP notes, recommended guardrails): [docs/agent-integration.md](docs/agent-integration.md).
 
@@ -248,7 +266,7 @@ Common failure modes and their fixes:
 - **`RedStone gateway unreachable` on a read.** `prime-summary` / `summary` fall back to balances-only when the RedStone gateway is down. On `--execute` of a solvency-gated write, the call cannot proceed without a payload; wait and retry, or try the alternate gateway via the env override.
 - **Swap fails on-chain with `InvalidExecutor`.** ParaSwap rotated an executor that is not in the tool's mirror of the on-chain allowlist. The tool patches to a known-good fallback automatically; if reverts persist, the on-chain allowlist itself has likely rotated. Open an issue.
 - **GMX deposit reverts `InsufficientNumberOfUniqueSigners(0,3)`.** A required RedStone feed was missing from the appended payload. This was the load-bearing fix on the GMX path (24-05-2026). If you hit it on a current build, capture the tx hash and open an issue.
-- **GMX deposit accepted but no GM minted.** The execution fee was below the keeper's threshold and the request expired (refund without mint). Re-run; the tool floors gas at 25 gwei in the fee estimator to clear the keeper's bar.
+- **GMX deposit accepted but no GM minted.** The execution fee was below the keeper's threshold and the request expired (refund without mint). Re-run; the tool floors gas at 1 gwei (and pads 2×) in the fee estimator to clear the keeper's bar.
 - **`createLoan` succeeded but `getLoansForOwner` returns empty.** The factory's owner→loans map lags a beat behind the receipt. The tool polls for up to 12s; rerun `my-positions` shortly after if it timed out.
 
 If your failure is not on this list and the on-chain revert reason is opaque, capture the tx hash, the exact CLI invocation, and the preview output, and file an issue.

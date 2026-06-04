@@ -47,7 +47,7 @@ Your prompt should now show `(primecli-env)` somewhere. That means the environme
 pip install primecli
 ```
 
-That's it. You should see a bunch of dependencies installing (web3, eth-account, requests, etc.) and then a confirmation line: `Successfully installed primecli-0.2.x ...`.
+That's it. You should see a bunch of dependencies installing (web3, eth-account, requests, etc.) and then a confirmation line: `Successfully installed primecli-0.5.x ...`.
 
 Quick check that it worked:
 

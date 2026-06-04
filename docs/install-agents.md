@@ -33,20 +33,36 @@ Both should print a valid JSON object describing the USDC pool on each chain. **
 ## Configuration contract
 
 ```
-key resolution precedence (first set wins):
-  1. --key <0xhex>                       (per-command CLI flag)
-  2. DELTAPRIME_PRIVATE_KEY               (env var, raw 0x... hex)
-  3. DELTAPRIME_KEY_FILE                  (env var, path to file containing the key)
+deltaprime / arbprime key resolution precedence (first set wins):
+  1. --key <0xhex>                          (per-command CLI flag, raw 0x... hex)
+  2. --as <agent>                            (CLI flag, looks up the AGENTS table)
+  3. <TOOL>_PRIVATE_KEY                       (env var, raw 0x... hex)
+  4. <TOOL>_KEY_FILE                          (env var, path to file containing the key)
+  5. <TOOL>_ENV_FILE + <TOOL>_KEY_VAR         (env vars; read named var from named file)
+  6. <TOOL>_AGENT                             (env var, looks up the AGENTS table)
+  7. otherwise: ERROR, exit 1 (no default)
 
-degenprime falls back to DELTAPRIME_PRIVATE_KEY / DELTAPRIME_KEY_FILE when its own
-DEGENPRIME_* equivalents are unset. The same EVM key works on both chains.
+degenprime is simpler:
+  1. --key <0xhex>
+  2. DEGENPRIME_PRIVATE_KEY
+  3. DEGENPRIME_KEY_FILE
+  (no --as / AGENTS table)
+
+<TOOL> is DELTAPRIME / ARBPRIME / DEGENPRIME. arbprime's ARBPRIME_* vars each fall
+back to the DELTAPRIME_* equivalent; degenprime falls back to DELTAPRIME_PRIVATE_KEY /
+DELTAPRIME_KEY_FILE. The same EVM key works on all three chains.
 
 RPC overrides (optional, for higher throughput):
   DELTAPRIME_RPC  (defaults to https://api.avax.network/ext/bc/C/rpc)
+  ARBPRIME_RPC    (defaults to https://arb1.arbitrum.io/rpc)
   DEGENPRIME_RPC  (defaults to https://base.publicnode.com)
 ```
 
 Read-only commands work without any key. Write commands require a key.
+
+**No default key (0.5.0 breaking change).** There is no longer a baked-in default agent. If no source resolves, the tool fails closed with `No signing key found...` and exits 1 — it will never sign with a key the operator did not select. Earlier versions silently fell back to a default; that behaviour was removed.
+
+**On the `--as` / AGENTS table.** The shipped `AGENTS` table (used by `--as` and `<TOOL>_AGENT`) maps agent names to *server-specific* env-file paths from this project's own deployment. It is most useful as a pattern for a multi-wallet setup you maintain yourself. For a general agent deployment, prefer `<TOOL>_KEY_FILE` (operator points it at a 600-permission key file) or `<TOOL>_PRIVATE_KEY` (operator injects it out-of-band); don't rely on the bundled table.
 
 ## Command surface
 
@@ -67,8 +83,8 @@ Read-only commands work without any key. Write commands require a key.
 | `<tool> withdraw-collateral --pool X --amount Y [--execute]` | yes | Step 1 of delayed Prime/Degen Account collateral withdrawal (separate flow). |
 | `<tool> withdrawal-intents` | no | Lists pending Prime/Degen Account collateral intents. |
 | `<tool> execute-withdrawal --pool X [--index N] [--execute]` | yes | Step 2 of delayed collateral withdrawal. |
-| `<tool> swap --from S --to S --amount N [--via yak\|paraswap] [--slippage P] [--execute]` | yes | RedStone-gated. **`--via paraswap` is currently blocked upstream** — see [issue #2](https://github.com/Mnemosyne-quest/primecli/issues/2). Default `--via yak` works. |
-| `<tool> swap-debt --from S --to S --amount N [--slippage P] [--execute]` | yes | **Currently blocked upstream** (same allowlist as paraswap). The tool refuses cleanly. Manual fallback: `borrow → swap --via yak → repay`. See [issue #2](https://github.com/Mnemosyne-quest/primecli/issues/2). |
+| `<tool> swap --from S --to S --amount N [--via yak\|paraswap] [--slippage P] [--execute]` | yes | RedStone-gated. `--via yak` is the default. `--via paraswap` decodes and validates the API calldata; a non-whitelisted executor is patched to a known-good one and re-validated before broadcast. |
+| `<tool> swap-debt --from S --to S --amount N [--slippage P] [--execute]` | yes | RedStone-gated debt refinance. Uses the same ParaSwap path (with the executor validate-then-patch logic). `arbprime` adds `--fallback` for a manual 3-tx route via YieldYak. |
 
 Avalanche-only on top of the above: `create-prime-account`, `cmd_defi`, `gmx-*` (6 markets), `lb-*` (9 pairs), `sjoe-*`, `prime-tier` / `prime-needed` / `prime-deposit` / `prime-activate` / `prime-deactivate` / `prime-unstake` / `prime-repay`, `zap`.
 
@@ -157,7 +173,7 @@ When no Degen Account exists: `{"wallet": "...", "account": null}` (the `account
 Missing key:
 
 ```
-deltaprime: No signing key found. Set DELTAPRIME_PRIVATE_KEY (raw 0x... key) or DELTAPRIME_KEY_FILE (path to a file with the key), or pass --key <0xhex>.
+deltaprime: No signing key found. Pass --key <0xhex> or --as <agent>, or set DELTAPRIME_PRIVATE_KEY (raw 0x... key), DELTAPRIME_KEY_FILE (path to a file with the key), or DELTAPRIME_ENV_FILE + DELTAPRIME_KEY_VAR.
 ```
 
 Exit code: 1.
@@ -212,7 +228,7 @@ Drop a `SKILL.md` at `.claude/skills/deltaprime/SKILL.md` (or `degenprime/SKILL.
 
 ### Custom MCP wrapper
 
-Not shipped in v0.2.x. If you build one, please file an issue — the canonical implementation would be a few hundred lines of FastMCP exposing each command as a structured tool with JSON schemas, preserving the preview-by-default contract.
+Not shipped as of 0.5.0. If you build one, please file an issue — the canonical implementation would be a few hundred lines of FastMCP exposing each command as a structured tool with JSON schemas, preserving the preview-by-default contract.
 
 ## What this tool does NOT do
 
@@ -226,7 +242,7 @@ Not shipped in v0.2.x. If you build one, please file an issue — the canonical 
 The 0.x line is pre-1.0; minor versions may include behaviour changes. Pin to a version if your agent depends on stable output shapes:
 
 ```bash
-pip install primecli==0.2.1
+pip install primecli==0.5.0
 ```
 
 Subscribe to releases at https://github.com/Mnemosyne-quest/primecli/releases for change notifications.

@@ -1,18 +1,25 @@
 # Security model
 
-`primecli` moves real on-chain funds. Read this before using.
+`primecli` moves real on-chain funds. Read this before using. Applies to 0.5.0.
 
 This document covers: key handling, the preview-by-default model, the ParaSwap executor allowlist, the RedStone trust model, slippage caps, and what the tool does (and does not) protect against.
 
 ## Key handling
 
-The tool reads your signing key from one of three places, in this precedence:
+The tool resolves your signing key per tool, first hit wins. For `deltaprime` and `arbprime` the full order is:
 
 1. `--key <0xhex>` (CLI flag). One-off, for a single command. Best when you don't want to persist the key anywhere.
-2. `DELTAPRIME_PRIVATE_KEY` / `DEGENPRIME_PRIVATE_KEY` (env var). The standard path. The key lives in your shell environment.
-3. `DELTAPRIME_KEY_FILE` / `DEGENPRIME_KEY_FILE` (env var). Points at a file containing the key. Use this if you don't want the key in process env (so it doesn't show up under `/proc/<pid>/environ` or in `env` dumps).
+2. `--as <agent>` (CLI flag). Selects a row in the tool's `AGENTS` table (an env-file path + variable name to read the key from). The shipped table contains server-specific paths; treat it as a pattern for your own deployment rather than a default.
+3. `<TOOL>_PRIVATE_KEY` (env var, e.g. `DELTAPRIME_PRIVATE_KEY`). The standard path. The key lives in your shell environment.
+4. `<TOOL>_KEY_FILE` (env var). Points at a file containing the key. Use this if you don't want the key in process env (so it doesn't show up under `/proc/<pid>/environ` or in `env` dumps).
+5. `<TOOL>_ENV_FILE` + `<TOOL>_KEY_VAR` (env vars). Reads the named variable from the named env file.
+6. `<TOOL>_AGENT` (env var). Selects a row in `AGENTS`, same as `--as`.
 
-DegenPrime falls back to the DeltaPrime env vars when its own are not set. The same EVM key works on both chains.
+`degenprime` is simpler: `--key` > `DEGENPRIME_PRIVATE_KEY` > `DEGENPRIME_KEY_FILE` (no `--as` / agent-table mechanism).
+
+`arbprime`'s `ARBPRIME_*` vars each fall back to the `DELTAPRIME_*` equivalent, and `degenprime` falls back to `DELTAPRIME_PRIVATE_KEY` / `DELTAPRIME_KEY_FILE`. The same EVM key works on all three chains.
+
+**No default key — fail closed (0.5.0 breaking change).** If none of the sources above resolve, the command does not silently fall back to any baked-in key; it exits 1 with `No signing key found...`. Earlier versions silently used a default agent when nothing was configured. That fallback was removed as a deliberate security fix: a tool that moves funds must never sign with a key the operator did not explicitly select.
 
 **The tool never writes your key anywhere.** Treat the env var or key file as a hard secret:
 
@@ -43,7 +50,12 @@ PARASWAP_EXECUTORS = {
 }
 ```
 
-**Current status (v0.2.2, 2026-05-29) — ParaSwap path BLOCKED upstream.** The ParaSwap API now routinely emits router methods and executors that the on-chain facet does not decode or whitelist. The previous "executor patch" was always cosmetic and is removed in v0.2.2 — the tool now refuses cleanly at the entry point with a pointer to the tracking issue, rather than emit calldata that would revert on broadcast. Both `swap --via paraswap` and `swap-debt` are dead end-to-end until DeltaPrime governance refreshes `ParaSwapFacet.PARASWAP_SUPPORTED_SELECTORS` / `PARASWAP_EXECUTORS`. **Workarounds:** use `--via yak` for swaps (the default), and compose `borrow → swap --via yak → repay` manually as three txs for refinances. Tracking: https://github.com/Mnemosyne-quest/primecli/issues/2
+**What the tool does with the executor field.** Before broadcasting, the tool decodes the ParaSwap calldata client-side and mirrors the facet's `validateSwapParameters` check (`src` / `dest` / `from` / `beneficiary` / `partner` / `feeBps` all validated; the supported-selector and minimum-length checks run first). It then checks the decoded executor against the local allowlist above:
+
+- If the executor is already on the allowlist, the calldata is left untouched.
+- If it is not, the tool patches the executor field to a known-good fallback executor (`0x000010036C0190E009a000d0fc3541100A07380A`, the one legacy executor whose calldata layout matches the current API output, verified on-chain), prints a `⚠ Executor … not whitelisted; patching to …` warning, and re-runs the full validation on the patched calldata before broadcast.
+
+This applies to both `swap --via paraswap` and `swap-debt` (the same patch logic runs in both). The patch only rewrites the executor address; every other field (tokens, amounts, beneficiary, partner/fee) must still pass validation, so a swap whose other parameters don't match the request is still refused. The allowlist is enforced in the sense that an unrecognised executor is never broadcast as-is — it is either patched to a known executor or the swap is refused.
 
 ## RedStone trust model
 
@@ -85,15 +97,15 @@ The tool refuses preview when a request would exceed these caps, with a clear me
 ## What this tool DOES protect against
 
 - **Malformed ParaSwap calldata.** The tool decodes the API's calldata client-side, validates `src` / `dest` / `from` / `beneficiary` / `partner` / `feeBps` against the on-chain facet's expectations, and refuses on mismatch.
-- **Non-whitelisted ParaSwap executors / unsupported router methods.** As of v0.2.2 the tool refuses cleanly at the entry point with a pointer to https://github.com/Mnemosyne-quest/primecli/issues/2 rather than try to patch broken calldata. Use `--via yak` instead.
+- **Non-whitelisted ParaSwap executors / unsupported router methods.** Unsupported router methods are refused outright. A non-whitelisted executor is patched to a known-good executor and re-validated before broadcast (see [ParaSwap executor allowlist](#paraswap-executor-allowlist)); an unrecognised executor is never broadcast as-is.
 - **Partial repays.** `repay` auto-caps to `min(requested, current debt, in-account balance)` so an overshoot doesn't revert.
 - **Bin-cap violations.** `lb-add` previews the projected total bin count and refuses if it would exceed 80.
-- **GMX execution-fee underfunding.** The tool floors the gas price at 25 gwei when estimating the GMX execution fee, so the keeper accepts the deposit.
+- **GMX execution-fee underfunding.** The tool floors the gas price at 1 gwei when estimating the GMX execution fee and pads the estimate by a buffer multiplier, so the keeper still accepts the request if gas rises between submission and execution. GMX refunds any excess to the Prime Account.
 - **Expired withdrawal intents.** `execute-withdrawal` refuses intents that have not matured or have already expired.
 
 ## What this tool does NOT protect against
 
-- **RPC tampering.** Use a trusted RPC. The tool reads price oracles, on-chain state, and broadcasts via the configured RPC; a malicious RPC can return wrong reads, refuse to broadcast, or front-run. Default RPCs are public endpoints. Override with `DELTAPRIME_RPC` / `DEGENPRIME_RPC` to use a paid provider you trust.
+- **RPC tampering.** Use a trusted RPC. The tool reads price oracles, on-chain state, and broadcasts via the configured RPC; a malicious RPC can return wrong reads, refuse to broadcast, or front-run. Default RPCs are public endpoints. Override with `DELTAPRIME_RPC` / `ARBPRIME_RPC` / `DEGENPRIME_RPC` to use a paid provider you trust.
 - **Key compromise.** If your key leaks, your funds are gone. The tool cannot help.
 - **Smart-contract bugs in DeltaPrime or DegenPrime themselves.** The tool calls verified facets; vulnerabilities in those facets are upstream.
 - **Oracle manipulation if RedStone is compromised.** The 3-of-5 authorised signer set is the trust root. If 3 keys are compromised, the oracle is.

@@ -199,7 +199,7 @@ The tool sidesteps Basescan entirely. Proxy implementations come from the EIP-19
 
 ### 6.9 Gas-price floor
 
-Avalanche's gas-price floor in the tool is **25 gwei** (mandated by GMX's exec-fee accounting). Base has no GMX integration and no such requirement; the tool uses **`max(network_price * 2, 1 gwei)`** to keep txs from stranding when Base's ~0.001 gwei base fee ticks up after submission. Cost is negligible on Base.
+Avalanche's *transaction* gas-price floor in the tool is **25 gwei** (legacy gas pricing on the C-chain); its GMX exec-fee estimator floors at 1 gwei separately. Base has no GMX integration and no such requirement; the tool uses **`max(network_price * 2, 1 gwei)`** to keep txs from stranding when Base's ~0.001 gwei base fee ticks up after submission. Cost is negligible on Base.
 
 ### 6.10 No GMX, TraderJoe V2 LB, sJOE, Wombat, GLP, Pangolin
 
