@@ -50,6 +50,13 @@ prime-summary reports live solvency (health ratio, total value, debt, solvent fl
 SolvencyFacetProdAvalanche, read via eth_call with a RedStone price payload appended (falls
 back to balances-only if the gateway is unreachable).
 
+NOTE: prime-summary shows TWO health metrics — don't confuse them:
+  - "Health ratio (chain)":  on-chain getHealthRatio. 1.0 = liquidation, >1.0 = solvent.
+  - "Health (Bruno 0-100%)": equity-based, frontend-style. 0% = liquidation, 50% = half
+    borrowing power used, 100% = no debt.
+  Formula for the latter: equity=supplied-debt, max_debt=equity*(tier-1),
+  pct=(max_debt-debt)/max_debt*100. tier=5 (BASIC) or 10 (PREMIUM).
+
 Collateral withdrawal is a two-step, time-delayed flow on the Prime Account (there is NO
 instant withdraw of in-account collateral). The savings-pool `withdraw` above is a separate
 two-step intent flow on the pool itself, not the Prime Account. Step 1: `withdraw --pool X
@@ -658,33 +665,42 @@ def _tx_gas_price(w3) -> int:
 
 def _set_gas_price(w3, tx_dict):
     """Set appropriate gas price fields for the chain, replacing the legacy gasPrice approach.
-    On EIP-1559 chains (Arbitrum, Base): sets maxFeePerGas + maxPriorityFeePerGas with a 2x
-    base-fee hedge (base + prio + 1 gwei buffer). On Avalanche (legacy): sets gasPrice at
-    2x base fee with a 1 gwei floor. (25 gwei was the pre-Etna C-chain minimum;
-    ACP-125 (Dec 2024) lowered the min base fee to 1 nAVAX — base now sits at ~0.01
-    nAVAX, so a 25 gwei floor overpaid ~2500x and inflated the upfront balance
-    requirement past small EOAs.)"""
+    On EIP-1559 chains (Arbitrum, Base, Avalanche post-Etna): sets maxFeePerGas +
+    maxPriorityFeePerGas with a 2x base-fee hedge (base + prio + 1 gwei buffer).
+    Falls back to legacy gasPrice only if the tx dict already lacks EIP-1559 fields
+    and the chain doesn't support max_priority_fee.
+    (25 gwei was the pre-Etna C-chain minimum; ACP-125 (Dec 2024) lowered the min base
+    fee to 1 nAVAX — base now sits at ~0.01 nAVAX, so a 25 gwei floor overpaid ~2500x
+    and inflated the upfront balance requirement past small EOAs.)"""
+    # If build_transaction already set EIP-1559 fields, don't touch them
+    if "maxFeePerGas" in tx_dict or "maxPriorityFeePerGas" in tx_dict:
+        tx_dict.pop("gasPrice", None)
+        return
     tx_dict.pop("gasPrice", None)
-    if CHAIN_ID in (42161, 8453):  # Arbitrum, Base — EIP-1559
+    try:
         base = w3.eth.gas_price
         prio = w3.eth.max_priority_fee
         tx_dict["maxFeePerGas"] = max(int(base * 2), base + prio + 10**9)
         tx_dict["maxPriorityFeePerGas"] = prio
-    else:  # Avalanche (43114) — legacy gasPrice
+    except Exception:
+        # Legacy chain — use gasPrice instead
         tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 1 * 10**9)
 
 def _set_gas_price_for(chain_id, w3, tx_dict):
     """Set gas fields for an EXPLICIT chain_id rather than the module CHAIN_ID. Needed by
     cross-chain flows (prime-bridge) where a tx may target Avalanche or Arbitrum regardless
-    of which tool built it. Arbitrum/Base (EIP-1559): maxFeePerGas + maxPriorityFeePerGas;
-    Avalanche (legacy): gasPrice with a 1 gwei floor (post-Etna; see _set_gas_price)."""
+    of which tool built it."""
+    # If build_transaction already set EIP-1559 fields, don't touch them
+    if "maxFeePerGas" in tx_dict or "maxPriorityFeePerGas" in tx_dict:
+        tx_dict.pop("gasPrice", None)
+        return
     tx_dict.pop("gasPrice", None)
-    if chain_id in (42161, 8453):  # Arbitrum, Base — EIP-1559
+    try:
         base = w3.eth.gas_price
         prio = w3.eth.max_priority_fee
         tx_dict["maxFeePerGas"] = max(int(base * 2), base + prio + 10**9)
         tx_dict["maxPriorityFeePerGas"] = prio
-    else:  # Avalanche (43114) — legacy gasPrice
+    except Exception:
         tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 1 * 10**9)
 
 def _read_env_var(path, var):
@@ -1979,6 +1995,49 @@ def gather_lending(w3, account):
             r["usd"] = None
     return out
 
+def _compute_bruno_health(data: dict, tier_code: int = 0) -> dict:
+    """Compute Bruno's 0-100% health from gather_lending data + tier.
+
+    DeltaPrime has *two* health metrics that agents must not confuse:
+
+      1. health_ratio (on-chain, getHealthRatio): 1.0 = liquidation, >1.0 = solvent.
+         This is the raw weighted-collateral / debt ratio from the SolvencyFacet.
+
+      2. bruno_pct (equity-based, 0-100%): the scale used in the DeltaPrime frontend
+         and the account-health-monitor cron. 0% = liquidation, 100% = no debt.
+         Formula:
+           equity    = supplied_usd - debt_usd
+           max_mult  = 10 if PREMIUM tier else 5 if BASIC
+           max_debt  = equity * (max_mult - 1)
+           bruno_pct = (max_debt - debt_usd) / max_debt * 100
+
+    Returns dict with keys: bruno_pct, supplied_usd, debt_usd, equity, max_debt,
+    tier_label, or error.
+    """
+    supplied_usd = sum(r.get("usd", 0) or 0 for r in data.get("supplied", []))
+    debt_usd = sum(r.get("usd", 0) or 0 for r in data.get("borrowed", []))
+    equity = supplied_usd - debt_usd
+    tier_labels = {0: "BASIC", 1: "PREMIUM", 2: "_NON_EXISTENT"}
+    tier_label = tier_labels.get(tier_code, str(tier_code))
+    max_mult = {0: 5, 1: 10}.get(tier_code, 5)
+
+    if equity <= 0.01:
+        return {"bruno_pct": 0.0, "supplied_usd": round(supplied_usd, 2),
+                "debt_usd": round(debt_usd, 2), "equity": round(equity, 2),
+                "max_debt": 0.0, "tier": tier_label, "error": "equity near zero"}
+
+    max_debt = equity * (max_mult - 1)
+    if max_debt > 0 and debt_usd >= 0:
+        bruno_pct = (max_debt - min(debt_usd, max_debt)) / max_debt * 100
+        bruno_pct = max(0.0, min(100.0, bruno_pct))
+    else:
+        bruno_pct = 100.0
+
+    return {"bruno_pct": round(bruno_pct, 1), "supplied_usd": round(supplied_usd, 2),
+            "debt_usd": round(debt_usd, 2), "equity": round(equity, 2),
+            "max_debt": round(max_debt, 2), "tier": tier_label}
+
+
 def cmd_prime_summary():
     w3 = get_w3()
     acct = get_account()
@@ -2022,7 +2081,23 @@ def cmd_prime_summary():
         # gather_lending nulls the ratio when debt is negligible (the raw value is
         # astronomically large there); render that as ">1000" rather than a junk number.
         ratio_str = ">1000.00 (negligible debt)" if ratio is None else f"{ratio:.4f}"
-        print(f"  Health ratio:       {ratio_str}  (>1.0 = solvent)")
+        print(f"  Health ratio (chain): {ratio_str}  (>1.0 = solvent, 1.0 = liquidation)")
+        # ─── Bruno's 0-100% health (equity-based, uses tier multiplier) ───
+        # Different from health_ratio! See _compute_bruno_health docstring.
+        # Get tier from the Prime Account (oracle-free view)
+        try:
+            tier_info = gather_prime_tier(w3, acct, account)
+            tier_code = tier_info.get("tier_code", 0)
+        except Exception:
+            tier_code = 0
+        bh = _compute_bruno_health(data, tier_code)
+        if "error" not in bh:
+            print(f"  Health (Bruno 0-100%): {bh['bruno_pct']:.1f}%")
+            print(f"    (supplied=${bh['supplied_usd']:.2f}, debt=${bh['debt_usd']:.2f},"
+                  f" equity=${bh['equity']:.2f}, max_debt=${bh['max_debt']:.2f}, {bh['tier']})")
+            print(f"    0%=liquidation  50%=half borrowing power used  100%=no debt")
+        else:
+            print(f"  Health (Bruno 0-100%): N/A ({bh['error']})")
         print(f"  Solvent:            {'yes' if data['solvent'] else 'NO — liquidatable'}")
     else:
         print(f"  Health/solvency:    RedStone fetch/call failed ({data.get('solvency_error', 'error')}); "
@@ -4928,9 +5003,12 @@ def gather_defi() -> dict:
         result["total_usd"] = lending["total_value_usd"]
         result["health_ratio"] = lending["health_ratio"]
         result["solvent"] = lending["solvent"]
+        # Compute Bruno's 0-100% health from lending data + tier
+        result["bruno_pct"] = _compute_bruno_health(lending, tier.get("tier_code", 0)).get("bruno_pct")
         if lending["supplied"] or lending["borrowed"]:
             result["groups"].append({
                 "type": "Lending / Leverage", "health_ratio": lending["health_ratio"],
+                "bruno_pct": result["bruno_pct"],
                 "supplied": [{"symbol": r["symbol"], "balance": r["balance"], "usd": r.get("usd")}
                              for r in lending["supplied"]],
                 "borrowed": [{"symbol": r["symbol"], "balance": r["balance"], "usd": r.get("usd")}

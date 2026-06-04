@@ -39,10 +39,18 @@ TIER_MAX = {"basic": 5, "premium": 10}
 def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
     """Compute Bruno's 0-100% health scale from defi --json data.
 
+    PREFERS the precomputed ``bruno_pct`` from defi --json (which primecli now
+    includes as of 2026-06-04), falling back to manual calculation when absent.
+
     Formula:
       equity = total_supplied_usd - total_debt_usd
       max_debt = equity * (tier - 1)    # PREMIUM=10, BASIC=5
       health% = (max_debt - debt) / max_debt * 100
+
+    This is DIFFERENT from getHealthRatio (the on-chain ratio where 1.0 = liquidation).
+    Do NOT convert between the two. The ``health_ratio`` metric is the on-chain value
+    (1.0=liquidation, >1.0=solvent). The ``bruno_pct`` is the equity-based frontend
+    measurement (0%=liquidation, 50%=half borrowing power used, 100%=no debt).
 
     Returns dict with health metrics or error.
     """
@@ -53,6 +61,31 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
         supplied = g.get("supplied", [])
         borrowed = g.get("borrowed", [])
         health_ratio = g.get("health_ratio", 0) or 0
+        # Use precomputed bruno_pct from defi --json if available (primecli >= 0.5.0)
+        precomputed = g.get("bruno_pct")
+        if precomputed is not None:
+            # Early return: precomputed value exists, enrich with detail fields
+            supplied_usd = sum(s.get("usd", 0) or 0 for s in supplied)
+            debt_usd = sum(b.get("usd", 0) or 0 for b in borrowed)
+            equity = supplied_usd - debt_usd
+            raw_usdc = sum(s.get("usd", 0) for s in supplied if s.get("symbol") == "USDC")
+            symbols = [s.get("symbol", "") for s in supplied]
+            has_gmx = any("GM_" in sym for sym in symbols)
+            has_lb = any(sym in ("LB_AVAX_USDC", "LB_WAVAX_USDC", "JOE") or "TRADERJOE" in sym.upper() for sym in symbols)
+            has_aero = any("AERO" in sym.upper() or "CL_POSITION" in sym.upper() for sym in symbols)
+            return {
+                "bruno_pct": float(precomputed),
+                "health_ratio": round(health_ratio, 4),
+                "supplied_usd": round(supplied_usd, 2),
+                "debt_usd": round(debt_usd, 2),
+                "equity": round(equity, 2),
+                "max_debt": round(max(0, equity * (max_mult - 1)), 2),
+                "raw_usdc": round(raw_usdc, 2),
+                "has_gmx": has_gmx,
+                "has_lb": has_lb,
+                "has_aero": has_aero,
+                "action": "computed from defi --json bruno_pct",
+            }
     else:
         supplied = defi_data.get("supplied", [])
         borrowed = defi_data.get("borrowed", [])
