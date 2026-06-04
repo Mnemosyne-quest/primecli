@@ -4,6 +4,16 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.5.1] - 2026-06-04
+
+### Fixed
+- Avalanche legacy gas-price floor lowered from 25 gwei to 1 gwei. The 25 gwei
+  figure was the pre-Etna C-chain minimum; ACP-125 (Dec 2024) reduced the network
+  minimum base fee to 1 nAVAX (live base is ~0.01 nAVAX), so the old floor
+  overpaid ~2500x and inflated the node's upfront `gas x price + value` balance
+  check beyond small EOAs — observed blocking a GMX deposit whose actual cost was
+  well under the wallet balance.
+
 ## [0.5.0] - 2026-06-04
 
 ### Changed (BREAKING)

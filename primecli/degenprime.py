@@ -236,7 +236,10 @@ def _set_gas_price(w3, tx_dict):
     """Set appropriate gas price fields for the chain, replacing the legacy gasPrice approach.
     On EIP-1559 chains (Arbitrum, Base): sets maxFeePerGas + maxPriorityFeePerGas with a 2x
     base-fee hedge (base + prio + 1 gwei buffer). On Avalanche (legacy): sets gasPrice at
-    2x base fee with a 25 gwei floor, matching the old _tx_gas_price semantics for this chain."""
+    2x base fee with a 1 gwei floor. (25 gwei was the pre-Etna C-chain minimum;
+    ACP-125 (Dec 2024) lowered the min base fee to 1 nAVAX — base now sits at ~0.01
+    nAVAX, so a 25 gwei floor overpaid ~2500x and inflated the upfront balance
+    requirement past small EOAs.)"""
     tx_dict.pop("gasPrice", None)
     if CHAIN_ID in (42161, 8453):  # Arbitrum, Base — EIP-1559
         base = w3.eth.gas_price
@@ -244,7 +247,7 @@ def _set_gas_price(w3, tx_dict):
         tx_dict["maxFeePerGas"] = max(int(base * 2), base + prio + 10**9)
         tx_dict["maxPriorityFeePerGas"] = prio
     else:  # Avalanche (43114) — legacy gasPrice
-        tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 25 * 10**9)
+        tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 1 * 10**9)
 def resolve_private_key():
     """Resolve the signing key per the documented precedence:
        1. --key <0xhex> CLI flag

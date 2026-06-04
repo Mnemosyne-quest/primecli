@@ -4,7 +4,7 @@ This helper sets gas fields for an explicit chain id (used by cross-chain flows
 like prime-bridge), so it must pick the right fee model per chain:
   * Arbitrum (42161) / Base (8453): EIP-1559 — maxFeePerGas + maxPriorityFeePerGas,
     and NO legacy gasPrice.
-  * Avalanche (43114): legacy gasPrice with a 25 gwei floor, and NO EIP-1559 fields.
+  * Avalanche (43114): legacy gasPrice with a 1 gwei floor (post-Etna), and NO EIP-1559 fields.
 
 No RPC is made: we feed a stub w3 whose `eth.gas_price` / `eth.max_priority_fee`
 return canned values. The helper is duplicated in both modules, so both are tested.
@@ -82,11 +82,11 @@ def test_base_sets_eip1559_no_gasprice(mod):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Avalanche (43114) — legacy gasPrice with 25 gwei floor
+# Avalanche (43114) — legacy gasPrice with 1 gwei floor (post-Etna ACP-125)
 
 
 def test_avalanche_sets_legacy_gasprice_no_eip1559(mod):
-    # gas_price*2 (60 gwei) > 25 gwei floor → uses doubled value
+    # gas_price*2 (60 gwei) > 1 gwei floor → uses doubled value
     w3 = _StubW3(gas_price=30 * GWEI, max_priority_fee=1 * GWEI)
     tx = {}
     mod._set_gas_price_for(43114, w3, tx)
@@ -95,11 +95,11 @@ def test_avalanche_sets_legacy_gasprice_no_eip1559(mod):
     assert "maxPriorityFeePerGas" not in tx
 
 
-def test_avalanche_applies_25_gwei_floor(mod):
-    # gas_price*2 (10 gwei) < 25 gwei floor → floor wins
-    w3 = _StubW3(gas_price=5 * GWEI, max_priority_fee=1 * GWEI)
+def test_avalanche_applies_1_gwei_floor(mod):
+    # gas_price*2 (0.02 gwei, realistic post-Etna base) < 1 gwei floor → floor wins
+    w3 = _StubW3(gas_price=GWEI // 100, max_priority_fee=1 * GWEI)
     tx = {"gasPrice": 1}  # stale value replaced, not added-to
     mod._set_gas_price_for(43114, w3, tx)
-    assert tx["gasPrice"] == 25 * GWEI
+    assert tx["gasPrice"] == 1 * GWEI
     assert "maxFeePerGas" not in tx
     assert "maxPriorityFeePerGas" not in tx

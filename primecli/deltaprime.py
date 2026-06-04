@@ -660,7 +660,10 @@ def _set_gas_price(w3, tx_dict):
     """Set appropriate gas price fields for the chain, replacing the legacy gasPrice approach.
     On EIP-1559 chains (Arbitrum, Base): sets maxFeePerGas + maxPriorityFeePerGas with a 2x
     base-fee hedge (base + prio + 1 gwei buffer). On Avalanche (legacy): sets gasPrice at
-    2x base fee with a 25 gwei floor, matching the old _tx_gas_price semantics for this chain."""
+    2x base fee with a 1 gwei floor. (25 gwei was the pre-Etna C-chain minimum;
+    ACP-125 (Dec 2024) lowered the min base fee to 1 nAVAX — base now sits at ~0.01
+    nAVAX, so a 25 gwei floor overpaid ~2500x and inflated the upfront balance
+    requirement past small EOAs.)"""
     tx_dict.pop("gasPrice", None)
     if CHAIN_ID in (42161, 8453):  # Arbitrum, Base — EIP-1559
         base = w3.eth.gas_price
@@ -668,13 +671,13 @@ def _set_gas_price(w3, tx_dict):
         tx_dict["maxFeePerGas"] = max(int(base * 2), base + prio + 10**9)
         tx_dict["maxPriorityFeePerGas"] = prio
     else:  # Avalanche (43114) — legacy gasPrice
-        tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 25 * 10**9)
+        tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 1 * 10**9)
 
 def _set_gas_price_for(chain_id, w3, tx_dict):
     """Set gas fields for an EXPLICIT chain_id rather than the module CHAIN_ID. Needed by
     cross-chain flows (prime-bridge) where a tx may target Avalanche or Arbitrum regardless
     of which tool built it. Arbitrum/Base (EIP-1559): maxFeePerGas + maxPriorityFeePerGas;
-    Avalanche (legacy): gasPrice with a 25 gwei floor."""
+    Avalanche (legacy): gasPrice with a 1 gwei floor (post-Etna; see _set_gas_price)."""
     tx_dict.pop("gasPrice", None)
     if chain_id in (42161, 8453):  # Arbitrum, Base — EIP-1559
         base = w3.eth.gas_price
@@ -682,7 +685,7 @@ def _set_gas_price_for(chain_id, w3, tx_dict):
         tx_dict["maxFeePerGas"] = max(int(base * 2), base + prio + 10**9)
         tx_dict["maxPriorityFeePerGas"] = prio
     else:  # Avalanche (43114) — legacy gasPrice
-        tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 25 * 10**9)
+        tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 1 * 10**9)
 
 def _read_env_var(path, var):
     """Return the value of `var` from a KEY=VALUE env file, or None if absent."""
