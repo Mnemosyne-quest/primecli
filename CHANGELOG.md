@@ -4,6 +4,22 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.5.2] - 2026-06-04
+
+### Added
+- `degenprime defi` command emitting the shared cross-tool JSON shape; fixes the
+  Base health-monitor arms which called a nonexistent command. Previously
+  `health_monitor.py` invoked `<tool> defi --json` for every chain, but only
+  `deltaprime` and `arbprime` had `cmd_defi` — the DegenPrime arms returned
+  "Unknown command: defi" and never produced data. `gather_defi` reuses the
+  existing `summary` solvency machinery (now factored into `_gather_pool_deposits`
+  + `_gather_account_state`, shared by both commands) and assembles the same
+  `protocol/chain/wallet/prime_account/total_usd/health_ratio/solvent/groups/status`
+  shape as `deltaprime`, with a `Lending / Leverage` group and a `Savings` group
+  for Diamond-Hands pool deposits. Output is trimmed by a ported `_trim_defi_json`
+  (drops null/empty fields, preserves numeric 0 and boolean false). On error it
+  emits `{"status": "error", ...}` rather than raising.
+
 ## [0.5.1] - 2026-06-04
 
 ### Fixed

@@ -15,6 +15,7 @@ Usage:
   degenprime create-account [--execute]
   degenprime create-account --fund-pool usdc --fund-amount 100 [--execute]
   degenprime summary
+  degenprime defi --json          (aggregate ALL positions as DeBank-style JSON; read-only)
   degenprime fund --pool usdc --amount 100 [--execute]
   degenprime borrow --pool usdc --amount 100 [--execute]
   degenprime repay --pool usdc --amount 100 [--execute]
@@ -1293,34 +1294,10 @@ def _prices_usd(w3, account, symbols: list, payload: bytes) -> dict:
     except Exception:
         return {}
 
-def cmd_summary(as_json: bool = False):
-    """Read-only Degen Account view: in-account collateral, debts, and live
-    RedStone-gated solvency (getTotalValue/getDebt/getHealthRatio/isSolvent). Falls
-    back to balances-only if the RedStone gateway is unreachable or a view reverts.
-    Note: per-asset USD is best-effort - only symbols with a RedStone primary-prod
-    feed are priced here. Symbols sourced on-chain from BaseOracle TWAP show as
-    balance-only (the SolvencyFacet still values them for the total/debt figures).
-
-    With --json: emits a single JSON object covering wallet, account, native
-    balance, per-asset supplied/borrowed with optional USD, poolDeposits (the EOA's
-    'Diamond Hands' lending-pool balances, emitted even with no Degen Account),
-    total/debt/health-ratio/solvent flags. Null fields, empty lists, and empty dicts are dropped (same
-    trim contract as `deltaprime defi --json`). Numeric 0 and boolean false are
-    preserved.
-
-    Multicall: stage A batches getAllOwnedAssets + getDebts (2 -> 1 RPC). Stage B
-    batches one getBalance per owned asset (N -> 1 RPC). Stage C batches the four
-    RedStone-gated solvency views + getPrices (4-5 -> 1 RPC), each leg carrying the
-    same RedStone payload appended."""
-    w3 = get_w3()
-    acct = get_account()
-    pa = get_prime_account(w3, acct.address)
-    if not as_json:
-        print(f"Wallet: {acct.address}")
-
-    # Pool deposits ("Diamond Hands") are EOA balances independent of the Degen Account,
-    # so read them up front via one Multicall3 — they must surface even for a wallet with
-    # no Degen Account (e.g. a deposit made before creating one).
+def _gather_pool_deposits(w3, owner: str) -> list:
+    """The EOA's 'Diamond Hands' lending-pool balances, read independently of the Degen
+    Account via one Multicall3 (one balanceOf per pool). Surfaces even for a wallet with
+    no Degen Account. Returns [{symbol, raw, decimals}, ...] for non-zero balances."""
     pool_deposits = []
     dep_legs, dep_meta = [], []
     for _pname, _pcfg in POOLS.items():
@@ -1329,7 +1306,7 @@ def cmd_summary(as_json: bool = False):
         except Exception:
             continue
         _proxy_cs = Web3.to_checksum_address(_pcfg["proxy"])
-        dep_legs.append((_proxy_cs, bytes.fromhex(_pc.encode_abi("balanceOf", args=[acct.address])[2:])))
+        dep_legs.append((_proxy_cs, bytes.fromhex(_pc.encode_abi("balanceOf", args=[owner])[2:])))
         dep_meta.append(_pcfg)
     if dep_legs:
         try:
@@ -1340,32 +1317,21 @@ def cmd_summary(as_json: bool = False):
             _bal = w3.codec.decode(["uint256"], _rd)[0] if _ok and _rd else 0
             if _bal > 0:
                 pool_deposits.append({"symbol": _pcfg["symbol"], "raw": _bal, "decimals": _pcfg["decimals"]})
+    return pool_deposits
 
-    if not pa:
-        # No Degen Account: still surface Diamond Hands deposits (balance-only — the
-        # RedStone getPrices view lives on the Degen Account, absent here).
-        if as_json:
-            out = {"wallet": acct.address, "account": None}
-            if pool_deposits:
-                out["poolDeposits"] = [{"symbol": r["symbol"], "amount": r["raw"] / 10**r["decimals"]}
-                                       for r in pool_deposits]
-            print(json.dumps(out, indent=2))
-        else:
-            print("No Degen Account yet. Create one with: degenprime create-account --execute")
-            if pool_deposits:
-                print("  Pool Deposits (Diamond Hands):")
-                for r in pool_deposits:
-                    print(f"    {r['symbol']:<8} {r['raw'] / 10**r['decimals']:,.6f}")
-        return
 
-    pa_eth = w3.eth.get_balance(pa) / 1e18
-    if not as_json:
-        print(f"Degen Account: {pa}")
-        if pa_eth >= 1e-9:
-            print(f"  Native ETH (gas):  {pa_eth:.6f}")
+def _gather_account_state(w3, account, pool_deposits: list):
+    """Read-only collateral / debt / RedStone-gated solvency for an existing Degen Account.
+    Shared by `summary` and `defi`. Returns (pa_eth, supplied, borrowed, solvency) where
+    supplied/borrowed are [{symbol, raw, decimals}, ...] and solvency carries
+    total/debt/ratio/solvent/error/prices. pool_deposits is taken so their feeds get folded
+    into the RedStone payload (else getPrices reverts on a deposit-only symbol).
 
-    account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
+    Multicall: stage A batches getAllOwnedAssets + getDebts (2 -> 1 RPC). Stage B batches
+    one getBalance per owned asset (N -> 1 RPC). Stage C batches the four RedStone-gated
+    solvency views + getPrices (4-5 -> 1 RPC), each leg carrying the same payload appended."""
     pa_cs = account.address
+    pa_eth = w3.eth.get_balance(pa_cs) / 1e18
     stage_a_legs = [
         ("getAllOwnedAssets", ["bytes32[]"], account.encode_abi("getAllOwnedAssets", args=[])),
         ("getDebts", ["(bytes32,uint256)[]"], account.encode_abi("getDebts", args=[])),
@@ -1449,6 +1415,160 @@ def cmd_summary(as_json: bool = False):
         solvency["prices"] = prices
     except Exception as e:
         solvency["error"] = type(e).__name__
+    return pa_eth, supplied, borrowed, solvency
+
+
+def gather_defi() -> dict:
+    """Aggregate ALL DegenPrime positions for the selected wallet into one DeBank-style dict,
+    matching the cross-tool shape `deltaprime defi --json` emits. Read-only: reuses the same
+    gather helpers as `summary` (lending/solvency via the RedStone-gated views, plus the EOA's
+    own pool deposits surfaced as a Savings group). Empty groups are omitted. total_usd /
+    health_ratio / solvent come from the RedStone-gated solvency views; per-asset USD is
+    best-effort (omitted where a RedStone feed is missing). Never broadcasts."""
+    w3 = get_w3()
+    acct = get_account()
+    pa = get_prime_account(w3, acct.address)
+    result = {
+        "protocol": "DegenPrime", "url": "https://degenprime.io", "chain": "base",
+        "wallet": acct.address, "prime_account": pa,
+        "total_usd": None, "health_ratio": None, "solvent": None,
+        "groups": [], "status": "ok",
+    }
+
+    pool_deposits = _gather_pool_deposits(w3, acct.address)
+    # _gather_account_state folds pool-deposit symbols into getPrices, so this map covers
+    # both in-account assets and Diamond-Hands deposits. Empty with no Degen Account.
+    prices = {}
+
+    if pa:
+        account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
+        _pa_eth, supplied, borrowed, solvency = _gather_account_state(w3, account, pool_deposits)
+        prices = solvency["prices"]
+        result["total_usd"] = solvency["total"]
+        result["health_ratio"] = solvency["ratio"]
+        result["solvent"] = solvency["solvent"]
+        if solvency["error"]:
+            result["solvency_error"] = solvency["error"]
+
+        def _row(r):
+            amt = r["raw"] / 10**r["decimals"]
+            row = {"symbol": r["symbol"], "balance": f"{amt:.6f}"}
+            usd = prices.get(r["symbol"])
+            if usd is not None:
+                row["usd"] = round(amt * usd, 2)
+            return row
+
+        if supplied or borrowed:
+            result["groups"].append({
+                "type": "Lending / Leverage", "health_ratio": solvency["ratio"],
+                "supplied": [_row(r) for r in supplied],
+                "borrowed": [_row(r) for r in borrowed],
+            })
+
+    # Savings: the EOA's own pool deposits ("Diamond Hands"), independent of the Degen
+    # Account (so NOT in getTotalValue) — surfaced as their own group and added on top.
+    # Priced from the same RedStone read used for the account (no extra RPC).
+    if pool_deposits:
+        sav_rows, sav_usd_total = [], 0.0
+        for r in pool_deposits:
+            amt = r["raw"] / 10**r["decimals"]
+            row = {"symbol": r["symbol"], "balance": f"{amt:.6f}"}
+            usd = prices.get(r["symbol"])
+            if usd is not None:
+                row["usd"] = round(amt * usd, 2)
+                sav_usd_total += amt * usd
+            sav_rows.append(row)
+        result["groups"].append({"type": "Savings", "label": "Savings", "supplied": sav_rows})
+        if sav_usd_total:
+            result["total_usd"] = (result["total_usd"] or 0) + sav_usd_total
+
+    return result
+
+
+_DEFI_DECORATIVE_KEYS = {"url"}
+
+
+def _trim_defi_json(value):
+    """Recursively strip noise from `defi --json` output so an LLM consumer doesn't pay
+    context for fields that carry no information: drops dict keys whose value is exactly
+    None, drops keys whose value is an empty list or empty dict, drops the decorative
+    top-level `url` key, but PRESERVES numeric 0 and boolean False (zero balance,
+    explicitly-not-solvent, etc.) and keeps the top-level structure so a consumer can tell
+    what's missing from what shape the response took. Same contract as `deltaprime`'s."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if k in _DEFI_DECORATIVE_KEYS:
+                continue
+            trimmed = _trim_defi_json(v)
+            if trimmed is None:
+                continue
+            if isinstance(trimmed, (list, dict)) and len(trimmed) == 0:
+                continue
+            out[k] = trimmed
+        return out
+    if isinstance(value, list):
+        return [_trim_defi_json(v) for v in value]
+    return value
+
+
+def cmd_defi(as_json: bool = True):
+    """Aggregate all DegenPrime positions for the wallet. Default output is the DeBank-style
+    JSON (the cross-tool shape the health monitor consumes). On error, emits
+    {"status":"error", ...} rather than raising, so the caller always gets parseable JSON."""
+    try:
+        data = gather_defi()
+    except Exception as e:
+        data = {"protocol": "DegenPrime", "chain": "base",
+                "status": "error", "error": f"{type(e).__name__}: {e}"}
+    print(json.dumps(_trim_defi_json(data), indent=2))
+
+
+def cmd_summary(as_json: bool = False):
+    """Read-only Degen Account view: in-account collateral, debts, and live
+    RedStone-gated solvency (getTotalValue/getDebt/getHealthRatio/isSolvent). Falls
+    back to balances-only if the RedStone gateway is unreachable or a view reverts.
+    Note: per-asset USD is best-effort - only symbols with a RedStone primary-prod
+    feed are priced here. Symbols sourced on-chain from BaseOracle TWAP show as
+    balance-only (the SolvencyFacet still values them for the total/debt figures).
+
+    With --json: emits a single JSON object covering wallet, account, native
+    balance, per-asset supplied/borrowed with optional USD, poolDeposits (the EOA's
+    'Diamond Hands' lending-pool balances, emitted even with no Degen Account),
+    total/debt/health-ratio/solvent flags. Null fields, empty lists, and empty dicts are dropped (same
+    trim contract as `deltaprime defi --json`). Numeric 0 and boolean false are
+    preserved."""
+    w3 = get_w3()
+    acct = get_account()
+    pa = get_prime_account(w3, acct.address)
+    if not as_json:
+        print(f"Wallet: {acct.address}")
+
+    pool_deposits = _gather_pool_deposits(w3, acct.address)
+
+    if not pa:
+        # No Degen Account: still surface Diamond Hands deposits (balance-only — the
+        # RedStone getPrices view lives on the Degen Account, absent here).
+        if as_json:
+            out = {"wallet": acct.address, "account": None}
+            if pool_deposits:
+                out["poolDeposits"] = [{"symbol": r["symbol"], "amount": r["raw"] / 10**r["decimals"]}
+                                       for r in pool_deposits]
+            print(json.dumps(out, indent=2))
+        else:
+            print("No Degen Account yet. Create one with: degenprime create-account --execute")
+            if pool_deposits:
+                print("  Pool Deposits (Diamond Hands):")
+                for r in pool_deposits:
+                    print(f"    {r['symbol']:<8} {r['raw'] / 10**r['decimals']:,.6f}")
+        return
+
+    account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
+    pa_eth, supplied, borrowed, solvency = _gather_account_state(w3, account, pool_deposits)
+    if not as_json:
+        print(f"Degen Account: {pa}")
+        if pa_eth >= 1e-9:
+            print(f"  Native ETH (gas):  {pa_eth:.6f}")
 
     if as_json:
         def _asset_row(r):
@@ -2315,6 +2435,8 @@ def _dispatch():
         cmd_create_account("--execute" in args, fund_pool, fund_amount)
     elif cmd == "summary":
         cmd_summary(as_json="--json" in args)
+    elif cmd == "defi":
+        cmd_defi("--json" in args)
     elif cmd == "fund":
         pool, amount = None, None
         execute = "--execute" in args
