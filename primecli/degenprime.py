@@ -137,6 +137,42 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 # read lazily so read-only commands that don't sign never need a key at all.
 _CLI_KEY = None  # set by the --key CLI flag in main()
 
+# Named-wallet table shared with deltaprime/arbprime. Allows running via
+# DEGENPRIME_AGENT=parakletos (or the fallback DELTAPRIME_AGENT) which is
+# cleaner than passing raw keys through environment variables.
+# Agent resolution also supports --as <agent> CLI flag.
+AGENTS = {
+    "parakletos":   ("/root/.openclaw/.env",                "PARAKLETOS_EVM_PRIVATE_KEY"),
+    "paraklaudios": ("/root/paraklaudios/.credentials.env", "PARAKLAUDIOS_EVM_PRIVATE_KEY"),
+}
+_SELECTED_AGENT = None        # set by the --as CLI flag in main()
+
+
+def _read_env_var(path, var):
+    """Return the value of `var` from a KEY=VALUE env file, or None if absent."""
+    try:
+        for line in Path(path).read_text().splitlines():
+            s = line.strip()
+            if s.startswith(var + "="):
+                return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def _agent_key(agent):
+    if agent not in AGENTS:
+        raise RuntimeError(
+            f"Unknown agent '{agent}'. Known agents: {', '.join(AGENTS)}. "
+            f"Or set DEGENPRIME_PRIVATE_KEY, or DEGENPRIME_KEY_FILE."
+        )
+    path, var = AGENTS[agent]
+    key = _read_env_var(path, var)
+    if not key:
+        raise RuntimeError(f"{var} not found in {path} (agent '{agent}').")
+    return key
+
+
 # Core protocol addresses (verified on Base 2026-05-29).
 FACTORY_PROXY = "0x5A6a0e2702cF4603a098C3Df01f3F0DF56115456"  # SmartLoansFactory TUP
 # Diamond beacon. Every Degen Account is a per-user proxy that delegates here, so the
@@ -265,10 +301,13 @@ def _set_gas_price(w3, tx_dict):
 def resolve_private_key():
     """Resolve the signing key per the documented precedence:
        1. --key <0xhex> CLI flag
-       2. DEGENPRIME_PRIVATE_KEY env var
-       3. DEGENPRIME_KEY_FILE env var (path to a file containing the 0x key)
-       4. DELTAPRIME_PRIVATE_KEY / DELTAPRIME_KEY_FILE (same key, both chains)
-    Raises with a clear message if none of the four are set."""
+       2. --as <agent> CLI flag
+       3. DEGENPRIME_PRIVATE_KEY env var
+       4. DEGENPRIME_KEY_FILE env var (path to a file containing the 0x key)
+       5. DELTAPRIME_PRIVATE_KEY / DELTAPRIME_KEY_FILE (same key, both chains)
+       6. DEGENPRIME_AGENT env var
+       7. DELTAPRIME_AGENT env var (fallback)
+    Raises with a clear message if none resolve."""
     if _CLI_KEY:
         return _CLI_KEY.strip()
     for env_var in ("DEGENPRIME_PRIVATE_KEY", "DELTAPRIME_PRIVATE_KEY"):
@@ -282,6 +321,11 @@ def resolve_private_key():
                 return Path(key_file).read_text().strip()
             except FileNotFoundError:
                 raise RuntimeError(f"{path_var} points at {key_file} but the file does not exist.")
+    # Named agent via env var
+    for ag in ("DEGENPRIME_AGENT", "DELTAPRIME_AGENT"):
+        agent = os.environ.get(ag)
+        if agent:
+            return _agent_key(agent)
     raise RuntimeError(
         "No signing key found. Set DEGENPRIME_PRIVATE_KEY (raw 0x... key) or "
         "DEGENPRIME_KEY_FILE (path to a file with the key), or pass --key <0xhex>. "

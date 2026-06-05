@@ -37,22 +37,21 @@ TIER_MAX = {"basic": 5, "premium": 10}
 # ════════════════════════════════════════════════════════════════════
 
 def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
-    """Compute equity-based health (0-100%) from defi --json data.
+    """Compute health (0-100%) using the frontend formula from DeltaPrime docs.
 
-    PREFERS the precomputed ``health_pct`` from defi --json (which primecli >= 0.5.4
-    includes), falling back to manual calculation when absent.
+    Uses the cross-margin health formula (all assets assumed same borrowing power):
+      equity    = total_supplied_usd - total_debt_usd
+      health_pct = 100 * (1 - debt / (max_mult * equity))
+      (0% = liquidation, 100% = no debt)
 
-    Formula:
-      equity = total_supplied_usd - total_debt_usd
-      max_debt = equity * (tier - 1)    # PREMIUM=10, BASIC=5
-      health% = (max_debt - debt) / max_debt * 100
+    Background:
+      The frontend uses Pr = tier / (tier + 1) and computes:
+        health_pct = (Pr * supplied - debt) / (Pr * equity) * 100
+      which simplifies to: 100 * (1 - debt / (max_mult * equity)).
 
-    This is DIFFERENT from getHealthRatio (the on-chain ratio where 1.0 = liquidation).
-    Do NOT convert between the two. The ``health_ratio`` metric is the on-chain value
-    (1.0=liquidation, >1.0=solvent). The ``health_pct`` is the equity-based frontend
-    measurement (0%=liquidation, 50%=half borrowing power used, 100%=no debt).
-
-    Returns dict with health metrics or error.
+    DIFFERENT from the equity-based "health_pct" in defi --json / prime-summary
+    (which uses max_debt = equity * (tier - 1)).
+    The on-chain health_ratio (1.0=liquidation) is NOT used here.
     """
     # Parse groups (DeltaPrime format) or flat format (DegenPrime)
     groups = defi_data.get("groups", [])
@@ -64,22 +63,25 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
         # Use precomputed health_pct from defi --json if available (primecli >= 0.5.4)
         precomputed = g.get("health_pct")
         if precomputed is not None:
-            # Early return: precomputed value exists, enrich with detail fields
+            # Override health_pct with frontend formula (ignores precomputed value)
             supplied_usd = sum(s.get("usd", 0) or 0 for s in supplied)
             debt_usd = sum(b.get("usd", 0) or 0 for b in borrowed)
-            equity = supplied_usd - debt_usd
+            equity = max(supplied_usd - debt_usd, 0.01)
             raw_usdc = sum(s.get("usd", 0) for s in supplied if s.get("symbol") == "USDC")
             symbols = [s.get("symbol", "") for s in supplied]
-            has_gmx = any("GM_" in sym for sym in symbols)
+            has_gmx = sum(s.get("usd", 0) for s in supplied if "GM_" in s.get("symbol", "")) > 1.0
             has_lb = any(sym in ("LB_AVAX_USDC", "LB_WAVAX_USDC", "JOE") or "TRADERJOE" in sym.upper() for sym in symbols)
             has_aero = any("AERO" in sym.upper() or "CL_POSITION" in sym.upper() for sym in symbols)
+            # Frontend formula: health_pct = 100 * (1 - debt / (max_mult * equity))
+            fe_health = max(0.0, 100.0 * (1.0 - round(debt_usd, 2) / (max_mult * equity)))
+            fe_max_debt = round(max_mult * equity, 2)
             return {
-                "health_pct": float(precomputed),
+                "health_pct": round(fe_health, 1),
                 "health_ratio": round(health_ratio, 4),
                 "supplied_usd": round(supplied_usd, 2),
                 "debt_usd": round(debt_usd, 2),
                 "equity": round(equity, 2),
-                "max_debt": round(max(0, equity * (max_mult - 1)), 2),
+                "max_debt": round(max(0, max_mult * equity), 2),
                 "raw_usdc": round(raw_usdc, 2),
                 "has_gmx": has_gmx,
                 "has_lb": has_lb,
@@ -105,14 +107,14 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
             "error": "equity near zero",
         }
 
-    max_debt = equity * (max_mult - 1)
+    max_debt = round(max_mult * equity, 2)  # frontend formula: max debt before liquidation
 
     # Raw USDC in account
     raw_usdc = sum(s.get("usd", 0) for s in supplied if s.get("symbol") == "USDC")
 
     # Position type detection
     symbols = [s.get("symbol", "") for s in supplied]
-    has_gmx = any("GM_" in sym for sym in symbols)
+    has_gmx = sum(s.get("usd", 0) for s in supplied if "GM_" in s.get("symbol", "")) > 1.0
     has_lb = any(
         sym in ("LB_AVAX_USDC", "LB_WAVAX_USDC", "JOE")
         or "TRADERJOE" in sym.upper()
@@ -120,13 +122,13 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
     )
     has_aero = any("AERO" in sym.upper() or "CL_POSITION" in sym.upper() for sym in symbols)
 
-    if max_debt > 0 and debt_usd >= 0:
-        health_pct = (max_debt - min(debt_usd, max_debt)) / max_debt * 100
-        health_pct = max(0.0, min(100.0, health_pct))
+    if max_debt > 0.01 and debt_usd >= 0:
+        health_pct = max(0.0, 100.0 * (1.0 - round(debt_usd, 2) / max_debt))
     else:
         health_pct = 100.0
 
-    delta_debt = (max_debt * 0.5) - debt_usd  # center target = 50%
+    # Center target (50% health): target_debt = max_debt * 0.5
+    delta_debt = (max_debt * 0.5) - debt_usd
 
     return {
         "health_pct": round(health_pct, 1),
@@ -306,28 +308,32 @@ def run_tick(
             max_mult = TIER_MAX.get("basic", 5)
             tier = "basic"
         else:
-            max_mult = TIER_MAX.get("premium", 10)
-            tier = "premium"
+            max_mult = TIER_MAX.get("basic", 5)
+            tier = "basic"
     except Exception:
-        max_mult = 10
-        tier = "premium"
+        max_mult = 5
+        tier = "basic"
 
     # 3. Compute health
     health = compute_health(defi_data, max_mult)
     health["tier"] = tier
     if health.get("error") == "equity near zero":
-        write_escalation(state_dir, "equity-near-zero", {
-            "reason": "equity_near_zero",
-            "equity": health["equity"],
-            "debt": health["debt_usd"],
-            "health_pct": health["health_pct"],
-            "label": label,
-        })
+        # Only escalate if there's actual debt — an empty unfunded wallet is not an emergency
+        if health.get("debt_usd", 0) and health["debt_usd"] > 0.5:
+            write_escalation(state_dir, "equity-near-zero", {
+                "reason": "equity_near_zero",
+                "equity": health["equity"],
+                "debt": health["debt_usd"],
+                "health_pct": health["health_pct"],
+                "label": label,
+            })
+            result["mode"] = "escalated"
+        else:
+            result["action"] = "none (unfunded account)"
         result.update(health)
-        result["mode"] = "escalated"
         return result
 
-    # 4. Load strategy
+    # 4. Load strategy (position/market/side are optional hints now — auto-detected from defi_data)
     strategy = load_strategy(strategy_path)
     mode = strategy.get("mode", "observer")
     health["mode"] = mode
@@ -390,7 +396,7 @@ def run_tick(
         pct = health["health_pct"]
         equity = health["equity"]
         debt = health["debt_usd"]
-        raw_usdc = health["raw_usdc"]
+        raw_usdc = health.get("raw_usdc", 0)
 
         # ── Stop-loss: equity drawdown ──────────────────────────────
         if stop_loss_drawdown > 0:
@@ -513,32 +519,86 @@ def run_tick(
                 result["error"] = f"borrow error: {e}"
                 return result
 
-            # Deploy into GMX (default position type)
-            if position_type == "gmx":
-                try:
-                    r = subprocess.run(
-                        [sys.executable, tool_path, "gmx-deposit",
-                         "--market", market, "--amount", f"{borrow_amt:.2f}",
-                         "--side", side, "--fee-buffer", "1.5", "--execute"],
-                        capture_output=True, text=True, timeout=120,
-                    )
-                    if r.returncode == 0:
-                        cooldown_file.write_text(str(int(time.time())))
-                        result["action"] = f"borrowed ${borrow_amt:.2f} + GMX deposit"
-                    else:
-                        # Partial state: borrowed but deposit failed
-                        result["warning"] = f"borrow ok but deposit failed: {r.stderr[:200]}"
-                        result["action"] = "partial (borrowed, deposit failed)"
-                except Exception as e:
-                    result["error"] = f"gmx deposit error: {e}"
+            # Deploy into whatever positions are open (detected dynamically from defi_data)
+            has_gmx = health.get("has_gmx", False)
+            has_lb = health.get("has_lb", False)
+            has_aero = health.get("has_aero", False)
+            open_positions = []
+            if has_gmx: open_positions.append("gmx")
+            if has_lb:  open_positions.append("lb")
+            if has_aero: open_positions.append("aero")
+
+            if not open_positions:
+                # No open positions — just borrow and leave as USDC (or deploy to default)
+                result["action"] = f"borrowed ${borrow_amt:.2f} (no positions to deploy into)"
+                cooldown_file.write_text(str(int(time.time())))
             else:
-                result["action"] = f"escalate (unsupported position: {position_type})"
-                write_escalation(state_dir, "unsupported-position", {
-                    "reason": "lever_unsupported_position",
-                    "position": position_type,
-                    "borrow_amt": borrow_amt,
-                    "label": label,
-                })
+                # Split borrow amount proportionally across open positions
+                split_amt = borrow_amt / len(open_positions)
+                deployed_ok = 0
+                deployed_fail = 0
+
+                for pos_type in open_positions:
+                    if pos_type == "gmx":
+                        # Use market/side from strategy as hint, fall back to sensible defaults
+                        mkt = strategy.get("market", "avax-usdc") if tool_path else "avax-usdc"
+                        sd = strategy.get("side", "long") if tool_path else "long"
+                        try:
+                            r = subprocess.run(
+                                [sys.executable, tool_path, "gmx-deposit",
+                                 "--market", mkt, "--amount", f"{split_amt:.2f}",
+                                 "--side", sd, "--fee-buffer", "1.5", "--execute"],
+                                capture_output=True, text=True, timeout=120,
+                            )
+                            if r.returncode == 0:
+                                deployed_ok += 1
+                            else:
+                                result["warning"] = f"gmx deposit failed: {r.stderr[:200]}"
+                                deployed_fail += 1
+                        except Exception as e:
+                            result["error"] = f"gmx deposit error: {e}"
+                            deployed_fail += 1
+
+                    elif pos_type == "lb":
+                        # LB deposits: use the pool from strategy hint, default to AVAX/USDC
+                        lb_pool = strategy.get("lb_pool", "AVAX/USDC")
+                        try:
+                            r = subprocess.run(
+                                [sys.executable, tool_path, "lb-deposit",
+                                 "--pool", lb_pool, "--amount", f"{split_amt:.2f}",
+                                 "--execute"],
+                                capture_output=True, text=True, timeout=120,
+                            )
+                            if r.returncode == 0:
+                                deployed_ok += 1
+                            else:
+                                result["warning"] = f"lb deposit failed: {r.stderr[:200]}"
+                                deployed_fail += 1
+                        except Exception as e:
+                            result["error"] = f"lb deposit error: {e}"
+                            deployed_fail += 1
+
+                    elif pos_type == "aero":
+                        try:
+                            r = subprocess.run(
+                                [sys.executable, tool_path, "aerodrome-deposit",
+                                 "--amount", f"{split_amt:.2f}", "--execute"],
+                                capture_output=True, text=True, timeout=120,
+                            )
+                            if r.returncode == 0:
+                                deployed_ok += 1
+                            else:
+                                result["warning"] = f"aerodrome deposit failed: {r.stderr[:200]}"
+                                deployed_fail += 1
+                        except Exception as e:
+                            result["error"] = f"aerodrome deposit error: {e}"
+                            deployed_fail += 1
+
+                if deployed_ok > 0:
+                    cooldown_file.write_text(str(int(time.time())))
+                    result["action"] = f"borrowed ${borrow_amt:.2f}, deployed ${split_amt:.2f} to {deployed_ok} position(s)"
+                else:
+                    result["warning"] = f"borrow ok but all deposits failed" 
 
     return result
 
@@ -573,7 +633,7 @@ def cli():
             [sys.executable, tool_path, "defi", "--json"],
             capture_output=True, text=True, timeout=90,
         )
-        tier = "premium"  # default
+        tier = "basic"  # default
         try:
             t = subprocess.run(
                 [sys.executable, tool_path, "prime-tier"],
