@@ -22,6 +22,7 @@ Strategy config (JSON):
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -36,18 +37,22 @@ TIER_MAX = {"basic": 5, "premium": 10}
 # Health computation
 # ════════════════════════════════════════════════════════════════════
 
-def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
-    """Compute health (0-100%) using the frontend formula from DeltaPrime docs.
+def compute_health(
+    defi_data: dict,
+    max_mult: int = 10,
+    per_asset_powers: dict[str, int] | None = None,
+) -> dict:
+    """Compute health (0-100%) using the cross-margin formula from DeltaPrime docs.
 
-    Uses the cross-margin health formula (all assets assumed same borrowing power):
-      equity    = total_supplied_usd - total_debt_usd
+    Cross-margin formula (when per_asset_powers is provided):
+      Pr_i  = power_i / (power_i + 1)        # borrowing power ratio per asset
+      Cw_i  = supplied_usd_i x Pr_i           # weighted collateral per asset
+      Bw_i  = borrowed_usd_i x Pr_i           # weighted borrows per asset
+      H     = (SigmaCw + SigmaBw - B) / SigmaCw x 100
+
+    Falls back to the simplified uniform formula when per_asset_powers is None
+    (all assets assumed at max_mult borrowing power):
       health_pct = 100 * (1 - debt / (max_mult * equity))
-      (0% = liquidation, 100% = no debt)
-
-    Background:
-      The frontend uses Pr = tier / (tier + 1) and computes:
-        health_pct = (Pr * supplied - debt) / (Pr * equity) * 100
-      which simplifies to: 100 * (1 - debt / (max_mult * equity)).
 
     DIFFERENT from the equity-based "health_pct" in defi --json / prime-summary
     (which uses max_debt = equity * (tier - 1)).
@@ -60,34 +65,6 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
         supplied = g.get("supplied", [])
         borrowed = g.get("borrowed", [])
         health_ratio = g.get("health_ratio", 0) or 0
-        # Use precomputed health_pct from defi --json if available (primecli >= 0.5.4)
-        precomputed = g.get("health_pct")
-        if precomputed is not None:
-            # Override health_pct with frontend formula (ignores precomputed value)
-            supplied_usd = sum(s.get("usd", 0) or 0 for s in supplied)
-            debt_usd = sum(b.get("usd", 0) or 0 for b in borrowed)
-            equity = max(supplied_usd - debt_usd, 0.01)
-            raw_usdc = sum(s.get("usd", 0) for s in supplied if s.get("symbol") == "USDC")
-            symbols = [s.get("symbol", "") for s in supplied]
-            has_gmx = sum(s.get("usd", 0) for s in supplied if "GM_" in s.get("symbol", "")) > 1.0
-            has_lb = any(sym in ("LB_AVAX_USDC", "LB_WAVAX_USDC", "JOE") or "TRADERJOE" in sym.upper() for sym in symbols)
-            has_aero = any("AERO" in sym.upper() or "CL_POSITION" in sym.upper() for sym in symbols)
-            # Frontend formula: health_pct = 100 * (1 - debt / (max_mult * equity))
-            fe_health = max(0.0, 100.0 * (1.0 - round(debt_usd, 2) / (max_mult * equity)))
-            fe_max_debt = round(max_mult * equity, 2)
-            return {
-                "health_pct": round(fe_health, 1),
-                "health_ratio": round(health_ratio, 4),
-                "supplied_usd": round(supplied_usd, 2),
-                "debt_usd": round(debt_usd, 2),
-                "equity": round(equity, 2),
-                "max_debt": round(max(0, max_mult * equity), 2),
-                "raw_usdc": round(raw_usdc, 2),
-                "has_gmx": has_gmx,
-                "has_lb": has_lb,
-                "has_aero": has_aero,
-                "action": "computed from defi --json health_pct",
-            }
     else:
         supplied = defi_data.get("supplied", [])
         borrowed = defi_data.get("borrowed", [])
@@ -107,12 +84,48 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
             "error": "equity near zero",
         }
 
-    max_debt = round(max_mult * equity, 2)  # frontend formula: max debt before liquidation
+    # ── Cross-margin formula (per-asset borrowing powers) ─────────────
+    if per_asset_powers is not None:
+        powers: dict[str, int] = per_asset_powers
+        sum_cw = 0.0  # SigmaCw
+        sum_bw = 0.0  # SigmaBw
+        total_debt = 0.0
 
-    # Raw USDC in account
+        for s in supplied:
+            sym = s.get("symbol", "")
+            usd_val = s.get("usd", 0) or 0
+            p = powers.get(sym, max_mult)
+            pr = p / (p + 1)
+            sum_cw += usd_val * pr
+
+        for b in borrowed:
+            sym = b.get("symbol", "")
+            usd_val = b.get("usd", 0) or 0
+            p = powers.get(sym, max_mult)
+            pr = p / (p + 1)
+            sum_bw += usd_val * pr
+            total_debt += usd_val
+
+        if sum_cw > 0.01:
+            # H = (SigmaCw + SigmaBw - B) / SigmaCw * 100
+            health_pct = max(0.0, (sum_cw + sum_bw - total_debt) / sum_cw * 100.0)
+        else:
+            health_pct = 0.0
+
+        max_debt = round(max_mult * equity, 2)
+
+    # ── Simplified formula fallback (uniform borrowing power) ─────────
+    else:
+        max_debt = round(max_mult * equity, 2)
+
+        if max_debt > 0.01 and debt_usd >= 0:
+            health_pct = max(0.0, 100.0 * (1.0 - round(debt_usd, 2) / max_debt))
+        else:
+            health_pct = 100.0
+
+    # Common features regardless of formula variant
     raw_usdc = sum(s.get("usd", 0) for s in supplied if s.get("symbol") == "USDC")
 
-    # Position type detection
     symbols = [s.get("symbol", "") for s in supplied]
     has_gmx = sum(s.get("usd", 0) for s in supplied if "GM_" in s.get("symbol", "")) > 1.0
     has_lb = any(
@@ -121,11 +134,6 @@ def compute_health(defi_data: dict, max_mult: int = 10) -> dict:
         for sym in symbols
     )
     has_aero = any("AERO" in sym.upper() or "CL_POSITION" in sym.upper() for sym in symbols)
-
-    if max_debt > 0.01 and debt_usd >= 0:
-        health_pct = max(0.0, 100.0 * (1.0 - round(debt_usd, 2) / max_debt))
-    else:
-        health_pct = 100.0
 
     # Center target (50% health): target_debt = max_debt * 0.5
     delta_debt = (max_debt * 0.5) - debt_usd
@@ -560,12 +568,52 @@ def run_tick(
                             deployed_fail += 1
 
                     elif pos_type == "lb":
-                        # LB deposits need pair + amount-x + amount-y (not a single amount),
-                        # so just leave as USDC for now — manual deployment required.
-                        result["action"] = f"lb-add needs pair + dual amounts — leaving ${split_amt:.2f} as USDC"
+                        # Detect LB pair from defi data (look for "TraderJoe V2 LB" group)
+                        lb_pairs = []
+                        for g in defi_data.get("groups", []):
+                            if g.get("type") == "TraderJoe V2 LB":
+                                for item in g.get("items", []):
+                                    label = item.get("label", "")
+                                    m = re.match(r'\[([^\]]+)\]', label)
+                                    if m:
+                                        lb_pairs.append(m.group(1))
+
+                        # Skip if tool doesn't support lb-add (degenprime)
+                        tool_bn = os.path.basename(tool_path) if tool_path else ""
+                        if "degenprime" in tool_bn:
+                            result["action"] = f"lb-add not available on degenprime — leaving ${split_amt:.2f} as USDC"
+                            deployed_fail += 1
+                        elif not lb_pairs:
+                            result["warning"] = f"has_lb=True but no LB pair found in defi data — leaving ${split_amt:.2f} as USDC"
+                            deployed_fail += 1
+                        else:
+                            pair_key = lb_pairs[0]
+                            try:
+                                r = subprocess.run(
+                                    [sys.executable, tool_path, "lb-add",
+                                     "--pair", pair_key,
+                                     "--amount-x", "0",
+                                     "--amount-y", f"{split_amt:.2f}",
+                                     "--shape", "spot",
+                                     "--range", "15",
+                                     "--execute"],
+                                    capture_output=True, text=True, timeout=120,
+                                )
+                                if r.returncode == 0:
+                                    deployed_ok += 1
+                                else:
+                                    result["warning"] = f"lb-add failed: {r.stderr[:200]}"
+                                    deployed_fail += 1
+                            except Exception as e:
+                                result["error"] = f"lb-add error: {e}"
+                                deployed_fail += 1
 
                     elif pos_type == "aero":
-                        result["action"] = f"aero deposit not yet supported by tool — leaving ${split_amt:.2f} as USDC"
+                        # Aerodrome CL: degenprime has read-only aerodrome-positions,
+                        # but no deposit/withdraw commands yet (write paths deferred to
+                        # v2 — on-chain signatures vary by Aerodrome version).
+                        # Use `degenprime aerodrome-positions` to list your NFT tokenIds.
+                        result["action"] = f"aero deposit not yet supported (read-only via aerodrome-positions, writes deferred to v2) — leaving ${split_amt:.2f} as USDC"
 
                 if deployed_ok > 0:
                     cooldown_file.write_text(str(int(time.time())))
