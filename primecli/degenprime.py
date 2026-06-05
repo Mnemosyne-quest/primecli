@@ -310,6 +310,8 @@ def resolve_private_key():
     Raises with a clear message if none resolve."""
     if _CLI_KEY:
         return _CLI_KEY.strip()
+    if _SELECTED_AGENT:
+        return _agent_key(_SELECTED_AGENT)
     for env_var in ("DEGENPRIME_PRIVATE_KEY", "DELTAPRIME_PRIVATE_KEY"):
         raw = os.environ.get(env_var)
         if raw:
@@ -2548,13 +2550,20 @@ def main():
 def _dispatch():
     args = sys.argv[1:] if len(sys.argv) > 1 else []
     # Global signing-key override: --key <0xhex>, stripped before command dispatch.
-    global _CLI_KEY
+    global _SELECTED_AGENT, _CLI_KEY
     if "--key" in args:
         i = args.index("--key")
         if i + 1 >= len(args):
             print("--key requires a hex key. Example: --key 0xabc...")
             return
         _CLI_KEY = args[i + 1]
+        del args[i:i + 2]
+    if "--as" in args:
+        i = args.index("--as")
+        if i + 1 >= len(args):
+            print("--as requires an agent name. Example: --as parakletos")
+            return
+        _SELECTED_AGENT = args[i + 1]
         del args[i:i + 2]
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)

@@ -560,39 +560,12 @@ def run_tick(
                             deployed_fail += 1
 
                     elif pos_type == "lb":
-                        # LB deposits: use the pool from strategy hint, default to AVAX/USDC
-                        lb_pool = strategy.get("lb_pool", "AVAX/USDC")
-                        try:
-                            r = subprocess.run(
-                                [sys.executable, tool_path, "lb-deposit",
-                                 "--pool", lb_pool, "--amount", f"{split_amt:.2f}",
-                                 "--execute"],
-                                capture_output=True, text=True, timeout=120,
-                            )
-                            if r.returncode == 0:
-                                deployed_ok += 1
-                            else:
-                                result["warning"] = f"lb deposit failed: {r.stderr[:200]}"
-                                deployed_fail += 1
-                        except Exception as e:
-                            result["error"] = f"lb deposit error: {e}"
-                            deployed_fail += 1
+                        # LB deposits need pair + amount-x + amount-y (not a single amount),
+                        # so just leave as USDC for now — manual deployment required.
+                        result["action"] = f"lb-add needs pair + dual amounts — leaving ${split_amt:.2f} as USDC"
 
                     elif pos_type == "aero":
-                        try:
-                            r = subprocess.run(
-                                [sys.executable, tool_path, "aerodrome-deposit",
-                                 "--amount", f"{split_amt:.2f}", "--execute"],
-                                capture_output=True, text=True, timeout=120,
-                            )
-                            if r.returncode == 0:
-                                deployed_ok += 1
-                            else:
-                                result["warning"] = f"aerodrome deposit failed: {r.stderr[:200]}"
-                                deployed_fail += 1
-                        except Exception as e:
-                            result["error"] = f"aerodrome deposit error: {e}"
-                            deployed_fail += 1
+                        result["action"] = f"aero deposit not yet supported by tool — leaving ${split_amt:.2f} as USDC"
 
                 if deployed_ok > 0:
                     cooldown_file.write_text(str(int(time.time())))
