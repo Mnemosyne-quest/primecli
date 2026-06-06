@@ -1939,8 +1939,21 @@ def gather_lending(w3, account):
         sym = n.rstrip(b"\x00").decode(errors="replace")
         if sym and sym not in feeds:
             feeds.append(sym)
-    out = {"supplied": supplied, "borrowed": borrowed,
+    out = {"supplied": supplied, "borrowed": borrowed, "w3": w3,
            "total_value_usd": None, "debt_usd": None, "health_ratio": None, "solvent": None}
+    # Resolve the account's PRIME tier (oracle-free) and per-asset on-chain debtCoverage,
+    # then stamp dc onto every row so _compute_health_pct can run getHealthMeter exactly.
+    try:
+        tier_code = account.functions.getLeverageTierFullInfo().call()[0]
+    except Exception:
+        tier_code = 0
+    out["tier_code"] = tier_code
+    try:
+        dc_map = _resolve_debt_coverages(w3, [r["symbol"] for r in supplied + borrowed], tier_code)
+        for r in supplied + borrowed:
+            r["dc"] = dc_map.get(r["symbol"], 0.0)
+    except Exception:
+        pass
     try:
         payload = build_redstone_payload(feeds)
         payload_hex = payload.hex()
@@ -2001,46 +2014,188 @@ def gather_lending(w3, account):
             r["usd"] = None
     return out
 
+def _health_meter_pct(assets: list) -> dict:
+    """getHealthMeter() exactly as the on-chain HealthMeterFacetProd renders it.
+
+    The frontend health meter is NOT equity*(mult-1); it is a per-asset, debtCoverage-
+    weighted formula. For each asset i with USD-valued long balance and borrow, and its
+    live debtCoverage dc_i:
+
+        net_i = supplied_usd_i - borrowed_usd_i
+        weightedCollateralPlus  = Σ dc_i·net_i        for net_i > 0  (net-long legs)
+        weightedCollateralMinus = Σ dc_i·(-net_i)     for net_i < 0  (net-short legs)
+        weightedCollateral      = weightedCollateralPlus - weightedCollateralMinus
+        weightedBorrowed        = Σ dc_i·borrowed_usd_i
+        borrowed                = Σ borrowed_usd_i                    (UNWEIGHTED)
+
+        borrowed == 0                                  -> 100
+        weightedCollateral > 0 and
+          weightedCollateral + weightedBorrowed > borrowed
+            -> (weightedCollateral + weightedBorrowed - borrowed) / weightedCollateral · 100
+        else                                           -> 0
+
+    Result clamped to [0, 100]. `assets` is a list of
+    {"symbol", "dc", "supplied_usd", "borrowed_usd"}; missing usd legs count as 0.
+    For a uniform-dc single-collateral position this reduces to the familiar
+    (max_debt - debt)/max_debt·100 with max_debt = equity·dc/(1-dc).
+    """
+    wc_plus = 0.0
+    wc_minus = 0.0
+    weighted_borrowed = 0.0
+    borrowed = 0.0
+    supplied_usd = 0.0
+    debt_usd = 0.0
+    for a in assets:
+        dc = a.get("dc", 0.0) or 0.0
+        sup = a.get("supplied_usd", 0.0) or 0.0
+        bor = a.get("borrowed_usd", 0.0) or 0.0
+        supplied_usd += sup
+        debt_usd += bor
+        net = sup - bor
+        if net > 0:
+            wc_plus += dc * net
+        elif net < 0:
+            wc_minus += dc * (-net)
+        weighted_borrowed += dc * bor
+        borrowed += bor
+    weighted_collateral = wc_plus - wc_minus
+    equity = supplied_usd - debt_usd
+    if borrowed <= 0:
+        health_pct = 100.0
+    elif weighted_collateral > 0 and (weighted_collateral + weighted_borrowed) > borrowed:
+        health_pct = (weighted_collateral + weighted_borrowed - borrowed) / weighted_collateral * 100.0
+        health_pct = max(0.0, min(100.0, health_pct))
+    else:
+        health_pct = 0.0
+    return {"health_pct": round(health_pct, 1), "supplied_usd": round(supplied_usd, 2),
+            "debt_usd": round(debt_usd, 2), "equity": round(equity, 2),
+            "weighted_collateral": round(weighted_collateral, 2),
+            "weighted_borrowed": round(weighted_borrowed, 2)}
+
+
+_dc_cache = {}
+
+
+def _resolve_debt_coverages(w3, symbols: list, tier_code: int = 0) -> dict:
+    """Per-asset debtCoverage read LIVE on-chain from the TokenManager, keyed by symbol.
+
+    Resolves each symbol to its token address via getAssetAddress(bytes32,true), then reads
+    the account's effective coverage: tieredDebtCoverage(tier, token) on Avalanche/Arbitrum
+    (the contract's getHealthMeter uses getPrimeLeverageTier() for exactly this), falling
+    back to the un-tiered debtCoverage(token). Cached per run keyed by (symbol, tier_code).
+    Batched through multicall so N assets cost ~2 eth_calls, not 2N. Symbols that don't
+    resolve get dc=0 (they contribute nothing — same as the contract skipping an unpriced
+    leg)."""
+    want = [s for s in dict.fromkeys(symbols) if s]
+    out = {}
+    missing = []
+    for s in want:
+        ck = (s, tier_code)
+        if ck in _dc_cache:
+            out[s] = _dc_cache[ck]
+        else:
+            missing.append(s)
+    if not missing:
+        return out
+    tm_abi = json.loads(
+        '[{"inputs":[{"name":"_asset","type":"bytes32"},{"name":"_active","type":"bool"}],'
+        '"name":"getAssetAddress","outputs":[{"type":"address"}],"stateMutability":"view","type":"function"},'
+        '{"inputs":[{"name":"a","type":"address"}],"name":"debtCoverage","outputs":[{"type":"uint256"}],'
+        '"stateMutability":"view","type":"function"},'
+        '{"inputs":[{"name":"t","type":"uint8"},{"name":"a","type":"address"}],"name":"tieredDebtCoverage",'
+        '"outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}]')
+    tm = w3.eth.contract(address=Web3.to_checksum_address(TOKEN_MANAGER), abi=tm_abi)
+    addr_legs = [(TOKEN_MANAGER, bytes.fromhex(tm.encode_abi("getAssetAddress", args=[asset_b32(s), True])[2:]))
+                 for s in missing]
+    addr_res = multicall(w3, addr_legs)
+    addrs = {}
+    for s, (ok, rd) in zip(missing, addr_res):
+        try:
+            a = w3.codec.decode(["address"], rd)[0] if ok and rd else None
+        except Exception:
+            a = None
+        addrs[s] = a if a and int(a, 16) != 0 else None
+    resolvable = [s for s in missing if addrs[s]]
+    # Try tiered coverage first (Avalanche/Arbitrum); fall back per-asset to un-tiered.
+    tiered_legs = [(TOKEN_MANAGER, bytes.fromhex(
+        tm.encode_abi("tieredDebtCoverage", args=[tier_code, Web3.to_checksum_address(addrs[s])])[2:]))
+        for s in resolvable]
+    untiered_legs = [(TOKEN_MANAGER, bytes.fromhex(
+        tm.encode_abi("debtCoverage", args=[Web3.to_checksum_address(addrs[s])])[2:]))
+        for s in resolvable]
+    tiered_res = multicall(w3, tiered_legs) if tiered_legs else []
+    untiered_res = multicall(w3, untiered_legs) if untiered_legs else []
+    for i, s in enumerate(resolvable):
+        dc = 0.0
+        ok_t, rd_t = tiered_res[i]
+        if ok_t and rd_t:
+            try:
+                dc = w3.codec.decode(["uint256"], rd_t)[0] / 1e18
+            except Exception:
+                dc = 0.0
+        if dc <= 0:
+            ok_u, rd_u = untiered_res[i]
+            if ok_u and rd_u:
+                try:
+                    dc = w3.codec.decode(["uint256"], rd_u)[0] / 1e18
+                except Exception:
+                    dc = 0.0
+        _dc_cache[(s, tier_code)] = dc
+        out[s] = dc
+    for s in missing:
+        if s not in out:
+            _dc_cache[(s, tier_code)] = 0.0
+            out[s] = 0.0
+    return out
+
+
 def _compute_health_pct(data: dict, tier_code: int = 0) -> dict:
-    """Compute equity-based health (0-100%) from gather_lending data + tier.
+    """Frontend-exact health (0-100%) for a Prime Account — wraps _health_meter_pct with
+    on-chain debtCoverage resolution and the tier label.
 
     DeltaPrime has *two* health metrics that agents must not confuse:
 
       1. health_ratio (on-chain, getHealthRatio): 1.0 = liquidation, >1.0 = solvent.
-         This is the raw weighted-collateral / debt ratio from the SolvencyFacet.
+         The raw weighted-collateral / debt ratio from the SolvencyFacet.
 
-      2. health_pct (equity-based, 0-100%): the scale used in the DeltaPrime frontend
-         and the account-health-monitor cron. 0% = liquidation, 100% = no debt.
-         Formula:
-           equity    = supplied_usd - debt_usd
-           max_mult  = 10 if PREMIUM tier else 5 if BASIC
-           max_debt  = equity * (max_mult - 1)
-           health_pct = (max_debt - debt_usd) / max_debt * 100
+      2. health_pct (0-100%, getHealthMeter): the scale the DeltaPrime frontend renders
+         and the account-health-monitor cron acts on. 0% = liquidation, 100% = no debt.
+         Computed by _health_meter_pct with per-asset dc from tieredDebtCoverage at the
+         account's PRIME tier — NOT the old equity*(mult-1) approximation.
 
-    Returns dict with keys: health_pct, supplied_usd, debt_usd, equity, max_debt,
-    tier_label, or error.
+    Per-asset USD comes from gather_lending (rows carry `dc` once resolved); if a row has
+    no `dc` key yet it is resolved here from `data["w3"]` when present. Returns
+    health_pct, supplied_usd, debt_usd, equity, max_debt (display zero-crossing debt),
+    tier, or error.
     """
-    supplied_usd = sum(r.get("usd", 0) or 0 for r in data.get("supplied", []))
-    debt_usd = sum(r.get("usd", 0) or 0 for r in data.get("borrowed", []))
-    equity = supplied_usd - debt_usd
+    supplied = data.get("supplied", [])
+    borrowed = data.get("borrowed", [])
     tier_labels = {0: "BASIC", 1: "PREMIUM", 2: "_NON_EXISTENT"}
     tier_label = tier_labels.get(tier_code, str(tier_code))
-    max_mult = {0: 5, 1: 10}.get(tier_code, 5)
-
+    # Per-symbol long/short USD, merging an asset that is both supplied and borrowed.
+    syms = list(dict.fromkeys([r["symbol"] for r in supplied + borrowed if r.get("symbol")]))
+    dc_map = {r["symbol"]: r["dc"] for r in supplied + borrowed if r.get("dc") is not None}
+    need = [s for s in syms if s not in dc_map]
+    if need and data.get("w3") is not None:
+        dc_map.update(_resolve_debt_coverages(data["w3"], need, tier_code))
+    assets = []
+    for s in syms:
+        sup = sum(r.get("usd", 0) or 0 for r in supplied if r.get("symbol") == s)
+        bor = sum(r.get("usd", 0) or 0 for r in borrowed if r.get("symbol") == s)
+        assets.append({"symbol": s, "dc": dc_map.get(s, 0.0), "supplied_usd": sup, "borrowed_usd": bor})
+    res = _health_meter_pct(assets)
+    equity = res["equity"]
     if equity <= 0.01:
-        return {"health_pct": 0.0, "supplied_usd": round(supplied_usd, 2),
-                "debt_usd": round(debt_usd, 2), "equity": round(equity, 2),
+        return {"health_pct": 0.0, "supplied_usd": res["supplied_usd"],
+                "debt_usd": res["debt_usd"], "equity": equity,
                 "max_debt": 0.0, "tier": tier_label, "error": "equity near zero"}
-
-    max_debt = equity * (max_mult - 1)
-    if max_debt > 0 and debt_usd >= 0:
-        health_pct = (max_debt - min(debt_usd, max_debt)) / max_debt * 100
-        health_pct = max(0.0, min(100.0, health_pct))
-    else:
-        health_pct = 100.0
-
-    return {"health_pct": round(health_pct, 1), "supplied_usd": round(supplied_usd, 2),
-            "debt_usd": round(debt_usd, 2), "equity": round(equity, 2),
+    # Display-only zero-crossing debt: the unweighted borrow at which health hits 0,
+    # equity·dc_eff/(1-dc_eff) for the position's value-weighted collateral dc.
+    coll_usd = sum(a["supplied_usd"] for a in assets) or 0.0
+    dc_eff = (sum(a["dc"] * a["supplied_usd"] for a in assets) / coll_usd) if coll_usd > 0 else 0.0
+    max_debt = equity * dc_eff / (1.0 - dc_eff) if 0 < dc_eff < 1 else 0.0
+    return {"health_pct": res["health_pct"], "supplied_usd": res["supplied_usd"],
+            "debt_usd": res["debt_usd"], "equity": equity,
             "max_debt": round(max_debt, 2), "tier": tier_label}
 
 
@@ -2166,21 +2321,32 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     # The facet's repay reverts if amount > debt OR amount > in-account balance.
     # Cap to min(requested, debt, in_account) so callers don't need to know either
     # exact figure — pass an overshoot like 9999 and it clips cleanly.
+    # ALSO: the contract's _getAvailableBalance() subtracts pending withdrawal intents,
+    # so we subtract total_intent from the raw balance to get the true cap.
     requested_wei = to_wei_units(amount, cfg["decimals"])
     debt_wei = pool.functions.getBorrowed(pa_cs).call()
     in_acct_wei = account.functions.getBalance(asset_b32(symbol)).call()
+    try:
+        total_intent_wei = account.functions.getTotalIntentAmount(asset_b32(symbol)).call()
+    except Exception:
+        total_intent_wei = 0
+    available_wei = in_acct_wei - total_intent_wei if in_acct_wei > total_intent_wei else 0
     if debt_wei == 0:
         print(f"No {symbol} debt to repay on Prime Account {pa}.")
         return
-    amount_wei = min(requested_wei, debt_wei, in_acct_wei)
+    amount_wei = min(requested_wei, debt_wei, available_wei)
     if amount_wei == 0:
-        print(f"Repay {amount} {symbol}: in-account {symbol} balance is 0 — "
-              f"swap into {symbol} first (e.g. deltaprime.py swap --to {symbol} --amount N --execute).")
+        print(f"Repay {amount} {symbol}: available {symbol} balance is 0 "
+              f"(total {in_acct_wei / 10**cfg['decimals']:.6f} minus "
+              f"{total_intent_wei / 10**cfg['decimals']:.6f} pending withdrawal intent) — "
+              f"swap into {symbol} first or wait for intents to mature.")
         return
     cap_notes = []
     if amount_wei < requested_wei:
-        if in_acct_wei < min(requested_wei, debt_wei):
-            cap_notes.append(f"in-account {symbol} only {in_acct_wei / 10**cfg['decimals']:.6f}")
+        if available_wei < min(requested_wei, debt_wei):
+            cap_notes.append(f"available {symbol} only {available_wei / 10**cfg['decimals']:.6f} "
+                             f"(total {in_acct_wei / 10**cfg['decimals']:.6f} minus "
+                             f"{total_intent_wei / 10**cfg['decimals']:.6f} pending intent)")
         if debt_wei < requested_wei:
             cap_notes.append(f"debt only {debt_wei / 10**cfg['decimals']:.6f} {symbol}")
 
@@ -2190,11 +2356,15 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
             print(f"  Capped from requested {amount}: {'; '.join(cap_notes)}")
         print(f"  Calls repay(bytes32 '{symbol}', {amount_wei}) on the Prime Account")
         print(f"  Current debt: {debt_wei / 10**cfg['decimals']:.6f} {symbol} | "
-              f"in-account: {in_acct_wei / 10**cfg['decimals']:.6f} {symbol}")
+              f"in-account: {in_acct_wei / 10**cfg['decimals']:.6f} {symbol} | "
+              f"available: {available_wei / 10**cfg['decimals']:.6f} {symbol}")
         if in_acct_wei < debt_wei:
             shortfall = (debt_wei - in_acct_wei) / 10**cfg['decimals']
             print(f"  Note: in-account < debt by {shortfall:.6f} {symbol} — "
                   f"swap into {symbol} first to close the position fully.")
+        if total_intent_wei > 0:
+            print(f"  Note: {total_intent_wei / 10**cfg['decimals']:.6f} {symbol} is locked in pending "
+                  f"withdrawal intent(s) and not available for repay.")
         print("Run with --execute to broadcast")
         return
 
@@ -2221,6 +2391,53 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     repaid = amount_wei / 10**cfg['decimals']
     print(f"{'✓' if ok else '✗'} Repay {repaid:.6f} {symbol} {'confirmed' if ok else 'failed'}")
     print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+    if not ok:
+        _print_revert_reason(w3, tx, receipt)
+
+def _print_revert_reason(w3, tx, receipt):
+    """Try to decode and print the revert reason from a failed tx."""
+    try:
+        result = w3.eth.call({
+            "from": tx["from"], "to": tx["to"], "data": tx["input"],
+            "gas": receipt["gasUsed"],
+            "maxFeePerGas": tx.get("maxFeePerGas", tx.get("gasPrice", 0)),
+            "maxPriorityFeePerGas": tx.get("maxPriorityFeePerGas", 0),
+        }, receipt["blockNumber"])
+    except Exception as e:
+        err = str(e)
+        data = err
+        if isinstance(e.args, (list, tuple)):
+            for arg in e.args:
+                if isinstance(arg, str) and arg.startswith("0x"):
+                    data = arg
+                    break
+                elif isinstance(arg, dict) and "data" in arg:
+                    data = arg["data"]
+                    break
+        if isinstance(data, str) and data.startswith("0x") and len(data) >= 10:
+            sel = data[:10]
+            _known_errors = {
+                "0x567fe27a": "Unknown error from Prime Account facet",
+                "0xf4d678b8": "Execution rejected (may be intent-locked balance check)",
+                "0x441a702e": "InsufficientBalance()",
+                "0xfd36fde3": "SignerNotAuthorised (RedStone signer mismatch)",
+                "0x92ba160c": "RedstoneConsensus()",
+                "0xc2c286b7": "SignerNotAuthorised(address)",
+                "0x08c379a0": "require() revert: see message below",
+            }
+            label = _known_errors.get(sel, f"Unknown custom error 0x{sel}")
+            print(f"  Revert: {label}")
+            if sel == "0x08c379a0" and len(data) >= 138:
+                try:
+                    from eth_abi import decode
+                    msg_bytes = bytes.fromhex(data[10:])
+                    decoded = decode(["string"], msg_bytes)
+                    print(f'  Require message: "{decoded[0]}"')
+                except Exception:
+                    pass
+        else:
+            print(f"  Revert reason: {err[:200]}")
+
 
 def _decode_formatted_offer(raw: bytes):
     """Manually decode YieldYak's FormattedOffer struct

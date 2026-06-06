@@ -2046,18 +2046,27 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     requested_wei = to_wei_units(amount, cfg["decimals"])
     debt_wei = pool.functions.getBorrowed(pa_cs).call()
     in_acct_wei = account.functions.getBalance(asset_b32(symbol)).call()
+    try:
+        total_intent_wei = account.functions.getTotalIntentAmount(asset_b32(symbol)).call()
+    except Exception:
+        total_intent_wei = 0
+    available_wei = in_acct_wei - total_intent_wei if in_acct_wei > total_intent_wei else 0
     if debt_wei == 0:
         print(f"No {symbol} debt to repay on Degen Account {pa}.")
         return
-    amount_wei = min(requested_wei, debt_wei, in_acct_wei)
+    amount_wei = min(requested_wei, debt_wei, available_wei)
     if amount_wei == 0:
-        print(f"Repay {amount} {symbol}: in-account {symbol} balance is 0 - "
-              f"swap into {symbol} first (e.g. degenprime swap --to {symbol} --amount N --execute).")
+        print(f"Repay {amount} {symbol}: available {symbol} balance is 0 "
+              f"(total {in_acct_wei / 10**cfg['decimals']:.6f} minus "
+              f"{total_intent_wei / 10**cfg['decimals']:.6f} pending withdrawal intent) — "
+              f"swap into {symbol} first or wait for intents to mature.")
         return
     cap_notes = []
     if amount_wei < requested_wei:
-        if in_acct_wei < min(requested_wei, debt_wei):
-            cap_notes.append(f"in-account {symbol} only {in_acct_wei / 10**cfg['decimals']:.6f}")
+        if available_wei < min(requested_wei, debt_wei):
+            cap_notes.append(f"available {symbol} only {available_wei / 10**cfg['decimals']:.6f} "
+                             f"(total {in_acct_wei / 10**cfg['decimals']:.6f} minus "
+                             f"{total_intent_wei / 10**cfg['decimals']:.6f} pending intent)")
         if debt_wei < requested_wei:
             cap_notes.append(f"debt only {debt_wei / 10**cfg['decimals']:.6f} {symbol}")
 
@@ -2067,11 +2076,15 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
             print(f"  Capped from requested {amount}: {'; '.join(cap_notes)}")
         print(f"  Calls repay(bytes32 '{symbol}', {amount_wei}) on the Degen Account")
         print(f"  Current debt: {debt_wei / 10**cfg['decimals']:.6f} {symbol} | "
-              f"in-account: {in_acct_wei / 10**cfg['decimals']:.6f} {symbol}")
+              f"in-account: {in_acct_wei / 10**cfg['decimals']:.6f} {symbol} | "
+              f"available: {available_wei / 10**cfg['decimals']:.6f} {symbol}")
         if in_acct_wei < debt_wei:
             shortfall = (debt_wei - in_acct_wei) / 10**cfg['decimals']
-            print(f"  Note: in-account < debt by {shortfall:.6f} {symbol} - "
+            print(f"  Note: in-account < debt by {shortfall:.6f} {symbol} — "
                   f"swap into {symbol} first to close the position fully.")
+        if total_intent_wei > 0:
+            print(f"  Note: {total_intent_wei / 10**cfg['decimals']:.6f} {symbol} is locked in pending "
+                  f"withdrawal intent(s) and not available for repay.")
         print("Run with --execute to broadcast")
         return
 
@@ -2098,6 +2111,53 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     repaid = amount_wei / 10**cfg['decimals']
     print(f"{'✓' if ok else '✗'} Repay {repaid:.6f} {symbol} {'confirmed' if ok else 'failed'}")
     print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+    if not ok:
+        _print_revert_reason(w3, tx, receipt)
+
+def _print_revert_reason(w3, tx, receipt):
+    """Try to decode and print the revert reason from a failed tx."""
+    try:
+        result = w3.eth.call({
+            "from": tx["from"], "to": tx["to"], "data": tx["input"],
+            "gas": receipt["gasUsed"],
+            "maxFeePerGas": tx.get("maxFeePerGas", tx.get("gasPrice", 0)),
+            "maxPriorityFeePerGas": tx.get("maxPriorityFeePerGas", 0),
+        }, receipt["blockNumber"])
+    except Exception as e:
+        err = str(e)
+        data = err
+        if isinstance(e.args, (list, tuple)):
+            for arg in e.args:
+                if isinstance(arg, str) and arg.startswith("0x"):
+                    data = arg
+                    break
+                elif isinstance(arg, dict) and "data" in arg:
+                    data = arg["data"]
+                    break
+        if isinstance(data, str) and data.startswith("0x") and len(data) >= 10:
+            sel = data[:10]
+            _known_errors = {
+                "0x567fe27a": "Unknown error from Prime Account facet",
+                "0xf4d678b8": "Execution rejected (may be intent-locked balance check)",
+                "0x441a702e": "InsufficientBalance()",
+                "0xfd36fde3": "SignerNotAuthorised (RedStone signer mismatch)",
+                "0x92ba160c": "RedstoneConsensus()",
+                "0xc2c286b7": "SignerNotAuthorised(address)",
+                "0x08c379a0": "require() revert: see message below",
+            }
+            label = _known_errors.get(sel, f"Unknown custom error 0x{sel}")
+            print(f"  Revert: {label}")
+            if sel == "0x08c379a0" and len(data) >= 138:
+                try:
+                    from eth_abi import decode
+                    msg_bytes = bytes.fromhex(data[10:])
+                    decoded = decode(["string"], msg_bytes)
+                    print(f'  Require message: "{decoded[0]}"')
+                except Exception:
+                    pass
+        else:
+            print(f"  Revert reason: {err[:200]}")
+
 
 # ─── ParaSwap / Velora route ─────────────────────────────────────────────────
 # The Degen Account already holds the funds, so the facet (not the EOA) approves the
