@@ -503,7 +503,7 @@ _T_WEETH  = {"addr": "0x35751007a407ca6FEFfE80b3cB397736D2cf4dbe", "symbol": "we
 TJ_LB_PAIRS = {
     "eth-usdc":    {"pair": "0x69f1216cB2905bf0852f74624D5Fa7b5FC4dA710", "router": TJ_ROUTER_V21, "binStep": 15, "tokenX": _T_WETH,   "tokenY": _T_USDC},
     "eth-usdc-10": {"pair": "0xb7236B927e03542AC3bE0A054F2bEa8868AF9508", "router": TJ_ROUTER_V22, "binStep": 10, "tokenX": _T_WETH,   "tokenY": _T_USDC},
-    "eth-usdt":    {"pair": "0xd387c40a72703B38A5181573724bcaF2Ce6038a5", "router": TJ_ROUTER_V21, "binStep": 15, "tokenX": _T_WETH,   "tokenY": _T_USDC},
+    "eth-usdt":    {"pair": "0xd387c40a72703B38A5181573724bcaF2Ce6038a5", "router": TJ_ROUTER_V21, "binStep": 15, "tokenX": _T_WETH,   "tokenY": _T_USDT},
 }
 
 # LB pair (ILBPair) reads used for previews + position views. getActiveId is the current

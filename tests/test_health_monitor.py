@@ -7,12 +7,15 @@ subprocess.run, so we monkeypatch that single seam to feed canned `defi --json`
 and `prime-tier` output and to record any borrow/repay/gmx-deposit invocation —
 no real process is ever spawned, no chain is touched.
 
-Health pct formula (with tier multiplier `max_mult`):
+Health pct formula (uniform-power fallback, with tier multiplier `max_mult`):
     equity   = sum(supplied.usd) - sum(borrowed.usd)
-    max_debt = equity * (max_mult - 1)
-    pct      = (max_debt - min(debt, max_debt)) / max_debt * 100
-For premium (max_mult=10) with equity=2000 → max_debt=18000, the debt levels
-below land on 85% (lever), 50% (in range) and 10% (de-lever) for a 30-70 range.
+    max_debt = max_mult * equity
+    pct      = 100 * (1 - debt / max_debt)
+This matches the on-chain getHealthMeter zero-crossing (debt == max_mult·equity →
+health 0), where max_mult = dc/(1-dc) is the asset's borrowing power (10 for the
+0.909091 class, 5 for 0.833333). For premium (max_mult=10) with equity=2000 →
+max_debt=20000, the debt levels below land on 86.5% (lever), 55% (in range) and
+19% (de-lever) for a 30-70 range.
 """
 
 from __future__ import annotations
@@ -57,7 +60,7 @@ def test_compute_health_lever_branch_high_pct():
         max_mult=10,
     )
     assert h["equity"] == 2000
-    assert h["health_pct"] == 85.0
+    assert h["health_pct"] == 86.5
     assert h["health_pct"] > 70  # lever territory
 
 
@@ -71,7 +74,7 @@ def test_compute_health_in_range_branch():
         max_mult=10,
     )
     assert h["equity"] == 2000
-    assert h["health_pct"] == 50.0
+    assert h["health_pct"] == 55.0
     assert 30 <= h["health_pct"] <= 70
 
 
@@ -85,7 +88,7 @@ def test_compute_health_delever_branch_low_pct():
         max_mult=10,
     )
     assert h["equity"] == 2000
-    assert h["health_pct"] == 10.0
+    assert h["health_pct"] == 19.0
     assert h["health_pct"] < 30  # de-lever territory
 
 
@@ -110,8 +113,8 @@ def test_compute_health_basic_tier_lower_ceiling():
     basic = hm.compute_health(_grouped(supplied, borrowed), max_mult=5)
     premium = hm.compute_health(_grouped(supplied, borrowed), max_mult=10)
     assert basic["equity"] == premium["equity"] == 2000
-    assert basic["max_debt"] == 2000 * 4
-    assert premium["max_debt"] == 2000 * 9
+    assert basic["max_debt"] == 2000 * 5
+    assert premium["max_debt"] == 2000 * 10
     assert basic["health_pct"] < premium["health_pct"]
 
 

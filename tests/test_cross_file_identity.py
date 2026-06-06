@@ -43,6 +43,11 @@ SHARED_FUNCS = [
     "_redstone_package_signer",
     "build_redstone_payload",
     "to_wei_units",
+    # Frontend-exact getHealthMeter core + its on-chain debtCoverage resolver. The math
+    # and the TokenManager wiring must not drift — a wrong dc or formula misreports every
+    # account's health identically wrongly on whichever chain drifted.
+    "_health_meter_pct",
+    "_resolve_debt_coverages",
 ]
 
 

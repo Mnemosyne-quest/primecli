@@ -4,6 +4,63 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.7.0] - 2026-06-06
+
+### Changed
+- **Contract-exact 0-100% account health across all three tools.** `_compute_health_pct`
+  no longer approximates the meter with `max_debt = equity·(max_mult − 1)` and a fixed,
+  uniform multiplier (off-by-one vs the protocol, and wrong for mixed-asset accounts). It
+  now mirrors the on-chain `HealthMeterFacetProd.getHealthMeter` exactly:
+
+      net_i = supplied_usd_i − borrowed_usd_i
+      weightedCollateral = Σ dc_i·net_i (net-long legs) − Σ dc_i·(−net_i) (net-short legs)
+      weightedBorrowed   = Σ dc_i·borrowed_usd_i
+      borrowed           = Σ borrowed_usd_i                 (UNWEIGHTED)
+      borrowed == 0                                          → 100
+      wc > 0 and wc + weightedBorrowed > borrowed
+          → (wc + weightedBorrowed − borrowed) / wc · 100   (clamped 0..100)
+      else                                                  → 0
+
+  Per-asset `debtCoverage` is read LIVE on-chain from each chain's TokenManager: the symbol
+  is resolved via `getAssetAddress(bytes32,true)`, then `tieredDebtCoverage(tier, token)` at
+  the account's PRIME leverage tier on Avalanche/Arbitrum (exactly what the contract's
+  `getPrimeLeverageTier()` selects), falling back to the un-tiered `debtCoverage(token)` —
+  which is the only coverage getter on Base (DegenPrime has no tier system). Lookups are
+  batched through multicall (~2 eth_calls for N assets) and cached per run. `gather_lending`
+  / `_gather_account_state` now stamp each row's `dc` so the meter math has its inputs. The
+  shared `_health_meter_pct` core and the `_resolve_debt_coverages` resolver are byte-/code-
+  identical across the three siblings and pinned by `test_cross_file_identity`.
+- Removed the now-unused `DEGEN_MAX_MULT` constant.
+
+### Fixed
+- **arbprime `TJ_LB_PAIRS` eth-usdt pair `tokenY`** was the USDC constant; the real on-chain
+  `tokenY` for pair `0xd387c40a72703B38A5181573724bcaF2Ce6038a5` is USDT (verified via
+  `getTokenY` → `0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9`). Fixed.
+- **degenprime `summary` crashed with a TypeError** when a solvency view came back `None`
+  while `solvency["error"]` was still `None` (a silently-empty multicall leg): the
+  currency format `${None:,.2f}` raised. `Total value` / `Debt` now print `n/a` in that
+  case instead of crashing.
+
+### Notes
+- Supersedes the partial 0.6.1, which shipped the deltaprime/arbprime health change without
+  the matching degenprime update, the eth-usdt fix, the summary crash guard, or the test
+  refresh. 0.7.0 makes all three tools consistent and brings the suite back to green.
+
+## [0.6.1] - 2026-06-06
+
+### Fixed
+- `cmd_repay` (all three tools): intent-aware repay cap — reads `getTotalIntentAmount` to
+  compute `available = balance − pending intents`, caps repay to
+  `min(requested, debt, available)`, warns when intents lock part of the balance, and
+  decodes the revert reason (known selectors + `Error(string)`) on a failed broadcast.
+- _(Backfilled entry.)_
+
+## [0.6.0] - 2026-06-06
+
+### Changed
+- Cross-margin health formula, LB auto-deploy, RedStone v0.9 payload format + corrected
+  Base DegenPrime feed set. _(Backfilled entry — released without a changelog entry.)_
+
 ## [0.5.6] - 2026-06-04
 
 ### Fixed

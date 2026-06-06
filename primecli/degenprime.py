@@ -126,7 +126,6 @@ except ImportError:
 BASE_RPC = os.environ.get("DEGENPRIME_RPC", "https://base.publicnode.com")
 EXPLORER = "https://basescan.org"
 CHAIN_ID = 8453
-DEGEN_MAX_MULT = 5  # Fixed max leverage multiplier (no tier system on DegenPrime)
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 # ── Signing key resolution ──────────────────────────────────────────────────
@@ -833,39 +832,175 @@ def _asset_meta(w3, symbol: str):
 # gateway once instead of per-feed-symbol. Cleared implicitly when the process exits.
 _redstone_gateway_cache = None
 
-def _compute_health_pct(supplied: list, borrowed: list, max_mult: int = None) -> dict:
-    """Compute equity-based health (0-100%) from per-asset supplied/borrowed data.
+def _health_meter_pct(assets: list) -> dict:
+    """getHealthMeter() exactly as the on-chain HealthMeterFacetProd renders it.
 
-    0% = liquidation, 50% = half borrowing power used, 100% = no debt.
-    Formula:
-      equity    = supplied_usd - debt_usd
-      max_mult  = 5 (fixed for DegenPrime; no tier system)
-      max_debt  = equity * (max_mult - 1)
-      health_pct = (max_debt - debt_usd) / max_debt * 100
+    The frontend health meter is NOT equity*(mult-1); it is a per-asset, debtCoverage-
+    weighted formula. For each asset i with USD-valued long balance and borrow, and its
+    live debtCoverage dc_i:
 
-    Returns dict with keys: health_pct, supplied_usd, debt_usd, equity, max_debt, or error.
+        net_i = supplied_usd_i - borrowed_usd_i
+        weightedCollateralPlus  = Σ dc_i·net_i        for net_i > 0  (net-long legs)
+        weightedCollateralMinus = Σ dc_i·(-net_i)     for net_i < 0  (net-short legs)
+        weightedCollateral      = weightedCollateralPlus - weightedCollateralMinus
+        weightedBorrowed        = Σ dc_i·borrowed_usd_i
+        borrowed                = Σ borrowed_usd_i                    (UNWEIGHTED)
+
+        borrowed == 0                                  -> 100
+        weightedCollateral > 0 and
+          weightedCollateral + weightedBorrowed > borrowed
+            -> (weightedCollateral + weightedBorrowed - borrowed) / weightedCollateral · 100
+        else                                           -> 0
+
+    Result clamped to [0, 100]. `assets` is a list of
+    {"symbol", "dc", "supplied_usd", "borrowed_usd"}; missing usd legs count as 0.
+    For a uniform-dc single-collateral position this reduces to the familiar
+    (max_debt - debt)/max_debt·100 with max_debt = equity·dc/(1-dc).
     """
-    if max_mult is None:
-        max_mult = DEGEN_MAX_MULT
-    supplied_usd = sum(r.get("usd", 0) or 0 for r in supplied)
-    debt_usd = sum(r.get("usd", 0) or 0 for r in borrowed)
+    wc_plus = 0.0
+    wc_minus = 0.0
+    weighted_borrowed = 0.0
+    borrowed = 0.0
+    supplied_usd = 0.0
+    debt_usd = 0.0
+    for a in assets:
+        dc = a.get("dc", 0.0) or 0.0
+        sup = a.get("supplied_usd", 0.0) or 0.0
+        bor = a.get("borrowed_usd", 0.0) or 0.0
+        supplied_usd += sup
+        debt_usd += bor
+        net = sup - bor
+        if net > 0:
+            wc_plus += dc * net
+        elif net < 0:
+            wc_minus += dc * (-net)
+        weighted_borrowed += dc * bor
+        borrowed += bor
+    weighted_collateral = wc_plus - wc_minus
     equity = supplied_usd - debt_usd
-
-    if equity <= 0.01:
-        return {"health_pct": 0.0, "supplied_usd": round(supplied_usd, 2),
-                "debt_usd": round(debt_usd, 2), "equity": round(equity, 2),
-                "max_debt": 0.0, "error": "equity near zero"}
-
-    max_debt = equity * (max_mult - 1)
-    if max_debt > 0 and debt_usd >= 0:
-        health_pct = (max_debt - min(debt_usd, max_debt)) / max_debt * 100
+    if borrowed <= 0:
+        health_pct = 100.0
+    elif weighted_collateral > 0 and (weighted_collateral + weighted_borrowed) > borrowed:
+        health_pct = (weighted_collateral + weighted_borrowed - borrowed) / weighted_collateral * 100.0
         health_pct = max(0.0, min(100.0, health_pct))
     else:
-        health_pct = 100.0
-
+        health_pct = 0.0
     return {"health_pct": round(health_pct, 1), "supplied_usd": round(supplied_usd, 2),
             "debt_usd": round(debt_usd, 2), "equity": round(equity, 2),
-            "max_debt": round(max_debt, 2), "tier": "FIXED_5X"}
+            "weighted_collateral": round(weighted_collateral, 2),
+            "weighted_borrowed": round(weighted_borrowed, 2)}
+
+
+_dc_cache = {}
+
+
+def _resolve_debt_coverages(w3, symbols: list, tier_code: int = 0) -> dict:
+    """Per-asset debtCoverage read LIVE on-chain from the TokenManager, keyed by symbol.
+
+    Resolves each symbol to its token address via getAssetAddress(bytes32,true), then reads
+    the account's effective coverage: tieredDebtCoverage(tier, token) on Avalanche/Arbitrum
+    (the contract's getHealthMeter uses getPrimeLeverageTier() for exactly this), falling
+    back to the un-tiered debtCoverage(token). Cached per run keyed by (symbol, tier_code).
+    Batched through multicall so N assets cost ~2 eth_calls, not 2N. Symbols that don't
+    resolve get dc=0 (they contribute nothing — same as the contract skipping an unpriced
+    leg)."""
+    want = [s for s in dict.fromkeys(symbols) if s]
+    out = {}
+    missing = []
+    for s in want:
+        ck = (s, tier_code)
+        if ck in _dc_cache:
+            out[s] = _dc_cache[ck]
+        else:
+            missing.append(s)
+    if not missing:
+        return out
+    tm_abi = json.loads(
+        '[{"inputs":[{"name":"_asset","type":"bytes32"},{"name":"_active","type":"bool"}],'
+        '"name":"getAssetAddress","outputs":[{"type":"address"}],"stateMutability":"view","type":"function"},'
+        '{"inputs":[{"name":"a","type":"address"}],"name":"debtCoverage","outputs":[{"type":"uint256"}],'
+        '"stateMutability":"view","type":"function"},'
+        '{"inputs":[{"name":"t","type":"uint8"},{"name":"a","type":"address"}],"name":"tieredDebtCoverage",'
+        '"outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}]')
+    tm = w3.eth.contract(address=Web3.to_checksum_address(TOKEN_MANAGER), abi=tm_abi)
+    addr_legs = [(TOKEN_MANAGER, bytes.fromhex(tm.encode_abi("getAssetAddress", args=[asset_b32(s), True])[2:]))
+                 for s in missing]
+    addr_res = multicall(w3, addr_legs)
+    addrs = {}
+    for s, (ok, rd) in zip(missing, addr_res):
+        try:
+            a = w3.codec.decode(["address"], rd)[0] if ok and rd else None
+        except Exception:
+            a = None
+        addrs[s] = a if a and int(a, 16) != 0 else None
+    resolvable = [s for s in missing if addrs[s]]
+    # Try tiered coverage first (Avalanche/Arbitrum); fall back per-asset to un-tiered.
+    tiered_legs = [(TOKEN_MANAGER, bytes.fromhex(
+        tm.encode_abi("tieredDebtCoverage", args=[tier_code, Web3.to_checksum_address(addrs[s])])[2:]))
+        for s in resolvable]
+    untiered_legs = [(TOKEN_MANAGER, bytes.fromhex(
+        tm.encode_abi("debtCoverage", args=[Web3.to_checksum_address(addrs[s])])[2:]))
+        for s in resolvable]
+    tiered_res = multicall(w3, tiered_legs) if tiered_legs else []
+    untiered_res = multicall(w3, untiered_legs) if untiered_legs else []
+    for i, s in enumerate(resolvable):
+        dc = 0.0
+        ok_t, rd_t = tiered_res[i]
+        if ok_t and rd_t:
+            try:
+                dc = w3.codec.decode(["uint256"], rd_t)[0] / 1e18
+            except Exception:
+                dc = 0.0
+        if dc <= 0:
+            ok_u, rd_u = untiered_res[i]
+            if ok_u and rd_u:
+                try:
+                    dc = w3.codec.decode(["uint256"], rd_u)[0] / 1e18
+                except Exception:
+                    dc = 0.0
+        _dc_cache[(s, tier_code)] = dc
+        out[s] = dc
+    for s in missing:
+        if s not in out:
+            _dc_cache[(s, tier_code)] = 0.0
+            out[s] = 0.0
+    return out
+
+
+def _compute_health_pct(supplied: list, borrowed: list, w3=None, tier_code: int = 0) -> dict:
+    """Frontend-exact health (0-100%) for a Degen Account — wraps _health_meter_pct with
+    per-asset on-chain debtCoverage. 0% = liquidation, 100% = no debt.
+
+    DegenPrime renders getHealthMeter (HealthMeterFacetProd) just like DeltaPrime, but Base
+    has no PRIME leverage tier, so debtCoverage is the un-tiered TokenManager value (the
+    tiered getter reverts and _resolve_debt_coverages falls back to it automatically).
+
+    supplied/borrowed are rows carrying `usd` (and optionally a pre-resolved `dc`); pass `w3`
+    so dc can be read live when a row lacks it. Returns health_pct, supplied_usd, debt_usd,
+    equity, max_debt (display zero-crossing debt), tier, or error.
+    """
+    syms = list(dict.fromkeys([r["symbol"] for r in supplied + borrowed if r.get("symbol")]))
+    dc_map = {r["symbol"]: r["dc"] for r in supplied + borrowed if r.get("dc") is not None}
+    need = [s for s in syms if s not in dc_map]
+    if need and w3 is not None:
+        dc_map.update(_resolve_debt_coverages(w3, need, tier_code))
+    assets = []
+    for s in syms:
+        sup = sum(r.get("usd", 0) or 0 for r in supplied if r.get("symbol") == s)
+        bor = sum(r.get("usd", 0) or 0 for r in borrowed if r.get("symbol") == s)
+        assets.append({"symbol": s, "dc": dc_map.get(s, 0.0), "supplied_usd": sup, "borrowed_usd": bor})
+    res = _health_meter_pct(assets)
+    equity = res["equity"]
+    if equity <= 0.01:
+        return {"health_pct": 0.0, "supplied_usd": res["supplied_usd"],
+                "debt_usd": res["debt_usd"], "equity": equity,
+                "max_debt": 0.0, "tier": "FIXED", "error": "equity near zero"}
+    coll_usd = sum(a["supplied_usd"] for a in assets) or 0.0
+    dc_eff = (sum(a["dc"] * a["supplied_usd"] for a in assets) / coll_usd) if coll_usd > 0 else 0.0
+    max_debt = equity * dc_eff / (1.0 - dc_eff) if 0 < dc_eff < 1 else 0.0
+    return {"health_pct": res["health_pct"], "supplied_usd": res["supplied_usd"],
+            "debt_usd": res["debt_usd"], "equity": equity,
+            "max_debt": round(max_debt, 2), "tier": "FIXED"}
 
 
 def _redstone_fetch_packages(use_cache: bool = True) -> dict:
@@ -1673,6 +1808,14 @@ def _gather_account_state(w3, account, pool_deposits: list):
         sym = n.rstrip(b"\x00").decode(errors="replace")
         if v > 0:
             borrowed.append({"symbol": sym, "raw": v, "decimals": _asset_decimals(w3, sym)})
+    # Per-asset on-chain debtCoverage (Base: un-tiered) stamped onto every row so the
+    # frontend-exact getHealthMeter computation has its dc inputs.
+    try:
+        dc_map = _resolve_debt_coverages(w3, [r["symbol"] for r in supplied + borrowed])
+        for r in supplied + borrowed:
+            r["dc"] = dc_map.get(r["symbol"], 0.0)
+    except Exception:
+        pass
 
     # Solvency views (SolvencyFacet) are RedStone-gated: they revert (0xe7764c9e)
     # without signed price calldata appended. Fetch a fresh RedStone payload covering
@@ -1780,7 +1923,7 @@ def gather_defi() -> dict:
         _rows_borrowed = [_row(r) for r in borrowed]
 
         # Compute equity-based health (0-100%)
-        _hp = _compute_health_pct(_rows_supplied, _rows_borrowed)
+        _hp = _compute_health_pct(_rows_supplied, _rows_borrowed, w3=w3)
         result["health_pct"] = _hp.get("health_pct")
 
         if supplied or borrowed:
@@ -1907,7 +2050,7 @@ def cmd_summary(as_json: bool = False):
         # Compute equity-based health (0-100%)
         _hp_rows = [_asset_row(r) for r in supplied]
         _hp_borrowed = [_asset_row(r) for r in borrowed]
-        _hp = _compute_health_pct(_hp_rows, _hp_borrowed)
+        _hp = _compute_health_pct(_hp_rows, _hp_borrowed, w3=w3)
 
         out = {
             "wallet": acct.address,
@@ -1955,17 +2098,24 @@ def cmd_summary(as_json: bool = False):
             print(f"    {r['symbol']:<8} {r['raw'] / 10**r['decimals']:,.6f}{usd_str}")
 
     if solvency["error"] is None:
-        print(f"  Total value:        ${solvency['total']:,.2f}")
-        print(f"  Debt:               ${solvency['debt']:,.2f}")
+        # A solvency view can come back None even with no error (e.g. a multicall leg that
+        # decoded empty); guard the currency format so summary never crashes on it.
+        tv_str = f"${solvency['total']:,.2f}" if solvency["total"] is not None else "n/a"
+        debt_str = f"${solvency['debt']:,.2f}" if solvency["debt"] is not None else "n/a"
+        print(f"  Total value:        {tv_str}")
+        print(f"  Debt:               {debt_str}")
         ratio_str = ">1000.00 (negligible debt)" if solvency["ratio"] is None else f"{solvency['ratio']:.4f}"
         print(f"  Health ratio (chain): {ratio_str}  (>1.0 = solvent, 1.0 = liquidation)")
         # ─── Equity-based health (0-100%) ───
         # Different from health_ratio!
         hp = _compute_health_pct(
-            [{"symbol": r["symbol"], "balance": "0", "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)}
+            [{"symbol": r["symbol"], "balance": "0", "dc": r.get("dc", 0.0),
+              "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)}
              for r in supplied if solvency["prices"].get(r["symbol"])],
-            [{"symbol": r["symbol"], "balance": "0", "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)}
+            [{"symbol": r["symbol"], "balance": "0", "dc": r.get("dc", 0.0),
+              "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)}
              for r in borrowed if solvency["prices"].get(r["symbol"])],
+            w3=w3,
         )
         if "error" not in hp:
             print(f"  Health (0-100%): {hp['health_pct']:.1f}%")
