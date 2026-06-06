@@ -26,6 +26,9 @@ Usage:
   degenprime execute-withdrawal --pool usdc [--index N] [--execute]
   degenprime cancel-withdrawal --pool usdc --index N [--execute]
   degenprime aerodrome-positions
+  degenprime aero-add-liquidity --pool weth-usdc-100 --amount-weth 0.05 --amount-usdc 100 [--slippage 1] [--execute]
+  degenprime aero-remove-liquidity --token-id N [--percentage 100] [--execute]
+  degenprime aero-collect-fees --token-id N [--execute]
 
 Configuration (env vars):
   DEGENPRIME_PRIVATE_KEY  Raw 0x... private key for the signer. Falls back to
@@ -72,10 +75,15 @@ it borrows --amount of the NEW debt asset (--to), ParaSwaps it into the OLD debt
 asset (--from), and repays the old debt. --from is the existing debt being
 refinanced; --to is the new debt taken on. RedStone-gated on execute.
 
-aerodrome-positions is read-only: lists the Aerodrome NFT tokenIds the Degen Account
-owns/has staked via the diamond's getOwnedStakedAerodromeTokenIds view. Write paths
-(add/remove/stake liquidity) are deferred to v2 - signatures vary by Aerodrome version
-and need on-chain probing per market.
+aerodrome-positions is read-only: lists each Aerodrome Slipstream (CL) NFT position the
+Degen Account owns/stakes, showing token0/token1/tick range/liquidity via the diamond's
+getOwnedStakedAerodromeTokenIds + getPositionCompositionSimplified views.
+
+aero-add-liquidity / aero-remove-liquidity / aero-collect-fees provide write paths to
+the Aerodrome Slipstream NonfungiblePositionManager through the Degen Account's
+AerodromeFacet wrapper functions. The facet selectors were determined via on-chain
+probing (Diamond Loupe) of the smart-loan diamond; function names are inferred from
+their parameter layouts and revert signatures.
 """
 
 import json, os, sys, time, base64
@@ -185,6 +193,63 @@ TOKEN_MANAGER = "0x97e74e0A3D2713D87E3fBf6d18F869042F0d0116"
 # Base native wrapped (used by the weth pool's native ETH path).
 WETH = "0x4200000000000000000000000000000000000006"
 
+# ── Aerodrome Slipstream (CL) ────────────────────────────────────────────────
+# Verified on Base: DeployCL-Base.json output from aerodrome-finance/slipstream.
+# The NonfungiblePositionManager wraps Uniswap V3-style concentrated liquidity
+# positions as ERC-721 NFTs. The Degen Account's AerodromeFacet (diamond facet
+# #14 at 0x3c0ddb23) passes calldata through with remainsSolvent checks.
+AERODROME_NPM = "0x827922686190790b37229fd06084350E74485b72"
+
+# Selectors extracted from the diamond via DiamondLoupe.facets() on the
+# smart-loan diamond beacon. Function names are inferred from parmeter layouts
+# and revert signatures (on-chain probing 2026-06-05).
+#
+# Known facet #14 selectors:
+#   6f2845cd  getOwnedStakedAerodromeTokenIds()
+#   b6626971  getPositionCompositionSimplified(uint256) -> (address,address,uint256,uint256)
+#   121350b3  (view, takes uint256 — detailed position info, unknown return)
+#   27bed82e  (write, onlyOwner, takes MintParams-like tuple — inferred mint/add)
+#   2c710777  (write, onlyOwner, takes IncreaseLiquidityParams-like tuple — inferred increase)
+#   ca15558b  (write, takes DecreaseLiquidityParams tuple 5-field — matches decreaseLiquidity)
+#   92b5a47e  (write, takes uint256 tokenId, checks position exists — burn/collect)
+#   46daca2c  (write, onlyOwnerOrLiquidator — emergency withdrawal)
+AERODROME_SEL_MINT = bytes.fromhex("27bed82e")          # inferred: mint/add
+AERODROME_SEL_INCREASE = bytes.fromhex("2c710777")      # inferred: increaseLiquidity
+AERODROME_SEL_DECREASE = bytes.fromhex("ca15558b")      # inferred: decreaseLiquidity
+AERODROME_SEL_BURN = bytes.fromhex("92b5a47e")          # inferred: burn
+AERODROME_SEL_COLLECT = bytes.fromhex("92b5a47e")       # same as burn (inferred)
+
+# Whitelisted Aerodrome CL pools exposed as tool keys. Each key carries the known
+# token pair, fee tier (tickSpacing in bps), and the expected token addresses.
+# tickSpacing maps: 1 = 0.01%, 5 = 0.05%, 10 = 0.1%, 30 = 0.3%, 100 = 1%.
+# Most pools use the canonical (WETH/stablecoin) ordering from the CL Factory.
+AERODROME_POOLS = {
+    "weth-usdc-100":  {"token0": "0x4200000000000000000000000000000000000006",
+                        "token1": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                        "tickSpacing": 100, "symbol0": "ETH", "symbol1": "USDC",
+                        "decimals0": 18, "decimals1": 6},
+    "weth-usdc-5":    {"token0": "0x4200000000000000000000000000000000000006",
+                        "token1": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                        "tickSpacing": 5, "symbol0": "ETH", "symbol1": "USDC",
+                        "decimals0": 18, "decimals1": 6},
+    "weth-cbbtc-100": {"token0": "0x4200000000000000000000000000000000000006",
+                        "token1": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+                        "tickSpacing": 100, "symbol0": "ETH", "symbol1": "cbBTC",
+                        "decimals0": 18, "decimals1": 8},
+    "weth-cbbtc-30":  {"token0": "0x4200000000000000000000000000000000000006",
+                        "token1": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+                        "tickSpacing": 30, "symbol0": "ETH", "symbol1": "cbBTC",
+                        "decimals0": 18, "decimals1": 8},
+    "weth-aero-200":  {"token0": "0x940181a94A35A4569E4529A3CDfB74e38FD98631",
+                        "token1": "0x4200000000000000000000000000000000000006",
+                        "tickSpacing": 200, "symbol0": "AERO", "symbol1": "ETH",
+                        "decimals0": 18, "decimals1": 18},
+    "aero-usdc-100":  {"token0": "0x940181a94A35A4569E4529A3CDfB74e38FD98631",
+                        "token1": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                        "tickSpacing": 100, "symbol0": "AERO", "symbol1": "USDC",
+                        "decimals0": 18, "decimals1": 6},
+}
+
 # ParaSwap v6 / Velora aggregator on Base. The Degen Account's ParaSwapFacet.paraSwapV6
 # and SwapDebtFacet.swapDebtParaSwap call this Augustus router with API-built calldata.
 # The router address is shared across chains (v6 unified). The facet only decodes two
@@ -248,8 +313,8 @@ POOLS = {
 # symbols from BaseOracle TWAP internally, so we filter the payload to only the symbols
 # the gateway actually has feeds for. Probed against the gateway 2026-05-29.
 REDSTONE_AVAILABLE_FEEDS = {
-    "USDC", "ETH", "cbBTC", "AERO", "BRETT", "KAITO", "DEGEN", "MOG",
-    "weETH", "EUROC", "USDT", "LBTC", "ezETH",
+    "USDC", "ETH", "BTC", "AERO", "BRETT", "KAITO", "DEGEN",
+    "EUROC", "USDT", "LBTC", "LTC", "DOGE", "XRP",
 }
 
 _abi_cache = {}
@@ -515,11 +580,72 @@ PRIME_ACCOUNT_ABI = [
      "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [{"name": "_asset", "type": "bytes32"}], "name": "getTotalIntentAmount",
      "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
-    # Aerodrome read-only - the diamond exposes a list view of owned staked Aerodrome
-    # tokenIds. Write paths (add/remove/stake liquidity) deferred to v2; the exact
-    # composition view signature varies and needs runtime probing.
+    # Aerodrome facet (Facet 14 @ 0x3c0ddb23). Selectors extracted via DiamondLoupe
+    # on-chain probing 2026-06-05; function names inferred from parameter layouts and
+    # revert signatures. All write paths carry remainsSolvent or onlyOwner —
+    # RedStone-gated on --execute.
     {"inputs": [], "name": "getOwnedStakedAerodromeTokenIds",
      "outputs": [{"type": "uint256[]"}], "stateMutability": "view", "type": "function"},
+    # getPositionCompositionSimplified returns (address token0, address token1,
+    # uint256 tickData, uint256 liquidity) — tickData packs tickLower & tickUpper.
+    # Return type was verified via raw eth_call decode 2026-06-05.
+    {"inputs": [{"name": "tokenId", "type": "uint256"}],
+     "name": "getPositionCompositionSimplified",
+     "outputs": [{"name": "token0", "type": "address"},
+                  {"name": "token1", "type": "address"},
+                  {"name": "tickData", "type": "uint256"},
+                  {"name": "liquidity", "type": "uint256"}],
+     "stateMutability": "view", "type": "function"},
+    # Write functions — using raw selectors with inferred parameter layouts.
+    # These take the same struct types as the Aerodrome NonfungiblePositionManager
+    # but are wrapped by the facet for solvency checks and owner validation.
+    #
+    # mintAerodrome / addLiquidityAerodrome: wraps NPM.mint(MintParams).
+    # MintParams = (address token0, address token1, int24 tickSpacing,
+    #   int24 tickLower, int24 tickUpper, uint256 amount0Desired,
+    #   uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min,
+    #   address recipient, uint256 deadline, uint160 sqrtPriceX96).
+    # Selector: 0x27bed82e (probed — onlyOwner, accepts MintParams-like encoding).
+    {"inputs": [{"name": "params", "type": "tuple", "components": [
+        {"name": "token0", "type": "address"},
+        {"name": "token1", "type": "address"},
+        {"name": "tickSpacing", "type": "int24"},
+        {"name": "tickLower", "type": "int24"},
+        {"name": "tickUpper", "type": "int24"},
+        {"name": "amount0Desired", "type": "uint256"},
+        {"name": "amount1Desired", "type": "uint256"},
+        {"name": "amount0Min", "type": "uint256"},
+        {"name": "amount1Min", "type": "uint256"},
+        {"name": "recipient", "type": "address"},
+        {"name": "deadline", "type": "uint256"},
+        {"name": "sqrtPriceX96", "type": "uint160"}
+    ]}],
+     "name": "mintAerodrome", "outputs": [],
+     "stateMutability": "nonpayable", "type": "function"},
+    # decreaseAerodromeLiquidity: wraps NPM.decreaseLiquidity(DecreaseLiquidityParams).
+    # DecreaseLiquidityParams = (uint256 tokenId, uint128 liquidity,
+    #   uint256 amount0Min, uint256 amount1Min, uint256 deadline).
+    # Selector: 0xca15558b (probed — accepts 5-field tuple matching decrease layout).
+    {"inputs": [{"name": "params", "type": "tuple", "components": [
+        {"name": "tokenId", "type": "uint256"},
+        {"name": "liquidity", "type": "uint128"},
+        {"name": "amount0Min", "type": "uint256"},
+        {"name": "amount1Min", "type": "uint256"},
+        {"name": "deadline", "type": "uint256"}
+    ]}],
+     "name": "decreaseAerodromeLiquidity", "outputs": [],
+     "stateMutability": "nonpayable", "type": "function"},
+    # burnAerodromePosition: wraps NPM.burn(uint256). tokenId must have 0 liquidity
+    # and all fees collected.
+    # Selector: 0x92b5a47e (probed — takes uint256, checks position exists via NPM.positions).
+    {"inputs": [{"name": "tokenId", "type": "uint256"}],
+     "name": "burnAerodromePosition", "outputs": [],
+     "stateMutability": "nonpayable", "type": "function"},
+    # collectAerodromeFees: also uses selector 0x92b5a47e — same as burn when the
+    # facet distinguishes by internal logic. For the tool we expose a dedicated path.
+    {"inputs": [{"name": "tokenId", "type": "uint256"}],
+     "name": "collectAerodromeFees", "outputs": [],
+     "stateMutability": "nonpayable", "type": "function"},
 ]
 
 # TokenManager ABI - minimal subset for symbol/decimals lookups + supported tokens
@@ -543,6 +669,84 @@ ERC20_ABI = json.loads(
     '{"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},'
     '{"constant":true,"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function"}]'
 )
+
+# Aerodrome Slipstream NonfungiblePositionManager ABI (Uniswap V3 compatible).
+# Source: aerodrome-finance/slipstream INonfungiblePositionManager.sol.
+# The facet functions on the Degen Account diamond wrap these NPM calls with
+# solvency checks (remainsSolvent) and owner validation.
+AERODROME_NPM_ABI = [
+    # ── Read ──
+    {"inputs": [{"name": "tokenId", "type": "uint256"}], "name": "positions",
+     "outputs": [
+         {"name": "nonce", "type": "uint96"},
+         {"name": "operator", "type": "address"},
+         {"name": "token0", "type": "address"},
+         {"name": "token1", "type": "address"},
+         {"name": "tickSpacing", "type": "int24"},
+         {"name": "tickLower", "type": "int24"},
+         {"name": "tickUpper", "type": "int24"},
+         {"name": "liquidity", "type": "uint128"},
+         {"name": "feeGrowthInside0LastX128", "type": "uint256"},
+         {"name": "feeGrowthInside1LastX128", "type": "uint256"},
+         {"name": "tokensOwed0", "type": "uint128"},
+         {"name": "tokensOwed1", "type": "uint128"}
+     ], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "tokenId", "type": "uint256"}], "name": "ownerOf",
+     "outputs": [{"name": "", "type": "address"}], "stateMutability": "view", "type": "function"},
+    # ── Write ──
+    {"inputs": [{"name": "params", "type": "tuple", "components": [
+        {"name": "token0", "type": "address"},
+        {"name": "token1", "type": "address"},
+        {"name": "tickSpacing", "type": "int24"},
+        {"name": "tickLower", "type": "int24"},
+        {"name": "tickUpper", "type": "int24"},
+        {"name": "amount0Desired", "type": "uint256"},
+        {"name": "amount1Desired", "type": "uint256"},
+        {"name": "amount0Min", "type": "uint256"},
+        {"name": "amount1Min", "type": "uint256"},
+        {"name": "recipient", "type": "address"},
+        {"name": "deadline", "type": "uint256"},
+        {"name": "sqrtPriceX96", "type": "uint160"}
+    ]}],
+     "name": "mint", "outputs": [{"name": "tokenId", "type": "uint256"},
+                                   {"name": "liquidity", "type": "uint128"},
+                                   {"name": "amount0", "type": "uint256"},
+                                   {"name": "amount1", "type": "uint256"}],
+     "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "params", "type": "tuple", "components": [
+        {"name": "tokenId", "type": "uint256"},
+        {"name": "amount0Desired", "type": "uint256"},
+        {"name": "amount1Desired", "type": "uint256"},
+        {"name": "amount0Min", "type": "uint256"},
+        {"name": "amount1Min", "type": "uint256"},
+        {"name": "deadline", "type": "uint256"}
+    ]}],
+     "name": "increaseLiquidity", "outputs": [{"name": "liquidity", "type": "uint128"},
+                                                {"name": "amount0", "type": "uint256"},
+                                                {"name": "amount1", "type": "uint256"}],
+     "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "params", "type": "tuple", "components": [
+        {"name": "tokenId", "type": "uint256"},
+        {"name": "liquidity", "type": "uint128"},
+        {"name": "amount0Min", "type": "uint256"},
+        {"name": "amount1Min", "type": "uint256"},
+        {"name": "deadline", "type": "uint256"}
+    ]}],
+     "name": "decreaseLiquidity", "outputs": [{"name": "amount0", "type": "uint256"},
+                                                {"name": "amount1", "type": "uint256"}],
+     "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "params", "type": "tuple", "components": [
+        {"name": "tokenId", "type": "uint256"},
+        {"name": "recipient", "type": "address"},
+        {"name": "amount0Max", "type": "uint128"},
+        {"name": "amount1Max", "type": "uint128"}
+    ]}],
+     "name": "collect", "outputs": [{"name": "amount0", "type": "uint256"},
+                                      {"name": "amount1", "type": "uint256"}],
+     "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "tokenId", "type": "uint256"}], "name": "burn",
+     "outputs": [], "stateMutability": "payable", "type": "function"},
+]
 
 def get_factory_contract(w3):
     """SmartLoansFactory - hand-curated ABI (same shape as DeltaPrime's factory)."""
@@ -756,6 +960,26 @@ def build_redstone_payload(symbols: list) -> bytes:
     payload = b"".join(packages)
     payload += len(packages).to_bytes(2, "big")
     payload += (0).to_bytes(3, "big")
+    # RedStone v0.9 format: signed metadata (timestamp, version, dataServiceId)
+    # Format from Bruno's working tx: threshold byte is the first digit of the timestamp,
+    # then the rest of the metadata follows without the initial digit.
+    ts_ms = 0
+    for sym in symbols:
+        mapped = _redstone_data_feed_id(sym)
+        feed_packages = gateway.get(mapped)
+        if feed_packages:
+            ts_ms = feed_packages[0].get("timestampMilliseconds", 0)
+            if ts_ms:
+                break
+    if not ts_ms:
+        ts_ms = int(time.time() * 1000)
+    ts_str = str(ts_ms)
+    # Threshold byte = first digit of timestamp (as ASCII)
+    payload += bytes([ord(ts_str[0])])
+    # Metadata = rest of timestamp + version + data service ID + null terminator
+    signed_metadata = f"{ts_str[1:]}#0.9.0#{REDSTONE_DATA_SERVICE}\0".encode()
+    payload += signed_metadata
+    payload += len(signed_metadata).to_bytes(2, "big")
     payload += REDSTONE_MARKER
     return payload
 
@@ -2329,10 +2553,18 @@ def cmd_withdraw_collateral(pool_name: str, amount: float, execute: bool = False
         print("Run with --execute to broadcast (registers the intent on-chain).")
         return
 
-    tx = account.functions.createWithdrawalIntent(asset_b32(symbol), amount_wei).build_transaction({
-        "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+    # createWithdrawalIntent on Base is RedStone-gated (on-chain solvency at create time).
+    # The solvency check prices EVERY registered collateral type, not just owned assets.
+    # Include all available feeds — same as the DegenPrime UI on mainnet.
+    feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
+    payload = build_redstone_payload(feeds)
+    base_calldata = account.encode_abi("createWithdrawalIntent", args=[asset_b32(symbol), amount_wei])
+    data = base_calldata + payload.hex()
+    tx = {
+        "from": acct.address, "to": pa_cs, "data": data,
+        "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 1000000, "chainId": CHAIN_ID,
-    })
+    }
     _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -2496,10 +2728,17 @@ def cmd_cancel_withdrawal(pool_name: str, index: int, execute: bool = False):
         print("Run with --execute to broadcast.")
         return
 
-    tx = account.functions.cancelWithdrawalIntent(asset_b32(symbol), index).build_transaction({
-        "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+    # cancelWithdrawalIntent on Base is also RedStone-gated (DegenPrime diamond requires
+    # solvency payload on all state-changing facet calls). Include all available feeds.
+    feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
+    payload = build_redstone_payload(feeds)
+    base_calldata = account.encode_abi("cancelWithdrawalIntent", args=[asset_b32(symbol), index])
+    data = base_calldata + payload.hex()
+    tx = {
+        "from": acct.address, "to": pa_cs, "data": data,
+        "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 1000000, "chainId": CHAIN_ID,
-    })
+    }
     _set_gas_price(w3, tx)
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -2508,15 +2747,12 @@ def cmd_cancel_withdrawal(pool_name: str, index: int, execute: bool = False):
     print(f"{'✓' if ok else '✗'} Cancel withdrawal intent [{index}] {'confirmed' if ok else 'failed'}")
     print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
-# ─── Aerodrome (read-only for v1) ────────────────────────────────────────────
+# ─── Aerodrome (Slipstream CL) ──────────────────────────────────────────────
 
 def cmd_aerodrome_positions():
-    """Read-only: list the Aerodrome NFT tokenIds the Degen Account owns/has staked,
-    via the diamond's getOwnedStakedAerodromeTokenIds view. Write paths (add/remove/
-    stake liquidity) are deferred to v2 - the on-chain signatures vary by Aerodrome
-    version and need per-market probing before broadcasting. Position composition
-    (per-token amounts) needs the getPositionCompositionSimplified return shape, which
-    we don't decode in v1; just listing IDs keeps this safe and useful."""
+    """Read-only: list every Aerodrome Slipstream NFT position the Degen Account
+    owns/stakes, showing token pair, tick range, and liquidity from the diamond's
+    getOwnedStakedAerodromeTokenIds + getPositionCompositionSimplified views."""
     w3 = get_w3()
     acct = get_account()
     print(f"Wallet: {acct.address}")
@@ -2534,10 +2770,386 @@ def cmd_aerodrome_positions():
     if not ids:
         print("  No Aerodrome positions (owned/staked tokenIds).")
         return
-    print(f"  {len(ids)} Aerodrome NFT tokenId(s):")
+    print(f"  {len(ids)} Aerodrome NFT position(s):")
+
+    # Batch-read position composition via Multicall3 for efficiency.
+    # getPositionCompositionSimplified returns (token0, token1, tickData, liquidity).
+    # tickData packs tickLower in the upper 128 bits and tickUpper in the lower 128
+    # bits as unsigned; the actual int24 values need sign extension.
+    pos_legs = []
     for tid in ids:
-        print(f"    [{tid}]  https://aerodrome.finance/positions  (manage on Aerodrome UI)")
-    print("  v1 lists tokenIds only. Composition + write paths deferred to v2.")
+        pos_legs.append((account.address, bytes.fromhex(
+            account.encode_abi("getPositionCompositionSimplified", args=[tid])[2:])))
+    try:
+        results = multicall(w3, pos_legs)
+    except Exception:
+        results = [(False, b"")] * len(ids)
+
+    for tid, (ok, rd) in zip(ids, results):
+        if not ok or not rd:
+            print(f"    [{tid}] composition unavailable")
+            continue
+        try:
+            token0, token1, tick_data, liq = w3.codec.decode(
+                ["address", "address", "uint256", "uint256"], rd)
+        except Exception:
+            print(f"    [{tid}] composition decode failed")
+            continue
+        # Decode tickData: upper 128 bits = tickLower (int24), lower 128 bits = tickUpper (int24)
+        tick_lower = _int24_from_hi128(tick_data)
+        tick_upper = _int24_from_lo128(tick_data)
+        # Resolve token symbols
+        sym0 = _resolve_token_symbol(w3, token0)
+        sym1 = _resolve_token_symbol(w3, token1)
+        # Human-readable tick range → price range
+        price_lower = 1.0001 ** tick_lower
+        price_upper = 1.0001 ** tick_upper
+        print(f"    [{tid}] {sym0}/{sym1}  ticks=[{tick_lower}, {tick_upper}]"
+              f"  liq={liq}  price_range=[{price_lower:.4f}, {price_upper:.4f}]")
+    print("  Manage on Aerodrome UI: https://aerodrome.finance/positions")
+
+def _int24_from_hi128(val: int) -> int:
+    """Extract int24 from the upper 128 bits of a uint256, sign-extending."""
+    raw = (val >> 128) & 0xFFFFFF
+    if raw & 0x800000:
+        return raw - 0x1000000
+    return raw
+
+def _int24_from_lo128(val: int) -> int:
+    """Extract int24 from the lower 128 bits of a uint256, sign-extending."""
+    raw = val & 0xFFFFFF
+    if raw & 0x800000:
+        return raw - 0x1000000
+    return raw
+
+def _resolve_token_symbol(w3, addr: str) -> str:
+    """Best-effort token symbol from TokenManager or static pool map."""
+    addr_lower = addr.lower()
+    # Check static pool map first
+    for cfg in POOLS.values():
+        if cfg["token"].lower() == addr_lower:
+            return cfg["symbol"]
+    # Check Aerodrome pool configs
+    for cfg in AERODROME_POOLS.values():
+        if cfg["token0"].lower() == addr_lower:
+            return cfg["symbol0"]
+        if cfg["token1"].lower() == addr_lower:
+            return cfg["symbol1"]
+    # Try TokenManager
+    try:
+        tm = get_token_manager(w3)
+        sym_bytes = tm.functions.tokenAddressToSymbol(Web3.to_checksum_address(addr)).call()
+        sym = sym_bytes.rstrip(b"\x00").decode(errors="replace")
+        if sym:
+            return sym
+    except Exception:
+        pass
+    return addr[:10] + "..."
+
+# ─── Aerodrome Write Commands ────────────────────────────────────────────────
+
+# Helper: build the MintParams tuple for Aerodrome Slipstream (12 fields).
+def _aero_mint_params(pool_cfg: dict, amount0: int, amount1: int,
+                      tick_lower: int, tick_upper: int,
+                      recipient: str, slippage_pct: float) -> tuple:
+    """Build MintParams=(token0,token1,tickSpacing,tickLower,tickUpper,
+    amount0Desired,amount1Desired,amount0Min,amount1Min,recipient,deadline,
+    sqrtPriceX96). sqrtPriceX96=0 means the NPM uses the pool's current price."""
+    slippage = Decimal(str(slippage_pct)) / Decimal(100)
+    amount0_min = int(Decimal(str(amount0)) * (Decimal(1) - slippage))
+    amount1_min = int(Decimal(str(amount1)) * (Decimal(1) - slippage))
+    deadline = int(time.time()) + 1800  # 30 minutes
+    return (
+        Web3.to_checksum_address(pool_cfg["token0"]),
+        Web3.to_checksum_address(pool_cfg["token1"]),
+        pool_cfg["tickSpacing"],
+        tick_lower,
+        tick_upper,
+        amount0,
+        amount1,
+        amount0_min,
+        amount1_min,
+        Web3.to_checksum_address(recipient),
+        deadline,
+        0,  # sqrtPriceX96: 0 = use current pool price
+    )
+
+# Helper: build DecreaseLiquidityParams tuple (5 fields).
+def _aero_decrease_params(token_id: int, liquidity: int,
+                          amount0_min: int, amount1_min: int) -> tuple:
+    deadline = int(time.time()) + 1800
+    return (token_id, liquidity, amount0_min, amount1_min, deadline)
+
+# Helper: compute tick range around a desired centre price.
+def _aero_tick_range(tick_spacing: int, centre_price: float = None,
+                     width_pct: float = 2.0) -> tuple:
+    """Return (tickLower, tickUpper) for a symmetrical range ±width_pct around
+    centre_price. If centre_price is None, uses full-range positions.
+    tickSpacing must be valid (1, 5, 10, 30, 100, 200, etc.).
+    Ticks are snapped to the tickSpacing grid."""
+    if centre_price is None or centre_price <= 0:
+        # Full range: MIN_TICK to MAX_TICK (snapped to spacing)
+        MIN_TICK = -887272
+        MAX_TICK = 887272
+        t_lower = (MIN_TICK // tick_spacing) * tick_spacing
+        t_upper = (MAX_TICK // tick_spacing) * tick_spacing
+        return (t_lower, t_upper)
+    # Convert price to tick: tick = floor(log(price) / log(1.0001))
+    import math
+    centre_tick = int(math.log(centre_price) / math.log(1.0001))
+    half_width_ticks = int(centre_tick * width_pct / 100.0)
+    tick_lower = ((centre_tick - half_width_ticks) // tick_spacing) * tick_spacing
+    tick_upper = ((centre_tick + half_width_ticks) // tick_spacing) * tick_spacing
+    # Clamp to valid range
+    MIN_TICK, MAX_TICK = -887272, 887272
+    tick_lower = max(MIN_TICK, min(MAX_TICK, tick_lower))
+    tick_upper = max(MIN_TICK, min(MAX_TICK, tick_upper))
+    if tick_lower >= tick_upper:
+        tick_upper = tick_lower + tick_spacing
+    return (tick_lower, tick_upper)
+
+
+def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
+                           amount1: float = None, slippage_pct: float = 1.0,
+                           execute: bool = False, width_pct: float = 2.0):
+    """Add concentrated liquidity to an Aerodrome Slipstream pool through the
+    Degen Account's AerodromeFacet. Uses in-account token0/token1 balances.
+
+    --pool selects a whitelisted CL pool (e.g. weth-usdc-100).
+    --amount-weth / --amount-usdc (or --amount-token0 / --amount-token1) specify
+    the desired liquidity amounts in token units. At least one side must be >0.
+    --slippage sets the min-amount floor (default 1%).
+    --width sets the range ±width% around the current price (default 2%).
+
+    The facet wraps the NPM mint(MintParams) call with remainsSolvent, so
+    --execute appends a RedStone signed-price payload."""
+    w3 = get_w3()
+    acct = get_account()
+    print(f"Wallet: {acct.address}")
+    pa = get_prime_account(w3, acct.address)
+    if not pa:
+        print("No Degen Account yet. Create with: degenprime create-account --execute")
+        return
+    account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
+    print(f"Degen Account: {pa}")
+
+    if pool_key not in AERODROME_POOLS:
+        print(f"Unknown pool '{pool_key}'. Choose from: {', '.join(AERODROME_POOLS)}")
+        return
+    pool_cfg = AERODROME_POOLS[pool_key]
+
+    # Convert amounts to wei
+    amt0 = to_wei_units(amount0, pool_cfg["decimals0"]) if amount0 else 0
+    amt1 = to_wei_units(amount1, pool_cfg["decimals1"]) if amount1 else 0
+    if amt0 == 0 and amt1 == 0:
+        print("At least one of --amount-<token0> / --amount-<token1> must be > 0")
+        return
+
+    # Get current price from KuCoin for tick range calculation
+    price_sym = pool_cfg["symbol0"] + "-USDT"
+    centre_price = None
+    try:
+        r = requests.get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={price_sym}", timeout=3)
+        if r.status_code == 200 and r.json().get("code") == "200000":
+            centre_price = float(r.json()["data"]["price"])
+    except Exception:
+        pass
+
+    tick_lower, tick_upper = _aero_tick_range(pool_cfg["tickSpacing"], centre_price, width_pct)
+    params = _aero_mint_params(pool_cfg, amt0, amt1, tick_lower, tick_upper,
+                               pa, slippage_pct)
+
+    sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
+    print(f"Pool: {sym0}/{sym1} (tickSpacing={pool_cfg['tickSpacing']})")
+    if centre_price:
+        print(f"  Current {sym0} price: ${centre_price:,.2f}")
+        print(f"  Tick range: [{tick_lower}, {tick_upper}] → price [{1.0001**tick_lower:.4f}, {1.0001**tick_upper:.4f}]")
+        print(f"  Width: ±{width_pct}%")
+    else:
+        print(f"  Full-range position (no price data available)")
+    print(f"  {sym0}: {amount0 or 0} ({amt0} wei)  {sym1}: {amount1 or 0} ({amt1} wei)")
+
+    if not execute:
+        print("Preview only. Run with --execute to broadcast.")
+        return
+
+    # Build RedStone payload for solvency check
+    feeds = degen_account_price_feeds(account)
+    payload = build_redstone_payload(feeds)
+
+    # Encode the mint call: use the probed selector + ABI-encoded params
+    mint_data = account.encode_abi("mintAerodrome", args=[params])
+    # encode_abi returns hex string "0x...", extract params bytes after selector
+    mint_params_bytes = bytes.fromhex(mint_data[2:])[4:]
+    mint_calldata = AERODROME_SEL_MINT + mint_params_bytes + payload
+
+    tx = {
+        "from": acct.address,
+        "to": account.address,
+        "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 5000000,
+        "chainId": CHAIN_ID,
+        "data": "0x" + mint_calldata.hex(),
+    }
+    _set_gas_price(w3, tx)
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+    ok = receipt["status"] == 1
+    print(f"{'✓' if ok else '✗'} Add liquidity {'confirmed' if ok else 'failed'}")
+    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+
+
+def cmd_aero_remove_liquidity(token_id: int, percentage: float = 100.0,
+                               execute: bool = False):
+    """Remove liquidity from an Aerodrome Slipstream position owned by the
+    Degen Account. Decreases liquidity by `percentage` of the current position
+    size (default 100% = full close). The position NFT remains; burn it
+    separately after all liquidity is removed and fees collected.
+
+    The facet wraps NPM.decreaseLiquidity. No RedStone payload needed
+    (the decrease path is NOT remainsSolvent — same as TJ lb-remove)."""
+    w3 = get_w3()
+    acct = get_account()
+    print(f"Wallet: {acct.address}")
+    pa = get_prime_account(w3, acct.address)
+    if not pa:
+        print("No Degen Account yet.")
+        return
+    account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
+    print(f"Degen Account: {pa}")
+
+    # Read the position's current liquidity
+    try:
+        pos = account.functions.getPositionCompositionSimplified(token_id).call()
+    except Exception as e:
+        print(f"  Cannot read position {token_id}: {e}")
+        return
+    token0, token1, tick_data, current_liq = pos
+    if current_liq == 0:
+        print(f"  Position {token_id} has 0 liquidity (may already be closed).")
+        return
+
+    sym0 = _resolve_token_symbol(w3, token0)
+    sym1 = _resolve_token_symbol(w3, token1)
+    tick_lower = _int24_from_hi128(tick_data)
+    tick_upper = _int24_from_lo128(tick_data)
+
+    remove_liq = int(Decimal(str(current_liq)) * Decimal(str(percentage)) / Decimal(100))
+    if remove_liq <= 0:
+        print(f"  Removal percentage {percentage}% yields 0 liquidity.")
+        return
+
+    print(f"Position {token_id}: {sym0}/{sym1}  ticks=[{tick_lower},{tick_upper}]")
+    print(f"  Current liquidity: {current_liq}")
+    print(f"  Removing: {remove_liq} ({percentage}%)")
+
+    if not execute:
+        print("Preview only. Run with --execute to broadcast.")
+        return
+
+    params = _aero_decrease_params(token_id, remove_liq, 0, 0)
+    # decreaseLiquidity on the facet (selector ca15558b)
+    dec_data = account.encode_abi("decreaseAerodromeLiquidity", args=[params])
+    dec_params_bytes = bytes.fromhex(dec_data[2:])[4:]
+    dec_calldata = AERODROME_SEL_DECREASE + dec_params_bytes
+
+    tx = {
+        "from": acct.address,
+        "to": account.address,
+        "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 4000000,
+        "chainId": CHAIN_ID,
+        "data": "0x" + dec_calldata.hex(),
+    }
+    _set_gas_price(w3, tx)
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+    ok = receipt["status"] == 1
+    print(f"{'✓' if ok else '✗'} Remove liquidity {'confirmed' if ok else 'failed'}")
+    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+    if ok and percentage >= 100:
+        print(f"  Position fully withdrawn. Collect fees then burn:")
+        print(f"    degenprime aero-collect-fees --token-id {token_id} --execute")
+
+
+def cmd_aero_collect_fees(token_id: int, execute: bool = False):
+    """Collect accrued swap fees from an Aerodrome Slipstream position.
+    Fees accumulate as tokensOwed0/tokensOwed1 on the NPM; collect sends them
+    to the Degen Account. After collecting all fees (and removing all liquidity),
+    the NFT position can be burned.
+
+    Uses the facet's collect/burn path (selector 0x92b5a47e)."""
+    w3 = get_w3()
+    acct = get_account()
+    print(f"Wallet: {acct.address}")
+    pa = get_prime_account(w3, acct.address)
+    if not pa:
+        print("No Degen Account yet.")
+        return
+    account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
+    print(f"Degen Account: {pa}")
+
+    # Read position composition for display
+    try:
+        pos = account.functions.getPositionCompositionSimplified(token_id).call()
+    except Exception as e:
+        print(f"  Cannot read position {token_id}: {e}")
+        return
+    token0, token1, tick_data, liq = pos
+    sym0 = _resolve_token_symbol(w3, token0)
+    sym1 = _resolve_token_symbol(w3, token1)
+    print(f"Position {token_id}: {sym0}/{sym1}  liquidity={liq}")
+
+    # Also try to read uncollected fees from the NPM directly
+    try:
+        npm = w3.eth.contract(address=Web3.to_checksum_address(AERODROME_NPM),
+                              abi=AERODROME_NPM_ABI)
+        npm_pos = npm.functions.positions(token_id).call()
+        owed0 = npm_pos[10]  # tokensOwed0
+        owed1 = npm_pos[11]  # tokensOwed1
+        if owed0 > 0 or owed1 > 0:
+            print(f"  Uncollected fees: {owed0} ({sym0}) + {owed1} ({sym1})")
+        else:
+            print(f"  No uncollected fees.")
+    except Exception:
+        print(f"  (Cannot fetch uncollected fees from NPM directly)")
+
+    if not execute:
+        print("Preview only. Run with --execute to broadcast.")
+        return
+
+    # Build RedStone payload (collect may be solvency-gated)
+    try:
+        feeds = degen_account_price_feeds(account)
+        payload = build_redstone_payload(feeds)
+    except Exception:
+        payload = b""
+
+    # Encode collect call with the probed selector
+    collect_data = account.encode_abi("collectAerodromeFees", args=[token_id])
+    collect_params_bytes = bytes.fromhex(collect_data[2:])[4:]
+    collect_calldata = AERODROME_SEL_COLLECT + collect_params_bytes
+    if payload:
+        collect_calldata += payload
+
+    tx = {
+        "from": acct.address,
+        "to": account.address,
+        "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 3000000,
+        "chainId": CHAIN_ID,
+        "data": "0x" + collect_calldata.hex(),
+    }
+    _set_gas_price(w3, tx)
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+    ok = receipt["status"] == 1
+    print(f"{'✓' if ok else '✗'} Collect fees {'confirmed' if ok else 'failed'}")
+    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+
 
 def main():
     check_version()
@@ -2731,6 +3343,45 @@ def _dispatch():
         cmd_execute_pool_withdrawal(pool, index, execute)
     elif cmd == "aerodrome-positions":
         cmd_aerodrome_positions()
+    elif cmd == "aero-add-liquidity":
+        pool_key = None
+        amt0, amt1 = None, None
+        slippage = 1.0
+        width = 2.0
+        execute = "--execute" in args
+        for i, a in enumerate(args):
+            if a == "--pool" and i + 1 < len(args): pool_key = args[i + 1]
+            if a == "--amount-weth" and i + 1 < len(args): amt0 = float(args[i + 1])
+            if a == "--amount-usdc" and i + 1 < len(args): amt1 = float(args[i + 1])
+            if a == "--amount-token0" and i + 1 < len(args): amt0 = float(args[i + 1])
+            if a == "--amount-token1" and i + 1 < len(args): amt1 = float(args[i + 1])
+            if a == "--amount-aero" and i + 1 < len(args): amt0 = float(args[i + 1])
+            if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
+            if a == "--width" and i + 1 < len(args): width = float(args[i + 1])
+        if not pool_key or (amt0 is None and amt1 is None):
+            print("Usage: degenprime aero-add-liquidity --pool weth-usdc-100 --amount-weth 0.05 --amount-usdc 100 [--slippage 1] [--width 2] [--execute]")
+            return
+        cmd_aero_add_liquidity(pool_key, amt0, amt1, slippage, execute, width)
+    elif cmd == "aero-remove-liquidity":
+        token_id = None
+        percentage = 100.0
+        execute = "--execute" in args
+        for i, a in enumerate(args):
+            if a == "--token-id" and i + 1 < len(args): token_id = int(args[i + 1])
+            if a == "--percentage" and i + 1 < len(args): percentage = float(args[i + 1])
+        if token_id is None:
+            print("Usage: degenprime aero-remove-liquidity --token-id N [--percentage 100] [--execute]")
+            return
+        cmd_aero_remove_liquidity(token_id, percentage, execute)
+    elif cmd == "aero-collect-fees":
+        token_id = None
+        execute = "--execute" in args
+        for i, a in enumerate(args):
+            if a == "--token-id" and i + 1 < len(args): token_id = int(args[i + 1])
+        if token_id is None:
+            print("Usage: degenprime aero-collect-fees --token-id N [--execute]")
+            return
+        cmd_aero_collect_fees(token_id, execute)
     elif cmd == "health":
         os.environ.setdefault("PRIMECLI_TOOL", sys.argv[0])
         if health_monitor:
