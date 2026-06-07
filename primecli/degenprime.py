@@ -1114,7 +1114,9 @@ def build_redstone_payload(symbols: list) -> bytes:
     # Metadata = rest of timestamp + version + data service ID + null terminator
     signed_metadata = f"{ts_str[1:]}#0.9.0#{REDSTONE_DATA_SERVICE}\0".encode()
     payload += signed_metadata
-    payload += len(signed_metadata).to_bytes(2, "big")
+    # Unsigned metadata size = padding(3) + ts_digit(1) + signed_metadata
+    unsigned_meta_size = len(signed_metadata) + 4
+    payload += unsigned_meta_size.to_bytes(3, "big")
     payload += REDSTONE_MARKER
     return payload
 
@@ -2150,9 +2152,7 @@ def cmd_borrow(pool_name: str, amount: float, execute: bool = False):
     pa_cs = Web3.to_checksum_address(pa)
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
     # borrow has remainsSolvent -> needs RedStone price payload appended to calldata.
-    feeds = degen_account_price_feeds(account)
-    if symbol in REDSTONE_AVAILABLE_FEEDS and symbol not in feeds:
-        feeds.append(symbol)
+    feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
     payload = build_redstone_payload(feeds)
     base_calldata = account.encode_abi("borrow", args=[asset_b32(symbol), amount_wei])
     data = base_calldata + payload.hex()
@@ -2883,9 +2883,7 @@ def cmd_execute_withdrawal(pool_name: str, index: int = None, execute: bool = Fa
         print("Run with --execute to broadcast (pulls the funds to the wallet).")
         return
 
-    feeds = degen_account_price_feeds(account)
-    if symbol in REDSTONE_AVAILABLE_FEEDS and symbol not in feeds:
-        feeds.append(symbol)
+    feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
     payload = build_redstone_payload(feeds)
     base_calldata = account.encode_abi("executeWithdrawalIntent", args=[asset_b32(symbol), ready])
     data = base_calldata + payload.hex()

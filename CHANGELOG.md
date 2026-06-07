@@ -4,6 +4,27 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.7.1] - 2026-06-07
+
+### Fixed
+- **DegenAccount `executeWithdrawalIntent` RedStone feed selection (Base).**
+  `cmd_execute_withdrawal` was using `degen_account_price_feeds(account)` which
+  returns only ETH + USDC (the two feeds the Degen Account directly holds), but
+  the on-chain `remainsSolvent` check needs prices for ALL 13 registered
+  collateral types that could be liquidated together. Changed to
+  `sorted(REDSTONE_AVAILABLE_FEEDS)` to match the creation path
+  (`cmd_withdraw_collateral`, `cmd_borrow`).
+  
+- **RedStone payload unsigned-metadata byte-size mismatch (Base).**
+  `build_redstone_payload` wrote the unsigned-metadata length as 2 bytes
+  (`len(signed_metadata).to_bytes(2, "big")`), but the RedStone on-chain
+  contract reads it as `uint24` (3 bytes). This shift caused
+  `CalldataOverOrUnderFlow()` on every tx that carries a fresh RedStone payload.
+  Fixed to store 3 bytes with the correct total: `len(signed_metadata) + 4`
+  (because fields between the data-package count and the size field — padding,
+  timestamp digit, and the metadata string itself — all count toward the
+  unsigned-metadata region the contract skips).
+
 ## [0.7.0] - 2026-06-06
 
 ### Changed
