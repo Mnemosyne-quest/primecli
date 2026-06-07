@@ -39,7 +39,7 @@ All notable changes to `primecli` are documented here. The format follows
   timestamp digit, and the metadata string itself — all count toward the
   unsigned-metadata region the contract skips).
 
-## [Unreleased]
+## [0.7.3] - 2026-06-07
 
 ### Added
 - **`_sign_and_send()` centralized tx send helper** across all three tools:
