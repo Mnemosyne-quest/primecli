@@ -48,6 +48,7 @@ SHARED_FUNCS = [
     # account's health identically wrongly on whichever chain drifted.
     "_health_meter_pct",
     "_resolve_debt_coverages",
+    "_estimate_gas_limit",
 ]
 
 

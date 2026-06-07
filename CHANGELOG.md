@@ -39,24 +39,29 @@ All notable changes to `primecli` are documented here. The format follows
   timestamp digit, and the metadata string itself — all count toward the
   unsigned-metadata region the contract skips).
 
+## [Unreleased]
+
+### Added
+- **`_sign_and_send()` centralized tx send helper** across all three tools:
+  - Always estimates gas from final calldata (incl. RedStone payload) with configurable buffer.
+  - Detects out-of-gas (gasUsed == gasLimit) on failure and retries once with 50% more buffer.
+  - Prints `✓ label confirmed` + tx link on success, `✗ label failed` + gasUsed/gasLimit on failure.
+  - Replaces ~50 inline sign+send+wait+print blocks across all tools with a single helper call.
+  - Tests: `test_gas_limit.py` covers estimation, fallback, out-of-gas detection logic.
+
+### Changed
+- **All tx broadcast paths now use `_sign_and_send()`**:
+  - Every borrow, deposit, withdraw, fund, repay, swap, swap-debt, GMX, LB,
+    sJOE, Aerodrome, PRIME, and bridge operation across deltaprime, arbprime,
+    and degenprime now estimates gas dynamically and has OOG retry.
+  - Net reduction of ~140 lines of boilerplate.
+
 ### Fixed
-- **DegenAccount `executeWithdrawalIntent` RedStone feed selection (Base).**
-  `cmd_execute_withdrawal` was using `degen_account_price_feeds(account)` which
-  returns only ETH + USDC (the two feeds the Degen Account directly holds), but
-  the on-chain `remainsSolvent` check needs prices for ALL 13 registered
-  collateral types that could be liquidated together. Changed to
-  `sorted(REDSTONE_AVAILABLE_FEEDS)` to match the creation path
-  (`cmd_withdraw_collateral`, `cmd_borrow`).
-  
-- **RedStone payload unsigned-metadata byte-size mismatch (Base).**
-  `build_redstone_payload` wrote the unsigned-metadata length as 2 bytes
-  (`len(signed_metadata).to_bytes(2, "big")`), but the RedStone on-chain
-  contract reads it as `uint24` (3 bytes). This shift caused
-  `CalldataOverOrUnderFlow()` on every tx that carries a fresh RedStone payload.
-  Fixed to store 3 bytes with the correct total: `len(signed_metadata) + 4`
-  (because fields between the data-package count and the size field — padding,
-  timestamp digit, and the metadata string itself — all count toward the
-  unsigned-metadata region the contract skips).
+- Borrow, swap, and swap-debt broadcasts now estimate gas from the final calldata
+  (including the RedStone payload) and add a 25% buffer before signing. This fixes routes
+  that simulated cleanly at an 8M gas allowance but reverted on broadcast under the old
+  fixed 3M swap cap (seen live on Base DegenPrime USDC→AERO, which needed ~4.24M gas).
+  If RPC estimation fails, the tools keep the previous fixed cap rather than crashing.
 
 ## [0.7.0] - 2026-06-06
 

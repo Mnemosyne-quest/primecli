@@ -692,6 +692,20 @@ def _set_gas_price(w3, tx_dict):
         # Legacy chain — use gasPrice instead
         tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 1 * 10**9)
 
+def _estimate_gas_limit(w3, tx_dict, fallback_gas: int, buffer_bps: int = 1250) -> int:
+    """Estimate gas for final calldata and add a buffer.
+
+    Solvency-gated swap paths append RedStone payloads and can vary materially by
+    route. A fixed cap can pass simulation at a high gas allowance, then revert
+    out-of-gas on broadcast. If the RPC cannot estimate, keep the old fixed cap.
+    """
+    try:
+        call_tx = {k: tx_dict[k] for k in ("from", "to", "data", "value") if k in tx_dict}
+        estimated = int(w3.eth.estimate_gas(call_tx))
+        return max(int(fallback_gas), (estimated * int(buffer_bps) + 999) // 1000)
+    except Exception:
+        return int(fallback_gas)
+
 def _set_gas_price_for(chain_id, w3, tx_dict):
     """Set gas fields for an EXPLICIT chain_id rather than the module CHAIN_ID. Needed by
     cross-chain flows (prime-bridge) where a tx may target Avalanche or Arbitrum regardless
@@ -731,6 +745,64 @@ def _agent_key(agent):
     if not key:
         raise RuntimeError(f"{var} not found in {path} (agent '{agent}').")
     return key
+
+def _sign_and_send(w3, acct, tx, label, timeout=180, fallback_gas=3000000, buffer_bps=1250, gas_price_fn=None):
+    """Sign, send, wait for a tx with gas estimation + OOG retry + error surfacing.
+
+    Always estimates gas from final calldata (incl. RedStone payload) then adds a
+    buffer. If the tx fails with status=0 and gasUsed == gasLimit (out of gas),
+    retries once with 50% more buffer. Surfaces the gas stats on any failure.
+
+    Gas limit override logic:
+    - If tx dict has a non-None "gas" key, use that as the starting fallback_gas
+      (removes the dict key so estimation is authoritative).
+      This lets callers set a minimum via fallback_gas without hardcoding the
+      broadcast limit.
+    - Always runs _estimate_gas_limit to compute the final cap.
+    - Ignores any "gas" key set in the tx dict before calling this function.
+
+    Returns the receipt (status 0 or 1). Prints status and tx link.
+    """
+    # If caller left a stale gas value in the dict, discard it — estimation is authoritative
+    tx.pop("gas", None)
+    tx["gas"] = _estimate_gas_limit(w3, tx, fallback_gas, buffer_bps)
+    if gas_price_fn:
+        gas_price_fn(w3, tx)
+    else:
+        _set_gas_price(w3, tx)
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+    ok = receipt["status"] == 1
+    if ok:
+        print(f"{'✓'} {label} confirmed")
+        print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+        return receipt
+
+    # Failure analysis
+    gas_used = receipt.get("gasUsed", 0)
+    gas_limit = tx.get("gas", 1)
+    is_oog = gas_used >= gas_limit
+    print(f"{'✗'} {label} failed (gasUsed={gas_used:,} / limit={gas_limit:,})")
+    if is_oog:
+        new_bps = buffer_bps * 3 // 2
+        print(f"  Out of gas. Retrying with {new_bps//10}% buffer...")
+        tx["nonce"] = w3.eth.get_transaction_count(acct.address)
+        tx.pop("gas", None)
+        tx["gas"] = _estimate_gas_limit(w3, tx, int(fallback_gas * 1.5), new_bps)
+        signed = acct.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        ok = receipt["status"] == 1
+        if ok:
+            print(f"{'✓'} {label} confirmed on retry")
+            print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+        else:
+            print(f"{'✗'} {label} failed again on retry")
+        return receipt
+    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+    return receipt
+
 
 def resolve_private_key():
     # The same EVM key works on every chain, so each ARBPRIME_ var falls back to its
@@ -1451,12 +1523,11 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
         # Gas: the native path wraps ETH→WETH + does the pool accounting +
         # internal rate update, so it needs more than the ERC20 branch's 200k.
         # 500k clears it cleanly.
-        tx = contract.functions.depositNativeToken().build_transaction({
+        dep_tx = contract.functions.depositNativeToken().build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
             "gas": 500000, "chainId": CHAIN_ID, "value": amount_wei,
         })
-        _set_gas_price(w3, tx)
-        signed = acct.sign_transaction(tx)
+        receipt = _sign_and_send(w3, acct, dep_tx, "Deposit (native)", timeout=120, fallback_gas=500000)
     else:
         # Approve
         token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]),
@@ -1475,14 +1546,8 @@ def cmd_deposit(pool_name: str, amount: float, execute: bool = False):
             "from": acct.address, "nonce": _dep_nonce + 1,
             "gas": 400000, "chainId": CHAIN_ID,
         })
-        _set_gas_price(w3, dep_tx)
-        signed = acct.sign_transaction(dep_tx)
-
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        receipt = _sign_and_send(w3, acct, dep_tx, f"Deposit {amount} {cfg['symbol']}", timeout=120, fallback_gas=400000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Deposit {amount} {cfg['symbol']} {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
     """Pool-side (LENDER) withdraw — step 1 of a 24h delayed flow.
@@ -1522,13 +1587,8 @@ def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
         "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 400000, "chainId": CHAIN_ID,
     })
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, "Lender withdrawal intent", fallback_gas=400000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Lender withdrawal intent {'registered' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 def cmd_withdrawal_requests():
     """Read-only: list pending lender withdrawal intents per pool, with current deposit.
@@ -1648,13 +1708,8 @@ def cmd_execute_withdrawal_request(pool_name: str, index: int = None, execute: b
         "gas": 600000, "chainId": CHAIN_ID,
         "data": data,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, "Execute lender withdrawal", fallback_gas=600000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Execute lender withdrawal {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 def cmd_cancel_withdrawal_request(pool_name: str, index: int, execute: bool = False):
     """Cancel a pending lender withdrawal intent on the pool via
@@ -1687,13 +1742,8 @@ def cmd_cancel_withdrawal_request(pool_name: str, index: int, execute: bool = Fa
         "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 300000, "chainId": CHAIN_ID,
     })
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, "Cancel lender withdrawal intent", fallback_gas=300000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Cancel lender withdrawal intent {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 # ─── Prime Account commands ──────────────────────────────────────────────────
 
@@ -1769,14 +1819,9 @@ def cmd_create_prime_account(execute: bool = False, fund_pool: str = None, fund_
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
             "gas": 4000000, "chainId": CHAIN_ID,
         })
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
-    ok = receipt["status"] == 1
     label = "Create+fund Prime Account" if funding else "Create Prime Account"
-    print(f"{'✓' if ok else '✗'} {label} {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+    receipt = _sign_and_send(w3, acct, tx, label, fallback_gas=4000000)
+    ok = receipt["status"] == 1
     if ok:
         # getLoanForOwner can lag a beat behind the receipt; poll briefly so we
         # print the new account address instead of None right after creation.
@@ -1824,11 +1869,10 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
 
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
     if cfg["native"]:
-        tx = account.functions.depositNativeToken().build_transaction({
+        fund_tx = account.functions.depositNativeToken().build_transaction({
             "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
             "gas": 3000000, "chainId": CHAIN_ID, "value": amount_wei,
         })
-        _set_gas_price(w3, tx)
         signed = acct.sign_transaction(tx)
     else:
         token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]),
@@ -1848,15 +1892,9 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
             "from": acct.address, "nonce": _fund_nonce,
             "gas": 3000000, "chainId": CHAIN_ID,
         })
-        _set_gas_price(w3, fund_tx)
-        signed = acct.sign_transaction(fund_tx)
-
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
-    ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Fund {amount} {symbol} {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
-    return ok
+        receipt = _sign_and_send(w3, acct, fund_tx, f"Fund {amount} {symbol}", fallback_gas=3000000)
+        ok = receipt["status"] == 1
+        return ok
 
 def _prices_usd(w3, account, symbols: list, payload: bytes) -> dict:
     """Best-effort per-symbol USD price map via the RedStone-gated getPrices view (1e8-scaled).
@@ -2276,15 +2314,10 @@ def cmd_borrow(pool_name: str, amount: float, execute: bool = False):
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 4000000, "chainId": CHAIN_ID,
+        "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, f"Borrow {amount} {symbol}", fallback_gas=4000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Borrow {amount} {symbol} {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
     return ok
 
 def cmd_repay(pool_name: str, amount: float, execute: bool = False):
@@ -2365,14 +2398,9 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 4000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, f"Repay {amount_wei / 10**cfg['decimals']:.6f} {symbol}", fallback_gas=4000000)
     ok = receipt["status"] == 1
     repaid = amount_wei / 10**cfg['decimals']
-    print(f"{'✓' if ok else '✗'} Repay {repaid:.6f} {symbol} {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
     if not ok:
         _print_revert_reason(w3, tx, receipt)
 
@@ -2612,16 +2640,10 @@ def _swap_via_paraswap(w3, acct, pa_cs, account, from_sym, to_sym, from_cfg, to_
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 3000000, "chainId": CHAIN_ID,
+        "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, f"Swap {amount} {from_sym} -> {to_sym}", fallback_gas=3000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Swap {amount} {from_sym} -> {to_sym} "
-          f"{'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
     return ok
 
 def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.0,
@@ -2721,16 +2743,10 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 3000000, "chainId": CHAIN_ID,
+        "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, f"Swap {amount} {from_sym} -> {to_sym}", fallback_gas=3000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Swap {amount} {from_sym} -> {to_sym} "
-          f"{'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
     return ok
 
 # ─── Swap debt / refinance (SwapDebtFacet) ───────────────────────────────────
@@ -2909,18 +2925,13 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         tx = {
             "from": acct.address, "to": pa_cs, "data": base_borrow + exec_payload.hex(),
             "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 4000000, "chainId": CHAIN_ID,
+            "chainId": CHAIN_ID,
         }
-        _set_gas_price(w3, tx)
-        signed = acct.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        receipt = _sign_and_send(w3, acct, tx, "Borrow (swap-debt fallback)", fallback_gas=4000000)
         if receipt["status"] != 1:
             print(f"  ✗ Borrow failed — aborting fallback sequence.")
-            print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
             return
-        print(f"  ✓ Borrowed {borrow_amount / 10**to_cfg['decimals']:.6f} {to_sym}")
-        print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+
 
         # Re-check health after borrow (fresh payload).
         fresh_payload = build_redstone_payload(prime_account_price_feeds(account))
@@ -2952,15 +2963,11 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         tx2 = {
             "from": acct.address, "to": pa_cs, "data": base_swap + swap_payload2.hex(),
             "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 3000000, "chainId": CHAIN_ID,
+            "chainId": CHAIN_ID,
         }
-        _set_gas_price(w3, tx2)
-        signed2 = acct.sign_transaction(tx2)
-        tx_hash2 = w3.eth.send_raw_transaction(signed2.raw_transaction)
-        receipt2 = w3.eth.wait_for_transaction_receipt(tx_hash2, timeout=180)
+        receipt2 = _sign_and_send(w3, acct, tx2, "Swap (swap-debt fallback)", fallback_gas=3000000)
         if receipt2["status"] != 1:
             print(f"  ✗ Swap failed — aborting fallback sequence.")
-            print(f"  Tx: {EXPLORER}/tx/{tx_hash2.hex()}")
             print(f"  Steps completed: 1 (borrow). You may need to manually swap & repay.")
             return
         print(f"  ✓ Swapped {to_sym} -> {from_sym}")
@@ -2990,15 +2997,10 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         tx3 = {
             "from": acct.address, "to": pa_cs, "data": base_reply + repay_payload3.hex(),
             "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 4000000, "chainId": CHAIN_ID,
+            "chainId": CHAIN_ID,
         }
-        _set_gas_price(w3, tx3)
-        signed3 = acct.sign_transaction(tx3)
-        tx_hash3 = w3.eth.send_raw_transaction(signed3.raw_transaction)
-        receipt3 = w3.eth.wait_for_transaction_receipt(tx_hash3, timeout=180)
+        receipt3 = _sign_and_send(w3, acct, tx3, f"Repaid (swap-debt fallback)", fallback_gas=4000000)
         ok3 = receipt3["status"] == 1
-        print(f"{'  ✓' if ok3 else '  ✗'} Repaid {actual_reply/10**from_cfg['decimals']:.6f} {from_sym} {'confirmed' if ok3 else 'failed'}")
-        print(f"  Tx: {EXPLORER}/tx/{tx_hash3.hex()}")
         if not ok3:
             print(f"  Steps completed: 1 (borrow), 2 (swap). Repay failed — check manually.")
         else:
@@ -3097,15 +3099,10 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     tx = {
         "from": acct.address, "to": pa_cs, "data": data,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 4000000, "chainId": CHAIN_ID,
+        "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, f"Swap debt {from_sym} -> {to_sym}", fallback_gas=4000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Swap debt {from_sym} -> {to_sym} {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 # ─── Collateral withdrawal (WithdrawalIntentFacet) ──────────────────────────
 # Pulling collateral out of the Prime Account to the EOA is a two-step, time-delayed
@@ -3216,13 +3213,8 @@ def cmd_cancel_withdrawal(pool_name: str, index: int, execute: bool = False):
         "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 500000, "chainId": CHAIN_ID,
     })
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    receipt = _sign_and_send(w3, acct, tx, f"Cancel withdrawal [{index}]", timeout=120, fallback_gas=1000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Withdrawal intent [{index}] {'cancelled' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 
 def cmd_withdrawal_intents():
@@ -3337,13 +3329,8 @@ def cmd_execute_withdrawal(pool_name: str, index: int = None, execute: bool = Fa
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 3000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, "Execute withdrawal", fallback_gas=3000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Execute withdrawal {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 # ─── GMX V2 GM / GM+ LP (GmxV2FacetArbitrum / GmxV2PlusFacetArbitrum) ─────────
 # GM tokens are GMX V2 market LP (two-sided long+short for GM, single-sided for GM+).
@@ -3709,13 +3696,8 @@ def cmd_gmx_deposit(market: str, amount: float, is_long: bool | None = None,
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 5000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, f"GMX {kind} deposit request", fallback_gas=5000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} GMX {kind} deposit request {'submitted' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
     if ok:
         print("  Request queued — wait for the GMX keeper callback to mint the GM tokens.")
     return ok
@@ -3843,13 +3825,8 @@ def cmd_gmx_withdraw(market: str, amount: float, slippage_pct: float = 1.0,
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 5000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, f"GMX {kind} withdrawal request", fallback_gas=5000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} GMX {kind} withdrawal request {'submitted' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
     if ok:
         print("  Request queued — wait for the GMX keeper callback to return the underlying(s).")
 
@@ -4069,13 +4046,8 @@ def cmd_glv_deposit(vault_key: str, amount: float, is_long: bool | None = None,
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 5000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, "GLV deposit request", fallback_gas=5000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} GLV deposit request {'submitted' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
     if ok:
         print("  Request queued — wait for the GMX keeper callback to mint the GLV tokens.")
     return ok
@@ -4190,13 +4162,8 @@ def cmd_glv_withdraw(vault_key: str, amount: float, target_market: str = None,
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 5000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, "GLV withdrawal request", fallback_gas=5000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} GLV withdrawal request {'submitted' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
     if ok:
         print("  Request queued — wait for the GMX keeper callback to return the underlying(s).")
     return ok
@@ -4541,13 +4508,8 @@ def cmd_lb_add(pair_key: str, amount_x: float, amount_y: float, shape: str = "sp
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": gas, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, "LB add", fallback_gas=5000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} LB add {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
     return ok
 
 
@@ -4639,13 +4601,8 @@ def cmd_lb_remove(pair_key: str, slippage_pct: float = 1.0, execute: bool = Fals
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 5000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    receipt = _sign_and_send(w3, acct, tx, "LB remove", fallback_gas=5000000)
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} LB remove {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
 
 # ─── PRIME-token leverage tiers (PrimeLeverageFacet) ─────────────────────────
 
@@ -4841,11 +4798,8 @@ def cmd_prime_activate(amount: float = None, execute: bool = False):
             "nonce": nonce + 1,
             "gas": 3000000, "chainId": CHAIN_ID,
         }
-        _set_gas_price(w3, dep_tx)
-        dep_hash = w3.eth.send_raw_transaction(acct.sign_transaction(dep_tx).raw_transaction)
-        dep_ok = w3.eth.wait_for_transaction_receipt(dep_hash, timeout=180)["status"] == 1
-        print(f"{'✓' if dep_ok else '✗'} depositPrime {'confirmed' if dep_ok else 'failed'}")
-        print(f"  Tx: {EXPLORER}/tx/{dep_hash.hex()}")
+        receipt = _sign_and_send(w3, acct, dep_tx, "depositPrime", fallback_gas=3000000)
+        dep_ok = receipt["status"] == 1
         if not dep_ok:
             print("  Aborting — not activating PREMIUM after a failed deposit.")
             return
@@ -4860,11 +4814,8 @@ def cmd_prime_activate(amount: float = None, execute: bool = False):
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 3000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    tx_hash = w3.eth.send_raw_transaction(acct.sign_transaction(tx).raw_transaction)
-    ok = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)["status"] == 1
-    print(f"{'✓' if ok else '✗'} PREMIUM tier {'activated' if ok else 'activation failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+    receipt = _sign_and_send(w3, acct, tx, "PREMIUM tier activate", fallback_gas=3000000)
+    ok = receipt["status"] == 1
 
 def cmd_prime_deposit(amount: float, execute: bool = False):
     """Deposit PRIME from the wallet (EOA) INTO the Prime Account, without activating PREMIUM.
@@ -4919,11 +4870,8 @@ def cmd_prime_deposit(amount: float, execute: bool = False):
         "nonce": nonce + 1,
         "gas": 3000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, dep_tx)
-    dep_hash = w3.eth.send_raw_transaction(acct.sign_transaction(dep_tx).raw_transaction)
-    dep_ok = w3.eth.wait_for_transaction_receipt(dep_hash, timeout=180)["status"] == 1
-    print(f"{'✓' if dep_ok else '✗'} depositPrime {'confirmed' if dep_ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{dep_hash.hex()}")
+    receipt = _sign_and_send(w3, acct, dep_tx, "depositPrime", fallback_gas=3000000)
+    dep_ok = receipt["status"] == 1
 
 def cmd_prime_deactivate(withdraw: bool = False, execute: bool = False):
     """Drop back to BASIC tier (deactivatePremiumTier(withdrawStake)). The facet REPAYS ALL PRIME
@@ -4972,11 +4920,8 @@ def cmd_prime_deactivate(withdraw: bool = False, execute: bool = False):
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 3000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    tx_hash = w3.eth.send_raw_transaction(acct.sign_transaction(tx).raw_transaction)
-    ok = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)["status"] == 1
-    print(f"{'✓' if ok else '✗'} PREMIUM tier {'deactivated' if ok else 'deactivation failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+    receipt = _sign_and_send(w3, acct, tx, "PREMIUM tier deactivate", fallback_gas=3000000)
+    ok = receipt["status"] == 1
 
 def cmd_prime_unstake(amount: float, execute: bool = False):
     """Unstake PRIME from the leverage stake back into the account (unstakePrime). onlyOwner, NOT
@@ -5021,11 +4966,8 @@ def cmd_prime_unstake(amount: float, execute: bool = False):
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 3000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    tx_hash = w3.eth.send_raw_transaction(acct.sign_transaction(tx).raw_transaction)
-    ok = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)["status"] == 1
-    print(f"{'✓' if ok else '✗'} PRIME unstake {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+    receipt = _sign_and_send(w3, acct, tx, "PRIME unstake", fallback_gas=3000000)
+    ok = receipt["status"] == 1
 
 def cmd_prime_repay(amount: float, execute: bool = False):
     """Repay accrued PRIME rent-debt (repayPrimeDebt) using in-account PRIME. onlyOwner, NOT
@@ -5071,11 +5013,8 @@ def cmd_prime_repay(amount: float, execute: bool = False):
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 3000000, "chainId": CHAIN_ID,
     }
-    _set_gas_price(w3, tx)
-    tx_hash = w3.eth.send_raw_transaction(acct.sign_transaction(tx).raw_transaction)
-    ok = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)["status"] == 1
-    print(f"{'✓' if ok else '✗'} PRIME debt repay {'confirmed' if ok else 'failed'}")
-    print(f"  Tx: {EXPLORER}/tx/{tx_hash.hex()}")
+    receipt = _sign_and_send(w3, acct, tx, "PRIME debt repay", fallback_gas=3000000)
+    ok = receipt["status"] == 1
 
 # ─── Zaps (tool-level macros) ────────────────────────────────────────────────
 # DeltaPrime zaps are NOT a separate on-chain facet (capabilities §7) — they are front-end
@@ -5640,13 +5579,9 @@ def cmd_prime_bridge(from_chain: str = "avax", amount: float = None, execute: bo
     tx = {"from": wallet, "to": bridge_target, "data": bytes.fromhex(calldata_hex),
           "nonce": w3.eth.get_transaction_count(wallet), "gas": 500000,
           "value": native_fee, "chainId": src_chain_id}
-    _set_gas_price_for(src_chain_id, w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+    receipt = _sign_and_send(w3, acct, tx, "Bridge", timeout=300, fallback_gas=500000,
+                         gas_price_fn=lambda _w, _tx: _set_gas_price_for(src_chain_id, _w, _tx))
     ok = receipt["status"] == 1
-    print(f"{'✓' if ok else '✗'} Bridge {'submitted' if ok else 'failed'}")
-    print(f"  Tx: {src_cfg['explorer']}/{tx_hash.hex()}")
 
 def main():
     check_version()
@@ -6027,4 +5962,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
