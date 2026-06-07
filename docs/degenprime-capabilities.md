@@ -98,7 +98,7 @@ SmartLoansFactory.createAndFundLoan(bytes32 asset, uint256 amount) -> address   
 DegenAccount.borrow(bytes32 asset, uint256 amount)                 // remainsSolvent → RedStone-gated
 DegenAccount.repay(bytes32 asset, uint256 amount)  payable         // NOT solvency-gated
 ```
-- `borrow` carries `remainsSolvent`; the tool appends a RedStone payload on `--execute`. Feeds = `degen_account_price_feeds(account)` + the borrow symbol if it has a RedStone feed (the SolvencyFacet handles BaseOracle-priced symbols internally).
+- `borrow` carries `remainsSolvent`; the tool appends a RedStone payload on `--execute`. Feeds = all 13 RedStone-available symbols (`sorted(REDSTONE_AVAILABLE_FEEDS)`), because the on-chain solvency check iterates every registered collateral type. The `account_price_feeds` function only returns the account's owned+debt symbols — insufficient for the full solvency iteration.
 - `repay` is NOT solvency-gated (the facet checks `debt + in-account balance` instead), so no payload. The facet reverts if `amount > debt` OR `amount > in-account balance`. The tool caps to `min(requested, debt, in-account)` and prints the cap reason.
 - **Approve target:** none for either (the account already holds the funds; for repay, the funds come from the in-account balance — fund them in first via `fund` or swap into the debt asset via `swap`).
 - **RedStone:** `borrow` yes, `repay` no.
@@ -128,7 +128,7 @@ DegenAccount.paraSwapV6(bytes4 selector, bytes data)               // remainsSol
   Patches to `0x000010036C0190E009a000d0fc3541100A07380A` if the API returns one that isn't on the list (mirrors DeltaPrime's swap-debt path). New executors surface on-chain with `InvalidExecutor`; add as they appear.
 - **Slippage:** `--slippage` is passed as bps to the API; the facet enforces a hard 5% cap on top, RedStone-priced. The tool prints both numbers.
 - **Approve target:** none (facet does it).
-- **RedStone:** yes on `--execute`. Feeds = `degen_account_price_feeds(account)` + `from_sym` + `to_sym` if either has a RedStone feed.
+- **RedStone:** yes on `--execute`. Feeds = all 13 RedStone-available symbols (`sorted(REDSTONE_AVAILABLE_FEEDS)`) if either has a RedStone feed.
 - **Gotchas:**
   - The Augustus router address `0x6A000F20005980200259B80c5102003040001068` is shared with Avalanche (v6 is unified).
   - The non-pool collateral path: `swap --from MOG --to USDC` works (MOG is a TokenManager-listed collateral); `_swap_asset_meta` falls back to TokenManager resolution if the symbol isn't in `POOLS`.
@@ -153,7 +153,7 @@ DegenAccount.swapDebtParaSwap(bytes32 fromAsset, bytes32 toAsset,
 - **Both symbols must have RedStone feeds.** The facet's value-match step calls `getPrices`, which only works for feed-available symbols. The tool refuses upfront if either leg isn't in `REDSTONE_AVAILABLE_FEEDS`.
 - **Both symbols must be DegenPrime pool assets.** Only pool assets have a `getBorrowed` view (you can only have debt in something there's a pool for).
 - **Approve target:** none.
-- **RedStone:** yes on `--execute`. Payload covers `degen_account_price_feeds(account) ∪ {from_sym, to_sym}`.
+- **RedStone:** yes on `--execute`. Payload covers all 13 RedStone-available symbols (`sorted(REDSTONE_AVAILABLE_FEEDS)`).
 - **Gotchas:**
   - `paraSwapDecodedData.fromAmount` must equal `borrowAmount` **exactly** (facet checks this). The tool's preview catches mismatches before broadcast.
   - The 5% USD-diff cap is RedStone-priced, not API-priced. A trade that fits the API's slippage but blows the RedStone-priced cap will revert on-chain; the preview catches it because it uses the same RedStone read the facet does.

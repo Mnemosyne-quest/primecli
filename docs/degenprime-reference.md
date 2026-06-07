@@ -106,7 +106,7 @@ Verified **identical** to DeltaPrime's config — same data service, same author
 >
 > **NOT in RedStone (priced on-chain by SolvencyFacet via BaseOracle TWAP):** `cbXRP, cbDOGE, TOSHI, KEYCAT, VIRTUAL, SKI, BASEDPEPE, AIXBT, VVV, SPX, CLANKER, BNKR, DRB, COOKIE, ZORA, DINO, AVNT, GIZA, cbLTC`.
 
-The tool filters its RedStone payload to feed-available symbols only. The SolvencyFacet sources the rest from BaseOracle internally, so `summary`'s total value / debt / health figures cover every asset — but per-symbol USD lines in the output only show for the 13 feed-available symbols (the BaseOracle prices are not exposed through `getPrices`).
+The tool uses the full 13-feed RedStone payload for all remainsSolvent-gated writes. The old behaviour (filtering to the account's owned+debt feeds) was insufficient: the on-chain solvency check iterates every registered collateral type. The SolvencyFacet sources the rest from BaseOracle internally, so `summary`'s total value / debt / health figures cover every asset — but per-symbol USD lines in the output only show for the 13 feed-available symbols (the BaseOracle prices are not exposed through `getPrices`).
 
 **Consequence for `swap-debt`:** both legs must have RedStone feeds, because the facet's value-match step calls `getPrices` to enforce its 5% USD-diff cap. The tool refuses if either symbol isn't in the feed set.
 

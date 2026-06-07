@@ -2472,10 +2472,7 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
     # Simulate-first executor handling (see cmd_swap_debt rationale): keep the API
     # executor when the exact tx simulates clean; only fall back to the legacy
     # executor if the unpatched calldata reverts.
-    feeds = degen_account_price_feeds(account)
-    for s in (from_sym, to_sym):
-        if s in REDSTONE_AVAILABLE_FEEDS and s not in feeds:
-            feeds.append(s)
+    feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
     payload = build_redstone_payload(feeds)
     def _sim_paraswap(db):
         base = account.encode_abi("paraSwapV6", args=[full[:4], db])
@@ -2599,10 +2596,7 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         return
     repay_amount = min(to_wei_units(amount, from_cfg["decimals"]), borrowed)
 
-    feeds = degen_account_price_feeds(account)
-    for s in (from_sym, to_sym):
-        if s not in feeds:
-            feeds.append(s)
+    feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
     payload = build_redstone_payload(feeds)
     price_from, price_to = _read_prices_usd(w3, account, [from_sym, to_sym], payload)
     # borrow_amount such that its USD value ≈ repay USD value:
@@ -3182,7 +3176,7 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
         return
 
     # Build RedStone payload for solvency check
-    feeds = degen_account_price_feeds(account)
+    feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
     payload = build_redstone_payload(feeds)
 
     # Encode the mint call: use the probed selector + ABI-encoded params
@@ -3330,7 +3324,7 @@ def cmd_aero_collect_fees(token_id: int, execute: bool = False):
 
     # Build RedStone payload (collect may be solvency-gated)
     try:
-        feeds = degen_account_price_feeds(account)
+        feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
         payload = build_redstone_payload(feeds)
     except Exception:
         payload = b""
