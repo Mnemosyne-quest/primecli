@@ -4,6 +4,29 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.7.4] - 2026-06-13
+
+### Added
+- **Aerodrome pool registry expanded from 6 to 31 on-chain-verified pools (Base, degenprime).**
+  `AERODROME_POOLS` now lists the authoritative set of DegenPrime-supported
+  SlipStream CL pools. Every entry was verified on Base (2026-06-13):
+  token0/token1/tickSpacing read from the pool, decimals/symbol from each token,
+  and each pool address cross-checked against the SlipStream factory's
+  `getPool(token0, token1, tickSpacing)` (all 31 matched). tickSpacing tiers in
+  use: 1, 50, 100, 200, 2000.
+- New optional `gauge_alive` field flags the 6 pools with a dead Aerodrome gauge
+  (no AERO emissions; still tradeable/LP-able): `weth-aero-200`,
+  `cbbtc-cbdoge-100`, `weth-euroc-100`, `weth-cbxrp-2000`, `euroc-usdc-1`,
+  `cbxrp-cbbtc-100`. The field is additive — consumers read entries by explicit
+  key, none assume a fixed schema.
+
+### Fixed
+- Corrections to the original 6 entries: `aero-usdc-100` (no DegenPrime pool at
+  ts=100) replaced by `aero-usdc-2000` with on-chain token0=USDC/token1=AERO
+  ordering; `weth-aero-200` token0/token1 un-reversed to match on-chain. Dropped
+  `weth-usdc-5` and `weth-cbbtc-30` (not DegenPrime-supported; only the ts=100
+  variants are). GIZA skipped (live pool not on the factory at its tickSpacing).
+
 ## [0.7.2] - 2026-06-07
 
 ### Fixed
