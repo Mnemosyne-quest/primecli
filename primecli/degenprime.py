@@ -27,7 +27,7 @@ Usage:
   degenprime cancel-withdrawal --pool usdc --index N [--execute]
   degenprime aerodrome-positions
   degenprime aero-add-liquidity --pool weth-usdc-100 --amount-weth 0.05 --amount-usdc 100 [--slippage 1] [--execute]
-  degenprime aero-remove-liquidity --token-id N [--percentage 100] [--execute]
+  degenprime aero-remove-liquidity --token-id N [--token-id M ...] [--execute]   (full close only)
   degenprime aero-collect-fees --token-id N [--execute]
 
 Configuration (env vars):
@@ -85,6 +85,13 @@ the Aerodrome Slipstream NonfungiblePositionManager through the Degen Account's
 AerodromeFacet wrapper functions. The facet selectors were determined via on-chain
 probing (Diamond Loupe) of the smart-loan diamond; function names are inferred from
 their parameter layouts and revert signatures.
+
+aero-remove-liquidity fully closes one or more staked positions in a single call via
+batchRemoveStakedLiquidityAerodrome(uint256[]) (selector 0x27bed82e): per tokenId it
+unstakes from the gauge, removes all liquidity, collects fees, and burns the NFT. There
+is no partial/percentage decrease on this path — it always closes 100%. The call is
+solvency-gated, so the calldata carries a RedStone payload (verified byte-exact against
+the manual close 0x0d65...0a50).
 """
 
 import json, os, sys, time, base64
@@ -208,14 +215,13 @@ AERODROME_NPM = "0x827922686190790b37229fd06084350E74485b72"
 #   6f2845cd  getOwnedStakedAerodromeTokenIds()
 #   b6626971  getPositionCompositionSimplified(uint256) -> (address,address,uint256,uint256)
 #   121350b3  (view, takes uint256 — detailed position info, unknown return)
-#   27bed82e  (write, onlyOwner, takes MintParams-like tuple — inferred mint/add)
+#   27bed82e  batchRemoveStakedLiquidityAerodrome(uint256[]) — full close per id
+#             (verified byte-exact vs manual close 0x0d65...0a50, 2026-06-14)
 #   2c710777  (write, onlyOwner, takes IncreaseLiquidityParams-like tuple — inferred increase)
-#   ca15558b  (write, takes DecreaseLiquidityParams tuple 5-field — matches decreaseLiquidity)
 #   92b5a47e  (write, takes uint256 tokenId, checks position exists — burn/collect)
 #   46daca2c  (write, onlyOwnerOrLiquidator — emergency withdrawal)
 AERODROME_SEL_MINT = bytes.fromhex("f32f1e56")          # mintAndStakeLiquidityAerodrome
 AERODROME_SEL_INCREASE = bytes.fromhex("2c710777")      # inferred: increaseLiquidity
-AERODROME_SEL_DECREASE = bytes.fromhex("cb16b6c6")       # decreaseAerodromeLiquidity
 AERODROME_SEL_BURN = bytes.fromhex("27bed82e")           # batchRemoveStakedLiquidityAerodrome
 AERODROME_SEL_COLLECT = bytes.fromhex("887e4b7e")        # collectAerodromeFees
 
@@ -800,19 +806,6 @@ PRIME_ACCOUNT_ABI = [
         {"name": "sqrtPriceX96", "type": "uint160"}
     ]}],
      "name": "mintAerodrome", "outputs": [],
-     "stateMutability": "nonpayable", "type": "function"},
-    # decreaseAerodromeLiquidity: wraps NPM.decreaseLiquidity(DecreaseLiquidityParams).
-    # DecreaseLiquidityParams = (uint256 tokenId, uint128 liquidity,
-    #   uint256 amount0Min, uint256 amount1Min, uint256 deadline).
-    # Selector: 0xca15558b (probed — accepts 5-field tuple matching decrease layout).
-    {"inputs": [{"name": "params", "type": "tuple", "components": [
-        {"name": "tokenId", "type": "uint256"},
-        {"name": "liquidity", "type": "uint128"},
-        {"name": "amount0Min", "type": "uint256"},
-        {"name": "amount1Min", "type": "uint256"},
-        {"name": "deadline", "type": "uint256"}
-    ]}],
-     "name": "decreaseAerodromeLiquidity", "outputs": [],
      "stateMutability": "nonpayable", "type": "function"},
     # burnAerodromePosition: wraps NPM.burn(uint256). tokenId must have 0 liquidity
     # and all fees collected.
@@ -3133,10 +3126,17 @@ def cmd_aerodrome_positions():
         token0, token1, tick_lower, tick_upper, liq = pos
         sym0 = _resolve_token_symbol(w3, token0)
         sym1 = _resolve_token_symbol(w3, token1)
-        price_lower = 1.0001 ** tick_lower
-        price_upper = 1.0001 ** tick_upper
-        print(f"    [{tid}] {sym0}/{sym1}  ticks=[{tick_lower}, {tick_upper}]"
-              f"  liq={liq}  price_range=[{price_lower:.4f}, {price_upper:.4f}]")
+        # Human price = token1 per token0 = 1.0001**tick * 10**(dec0 - dec1).
+        dec0 = _resolve_token_decimals(w3, token0)
+        dec1 = _resolve_token_decimals(w3, token1)
+        if dec0 is not None and dec1 is not None:
+            scale = 10 ** (dec0 - dec1)
+            price_lower = 1.0001 ** tick_lower * scale
+            price_upper = 1.0001 ** tick_upper * scale
+            print(f"    [{tid}] {sym0}/{sym1}  ticks=[{tick_lower}, {tick_upper}]"
+                  f"  liq={liq}  price_range=[{price_lower:.6g}, {price_upper:.6g}] ({sym1}/{sym0})")
+        else:
+            print(f"    [{tid}] {sym0}/{sym1}  ticks=[{tick_lower}, {tick_upper}]  liq={liq}")
     print("  Manage on Aerodrome UI: https://aerodrome.finance/positions")
 
 def _aero_read_position(w3, token_id: int):
@@ -3196,6 +3196,25 @@ def _resolve_token_symbol(w3, addr: str) -> str:
     except Exception:
         pass
     return addr[:10] + "..."
+
+_ERC20_DECIMALS_ABI = json.dumps([{"inputs": [], "name": "decimals",
+    "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"}])
+
+def _resolve_token_decimals(w3, addr: str):
+    """Token decimals from the static pool maps, falling back to an on-chain
+    decimals() read. Returns the int decimals or None if it can't be determined."""
+    addr_lower = addr.lower()
+    for cfg in AERODROME_POOLS.values():
+        if cfg["token0"].lower() == addr_lower:
+            return cfg["decimals0"]
+        if cfg["token1"].lower() == addr_lower:
+            return cfg["decimals1"]
+    try:
+        c = w3.eth.contract(address=Web3.to_checksum_address(addr),
+                            abi=json.loads(_ERC20_DECIMALS_ABI))
+        return c.functions.decimals().call()
+    except Exception:
+        return None
 
 # ─── Aerodrome Write Commands ────────────────────────────────────────────────
 
@@ -3306,12 +3325,6 @@ def _aero_mint_params(pool_cfg: dict, amount0_wei: int, amount1_wei: int,
         int(current_tick),    # word10: live pool tick
         0, 0, 0,              # word11-13: zero (sqrtPriceX96=0 / bools false)
     )
-
-# Helper: build DecreaseLiquidityParams tuple (5 fields).
-def _aero_decrease_params(token_id: int, liquidity: int,
-                          amount0_min: int, amount1_min: int) -> tuple:
-    deadline = int(time.time()) + 1800
-    return (token_id, liquidity, amount0_min, amount1_min, deadline)
 
 # Helper: compute tick range around a desired centre price.
 def _aero_tick_range(tick_spacing: int, centre_price: float = None,
@@ -3468,15 +3481,31 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
     ok = receipt["status"] == 1
 
 
-def cmd_aero_remove_liquidity(token_id: int, percentage: float = 100.0,
+def cmd_aero_remove_liquidity(token_ids, percentage: float = 100.0,
                                execute: bool = False):
-    """Remove liquidity from an Aerodrome Slipstream position owned by the
-    Degen Account. Decreases liquidity by `percentage` of the current position
-    size (default 100% = full close). The position NFT remains; burn it
-    separately after all liquidity is removed and fees collected.
+    """Fully close one or more staked Aerodrome Slipstream positions owned by the
+    Degen Account, via batchRemoveStakedLiquidityAerodrome(uint256[]) on the
+    AerodromeFacet (selector 0x27bed82e). This single call does the FULL unwind per
+    tokenId: unstake from the gauge + remove all liquidity + collect fees + burn the
+    NFT (the manual reference close 0x0d65... emitted 41 logs doing exactly this).
 
-    The facet wraps NPM.decreaseLiquidity. No RedStone payload needed
-    (the decrease path is NOT remainsSolvent — same as TJ lb-remove)."""
+    There is NO partial/percentage decrease on this path — it always closes 100%.
+    The call is remainsSolvent-gated, so the calldata carries a RedStone signed-price
+    payload (same construction as the mint+stake path)."""
+    if percentage < 100:
+        print(f"  Partial removal ({percentage}%) is not supported on this path — "
+              f"batchRemoveStakedLiquidityAerodrome fully closes each position "
+              f"(unstake + remove + collect + burn). Re-run without --percentage "
+              f"(or with --percentage 100) to fully close.")
+        return
+
+    if isinstance(token_ids, int):
+        token_ids = [token_ids]
+    token_ids = [int(t) for t in token_ids]
+    if not token_ids:
+        print("  No tokenIds supplied.")
+        return
+
     w3 = get_w3()
     acct = get_account()
     print(f"Wallet: {acct.address}")
@@ -3487,41 +3516,33 @@ def cmd_aero_remove_liquidity(token_id: int, percentage: float = 100.0,
     account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
     print(f"Degen Account: {pa}")
 
-    # Read the position's current liquidity from NPM.positions() — correct for
-    # staked positions too (the simplified facet view reports 0 liquidity once the
-    # NFT is held by the gauge).
-    pos = _aero_read_position(w3, token_id)
-    if pos is None:
-        print(f"  Cannot read position {token_id}.")
-        return
-    token0, token1, tick_lower, tick_upper, current_liq = pos
-    if current_liq == 0:
-        print(f"  Position {token_id} has 0 liquidity (may already be closed).")
-        return
+    # Show what each position holds before closing (NPM.positions() is correct for
+    # staked NFTs, which the simplified facet view reports as 0 liquidity).
+    for tid in token_ids:
+        pos = _aero_read_position(w3, tid)
+        if pos is None:
+            print(f"  Position {tid}: cannot read (may not exist).")
+            continue
+        token0, token1, tick_lower, tick_upper, current_liq = pos
+        sym0 = _resolve_token_symbol(w3, token0)
+        sym1 = _resolve_token_symbol(w3, token1)
+        print(f"Position {tid}: {sym0}/{sym1}  ticks=[{tick_lower},{tick_upper}]  "
+              f"liquidity={current_liq}")
 
-    sym0 = _resolve_token_symbol(w3, token0)
-    sym1 = _resolve_token_symbol(w3, token1)
+    # Encode batchRemoveStakedLiquidityAerodrome(uint256[] tokenIds) and append the
+    # RedStone payload raw. Byte-for-byte layout (selector + uint256[] head + payload)
+    # verified against the manual close 0x0d65...0a50.
+    from eth_abi import encode as abi_encode
+    encoded_ids = abi_encode(['uint256[]'], [token_ids])
+    feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
+    payload = build_redstone_payload(feeds)
+    close_calldata = AERODROME_SEL_BURN + encoded_ids + payload
 
-    remove_liq = int(Decimal(str(current_liq)) * Decimal(str(percentage)) / Decimal(100))
-    if remove_liq <= 0:
-        print(f"  Removal percentage {percentage}% yields 0 liquidity.")
-        return
-
-    print(f"Position {token_id}: {sym0}/{sym1}  ticks=[{tick_lower},{tick_upper}]")
-    print(f"  Current liquidity: {current_liq}")
-    print(f"  Removing: {remove_liq} ({percentage}%)")
-
-    params = _aero_decrease_params(token_id, remove_liq, 0, 0)
-    # decreaseLiquidity on the facet (selector ca15558b)
-    dec_data = account.encode_abi("decreaseAerodromeLiquidity", args=[params])
-    dec_params_bytes = bytes.fromhex(dec_data[2:])[4:]
-    dec_calldata = AERODROME_SEL_DECREASE + dec_params_bytes
-
-    # Pre-flight eth_call simulation — refuse to broadcast on revert. The decrease
-    # path is not RedStone-gated, so a bare eth_call is sufficient.
+    # Pre-flight eth_call simulation — refuse to broadcast on revert. The close path
+    # IS RedStone-gated, so the simulated calldata already carries the payload.
     try:
         w3.eth.call({"from": acct.address, "to": account.address,
-                     "data": "0x" + dec_calldata.hex()})
+                     "data": "0x" + close_calldata.hex()})
     except Exception as e:
         print(f"  Simulation reverted — aborting before broadcast: {type(e).__name__}: {str(e)[:200]}")
         return
@@ -3535,15 +3556,15 @@ def cmd_aero_remove_liquidity(token_id: int, percentage: float = 100.0,
         "from": acct.address,
         "to": account.address,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 4000000,
+        "gas": 5000000,
         "chainId": CHAIN_ID,
-        "data": "0x" + dec_calldata.hex(),
+        "data": "0x" + close_calldata.hex(),
     }
-    receipt = _sign_and_send(w3, acct, tx, "Remove liquidity", timeout=300, fallback_gas=4000000)
+    receipt = _sign_and_send(w3, acct, tx, "Close Aerodrome position(s)", timeout=300, fallback_gas=5000000)
     ok = receipt["status"] == 1
-    if ok and percentage >= 100:
-        print(f"  Position fully withdrawn. Collect fees then burn:")
-        print(f"    degenprime aero-collect-fees --token-id {token_id} --execute")
+    if ok:
+        ids_str = ", ".join(str(t) for t in token_ids)
+        print(f"  Fully closed (unstaked + removed + collected + burned): {ids_str}")
 
 
 def cmd_aero_collect_fees(token_id: int, execute: bool = False):
@@ -3563,13 +3584,13 @@ def cmd_aero_collect_fees(token_id: int, execute: bool = False):
     account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
     print(f"Degen Account: {pa}")
 
-    # Read position composition for display
-    try:
-        pos = account.functions.getPositionCompositionSimplified(token_id).call()
-    except Exception as e:
-        print(f"  Cannot read position {token_id}: {e}")
+    # Read position for display via NPM.positions() — correct for staked NFTs (the
+    # simplified facet view reports liquidity=0 once the gauge owns the NFT).
+    pos = _aero_read_position(w3, token_id)
+    if pos is None:
+        print(f"  Cannot read position {token_id}.")
         return
-    token0, token1, tick_data, liq = pos
+    token0, token1, tick_lower, tick_upper, liq = pos
     sym0 = _resolve_token_symbol(w3, token0)
     sym1 = _resolve_token_symbol(w3, token1)
     print(f"Position {token_id}: {sym0}/{sym1}  liquidity={liq}")
@@ -3830,16 +3851,17 @@ def _dispatch():
             return
         cmd_aero_add_liquidity(pool_key, amt0, amt1, slippage, execute, width)
     elif cmd == "aero-remove-liquidity":
-        token_id = None
+        token_ids = []
         percentage = 100.0
         execute = "--execute" in args
         for i, a in enumerate(args):
-            if a == "--token-id" and i + 1 < len(args): token_id = int(args[i + 1])
+            if a == "--token-id" and i + 1 < len(args): token_ids.append(int(args[i + 1]))
             if a == "--percentage" and i + 1 < len(args): percentage = float(args[i + 1])
-        if token_id is None:
-            print("Usage: degenprime aero-remove-liquidity --token-id N [--percentage 100] [--execute]")
+        if not token_ids:
+            print("Usage: degenprime aero-remove-liquidity --token-id N [--token-id M ...] [--execute]")
+            print("  Fully closes (unstake + remove + collect + burn) each staked position. Full close only.")
             return
-        cmd_aero_remove_liquidity(token_id, percentage, execute)
+        cmd_aero_remove_liquidity(token_ids, percentage, execute)
     elif cmd == "aero-collect-fees":
         token_id = None
         execute = "--execute" in args

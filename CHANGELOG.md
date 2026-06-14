@@ -4,6 +4,25 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.8.1] - 2026-06-14
+
+### Fixed
+- **Aerodrome close/remove-liquidity path (DegenPrime, Base).** `aero-remove-liquidity`
+  now calls `batchRemoveStakedLiquidityAerodrome(uint256[])` (selector `0x27bed82e`)
+  with a RedStone payload — the proven full-close (unstake + remove + collect + burn)
+  for a staked position. The previous `decreaseAerodromeLiquidity` (`0xcb16b6c6`)
+  reverted `Diamond: Function does not exist`. Verified by an `eth_call` close sim on a
+  live staked position. Partial (`--percentage < 100`) is refused with a clear message —
+  this facet method is full-close only.
+- **`aero-collect-fees` display** showed `liquidity=0` for staked positions; now reads
+  `NPM.positions(tokenId)` and reports real liquidity.
+- **`aerodrome-positions` price range** showed `[0.0000, 0.0000]`; now computes the human
+  price from the position ticks with token-decimal scaling.
+
+### Removed
+- Dead `decreaseAerodromeLiquidity` selector / helper / ABI (a wrong-guess selector that
+  never matched the live diamond).
+
 ## [0.8.0] - 2026-06-14
 
 ### Fixed
