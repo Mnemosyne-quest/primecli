@@ -76,8 +76,9 @@ asset (--from), and repays the old debt. --from is the existing debt being
 refinanced; --to is the new debt taken on. RedStone-gated on execute.
 
 aerodrome-positions is read-only: lists each Aerodrome Slipstream (CL) NFT position the
-Degen Account owns/stakes, showing token0/token1/tick range/liquidity via the diamond's
-getOwnedStakedAerodromeTokenIds + getPositionCompositionSimplified views.
+Degen Account owns/stakes, showing token0/token1/tick range/liquidity. Enumerates tokenIds
+via getOwnedStakedAerodromeTokenIds, then reads each from the Aerodrome NPM.positions()
+view (correct for staked NFTs, which the simplified facet view reports as 0 liquidity).
 
 aero-add-liquidity / aero-remove-liquidity / aero-collect-fees provide write paths to
 the Aerodrome Slipstream NonfungiblePositionManager through the Degen Account's
@@ -212,11 +213,11 @@ AERODROME_NPM = "0x827922686190790b37229fd06084350E74485b72"
 #   ca15558b  (write, takes DecreaseLiquidityParams tuple 5-field — matches decreaseLiquidity)
 #   92b5a47e  (write, takes uint256 tokenId, checks position exists — burn/collect)
 #   46daca2c  (write, onlyOwnerOrLiquidator — emergency withdrawal)
-AERODROME_SEL_MINT = bytes.fromhex("27bed82e")          # inferred: mint/add
+AERODROME_SEL_MINT = bytes.fromhex("f32f1e56")          # mintAndStakeLiquidityAerodrome
 AERODROME_SEL_INCREASE = bytes.fromhex("2c710777")      # inferred: increaseLiquidity
-AERODROME_SEL_DECREASE = bytes.fromhex("ca15558b")      # inferred: decreaseLiquidity
-AERODROME_SEL_BURN = bytes.fromhex("92b5a47e")          # inferred: burn
-AERODROME_SEL_COLLECT = bytes.fromhex("92b5a47e")       # same as burn (inferred)
+AERODROME_SEL_DECREASE = bytes.fromhex("cb16b6c6")       # decreaseAerodromeLiquidity
+AERODROME_SEL_BURN = bytes.fromhex("27bed82e")           # batchRemoveStakedLiquidityAerodrome
+AERODROME_SEL_COLLECT = bytes.fromhex("887e4b7e")        # collectAerodromeFees
 
 # Whitelisted Aerodrome CL pools exposed as tool keys — the authoritative set of
 # ~31 DegenPrime-supported SlipStream pools. Every entry was verified on-chain
@@ -824,6 +825,9 @@ PRIME_ACCOUNT_ABI = [
     {"inputs": [{"name": "tokenId", "type": "uint256"}],
      "name": "collectAerodromeFees", "outputs": [],
      "stateMutability": "nonpayable", "type": "function"},
+    # batchRemoveStakedLiquidityAerodrome(uint256[]) — selector 0x27bed82e
+    # (== AERODROME_SEL_BURN, verified). Unstakes + closes the listed positions.
+    {"inputs":[{"internalType":"uint256[]","name":"tokenIds","type":"uint256[]"}],"name":"batchRemoveStakedLiquidityAerodrome","outputs":[],"stateMutability":"nonpayable","type":"function"},
 ]
 
 # TokenManager ABI - minimal subset for symbol/decimals lookups + supported tokens
@@ -834,7 +838,8 @@ TOKEN_MANAGER_ABI = [
      "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
     {"inputs": [{"name": "_address", "type": "address"}], "name": "tokenAddressToSymbol",
      "outputs": [{"type": "bytes32"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [{"name": "_symbol", "type": "bytes32"}], "name": "getAssetAddress",
+    {"inputs": [{"name": "_symbol", "type": "bytes32"},
+                {"name": "_allowInactive", "type": "bool"}], "name": "getAssetAddress",
      "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "getSupportedTokensAddresses",
      "outputs": [{"type": "address[]"}], "stateMutability": "view", "type": "function"},
@@ -947,6 +952,28 @@ def get_prime_account(w3, owner: str) -> str:
 def asset_b32(symbol: str) -> bytes:
     return symbol.encode().ljust(32, b"\x00")
 
+def fmt_token_amount(raw: int, decimals: int) -> str:
+    """Human token amount that never misleadingly rounds a dust balance UP.
+
+    Plain f"{x:,.6f}" turns 9.41e-7 into "0.000001" — visually a larger,
+    round number than the true value, which is exactly what over-requested a
+    dust balance and reverted a mint after burning gas (2026-06-14). For any
+    nonzero value that 6-dp formatting would round to zero or up to its own
+    last place, append the raw base units so the real size is unambiguous.
+    Normal/large balances keep the familiar grouped 6-dp display."""
+    if raw == 0:
+        return "0"
+    amt = Decimal(raw) / (Decimal(10) ** int(decimals))
+    rounded6 = amt.quantize(Decimal("0.000001"))
+    # Switch to sci-notation + raw wei only for genuinely small balances that 6-dp
+    # formatting would misrepresent: rounds to 0 (looks like nothing), or rounds UP
+    # below the 1e-4 dust line (e.g. 9.41e-7 -> 0.000001, the over-request trap).
+    # Larger values keep the familiar grouped 6-dp display even if the last place
+    # rounds — there a round-up isn't misleading and sci-notation would be noise.
+    if rounded6 == 0 or (rounded6 > amt and amt < Decimal("0.0001")):
+        return f"{amt:.3e} ({raw} wei)"
+    return f"{amt:,.6f}"
+
 def pool_to_asset_symbol(pool_name: str) -> str:
     """Pool key -> on-chain bytes32 asset symbol (the contracts use 'ETH', not 'WETH')."""
     return POOLS[pool_name]["symbol"]
@@ -976,7 +1003,7 @@ def _asset_meta(w3, symbol: str):
             return _asset_meta_cache[symbol]
     try:
         tm = get_token_manager(w3)
-        addr = tm.functions.getAssetAddress(asset_b32(symbol)).call()
+        addr = tm.functions.getAssetAddress(asset_b32(symbol), True).call()
         if int(addr, 16) == 0:
             _asset_meta_cache[symbol] = (None, 18)
             return _asset_meta_cache[symbol]
@@ -2180,7 +2207,7 @@ def cmd_summary(as_json: bool = False):
             if pool_deposits:
                 print("  Pool Deposits (Diamond Hands):")
                 for r in pool_deposits:
-                    print(f"    {r['symbol']:<8} {r['raw'] / 10**r['decimals']:,.6f}")
+                    print(f"    {r['symbol']:<8} {fmt_token_amount(r['raw'], r['decimals'])}")
         return
 
     account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
@@ -2228,7 +2255,7 @@ def cmd_summary(as_json: bool = False):
         for r in supplied:
             usd = solvency["prices"].get(r["symbol"])
             usd_str = f"  (~${r['raw'] / 10**r['decimals'] * usd:,.2f})" if usd is not None else ""
-            print(f"    {r['symbol']:<8} {r['raw'] / 10**r['decimals']:,.6f}{usd_str}")
+            print(f"    {r['symbol']:<8} {fmt_token_amount(r['raw'], r['decimals'])}{usd_str}")
     else:
         print("    (none)")
 
@@ -2237,7 +2264,7 @@ def cmd_summary(as_json: bool = False):
         for r in borrowed:
             usd = solvency["prices"].get(r["symbol"])
             usd_str = f"  (~${r['raw'] / 10**r['decimals'] * usd:,.2f})" if usd is not None else ""
-            print(f"    {r['symbol']:<8} {r['raw'] / 10**r['decimals']:,.6f}{usd_str}")
+            print(f"    {r['symbol']:<8} {fmt_token_amount(r['raw'], r['decimals'])}{usd_str}")
     else:
         print("    (none)")
 
@@ -2246,7 +2273,7 @@ def cmd_summary(as_json: bool = False):
         for r in pool_deposits:
             usd = solvency["prices"].get(r["symbol"])
             usd_str = f"  (~${r['raw'] / 10**r['decimals'] * usd:,.2f})" if usd is not None else ""
-            print(f"    {r['symbol']:<8} {r['raw'] / 10**r['decimals']:,.6f}{usd_str}")
+            print(f"    {r['symbol']:<8} {fmt_token_amount(r['raw'], r['decimals'])}{usd_str}")
 
     if solvency["error"] is None:
         # A solvency view can come back None even with no error (e.g. a multicall leg that
@@ -2275,7 +2302,14 @@ def cmd_summary(as_json: bool = False):
             print(f"    0%=liquidation  50%=half borrowing power used  100%=no debt")
         else:
             print(f"  Health (0-100%): N/A ({hp['error']})")
-        print(f"  Solvent:            {'yes' if solvency['solvent'] else 'NO - liquidatable'}")
+        # An account with no debt cannot be liquidated. isSolvent() can come back
+        # None on a no-debt account (empty multicall leg), which used to render a
+        # misleading "NO - liquidatable" despite ratio >1000 and ~$0 debt. Treat
+        # negligible debt (or a >1000 ratio, surfaced as ratio=None) as solvent.
+        negligible_debt = (solvency["debt"] is None or solvency["debt"] < 0.01
+                           or solvency["ratio"] is None)
+        is_solvent = bool(solvency["solvent"]) or negligible_debt
+        print(f"  Solvent:            {'yes' if is_solvent else 'NO - liquidatable'}")
     else:
         print(f"  Health/solvency:    RedStone fetch/call failed ({solvency['error']}); showing balances only")
 
@@ -3065,8 +3099,9 @@ def cmd_cancel_withdrawal(pool_name: str, index: int, execute: bool = False):
 
 def cmd_aerodrome_positions():
     """Read-only: list every Aerodrome Slipstream NFT position the Degen Account
-    owns/stakes, showing token pair, tick range, and liquidity from the diamond's
-    getOwnedStakedAerodromeTokenIds + getPositionCompositionSimplified views."""
+    owns/stakes, showing token pair, tick range, and liquidity. Enumerates tokenIds
+    via getOwnedStakedAerodromeTokenIds, then reads each from NPM.positions() (the
+    simplified facet view reports liquidity=0 + garbage ticks for staked NFTs)."""
     w3 = get_w3()
     acct = get_account()
     print(f"Wallet: {acct.address}")
@@ -3086,41 +3121,43 @@ def cmd_aerodrome_positions():
         return
     print(f"  {len(ids)} Aerodrome NFT position(s):")
 
-    # Batch-read position composition via Multicall3 for efficiency.
-    # getPositionCompositionSimplified returns (token0, token1, tickData, liquidity).
-    # tickData packs tickLower in the upper 128 bits and tickUpper in the lower 128
-    # bits as unsigned; the actual int24 values need sign extension.
-    pos_legs = []
+    # Read each position straight from NPM.positions(). The account's enumerated
+    # tokenIds include STAKED positions whose NFT now belongs to the gauge, and the
+    # facet's getPositionCompositionSimplified reports liquidity=0 + garbage ticks
+    # for those. NPM.positions() returns the real struct for any holder.
     for tid in ids:
-        pos_legs.append((account.address, bytes.fromhex(
-            account.encode_abi("getPositionCompositionSimplified", args=[tid])[2:])))
-    try:
-        results = multicall(w3, pos_legs)
-    except Exception:
-        results = [(False, b"")] * len(ids)
-
-    for tid, (ok, rd) in zip(ids, results):
-        if not ok or not rd:
-            print(f"    [{tid}] composition unavailable")
+        pos = _aero_read_position(w3, tid)
+        if pos is None:
+            print(f"    [{tid}] position read failed")
             continue
-        try:
-            token0, token1, tick_data, liq = w3.codec.decode(
-                ["address", "address", "uint256", "uint256"], rd)
-        except Exception:
-            print(f"    [{tid}] composition decode failed")
-            continue
-        # Decode tickData: upper 128 bits = tickLower (int24), lower 128 bits = tickUpper (int24)
-        tick_lower = _int24_from_hi128(tick_data)
-        tick_upper = _int24_from_lo128(tick_data)
-        # Resolve token symbols
+        token0, token1, tick_lower, tick_upper, liq = pos
         sym0 = _resolve_token_symbol(w3, token0)
         sym1 = _resolve_token_symbol(w3, token1)
-        # Human-readable tick range → price range
         price_lower = 1.0001 ** tick_lower
         price_upper = 1.0001 ** tick_upper
         print(f"    [{tid}] {sym0}/{sym1}  ticks=[{tick_lower}, {tick_upper}]"
               f"  liq={liq}  price_range=[{price_lower:.4f}, {price_upper:.4f}]")
     print("  Manage on Aerodrome UI: https://aerodrome.finance/positions")
+
+def _aero_read_position(w3, token_id: int):
+    """Authoritative read of an Aerodrome Slipstream position via NPM.positions().
+
+    getPositionCompositionSimplified is wrong for STAKED positions: once an NFT is
+    staked its owner becomes the gauge, and the simplified view returns liquidity=0
+    with a tickData word that is not a tick packing at all (it decodes to garbage,
+    e.g. [0, -3984902] for the live tokenId 71997868). NPM.positions(tokenId) returns
+    the real struct regardless of who holds the NFT — token0/token1, tickLower,
+    tickUpper, and liquidity. Returns (token0, token1, tickLower, tickUpper, liquidity)
+    or None if the read fails."""
+    try:
+        npm = w3.eth.contract(address=Web3.to_checksum_address(AERODROME_NPM),
+                              abi=AERODROME_NPM_ABI)
+        p = npm.functions.positions(token_id).call()
+    except Exception:
+        return None
+    # positions() layout: nonce, operator, token0, token1, tickSpacing,
+    #                      tickLower, tickUpper, liquidity, ...
+    return (p[2], p[3], p[5], p[6], p[7])
 
 def _int24_from_hi128(val: int) -> int:
     """Extract int24 from the upper 128 bits of a uint256, sign-extending."""
@@ -3162,30 +3199,112 @@ def _resolve_token_symbol(w3, addr: str) -> str:
 
 # ─── Aerodrome Write Commands ────────────────────────────────────────────────
 
-# Helper: build the MintParams tuple for Aerodrome Slipstream (12 fields).
-def _aero_mint_params(pool_cfg: dict, amount0: int, amount1: int,
+# Helper: get Aerodrome CL pool address from the factory's getPool (authoritative).
+def _aero_pool_address(pool_cfg: dict) -> str:
+    """Resolve the pool address via the factory's getPool()."""
+    try:
+        w3_local = Web3(Web3.HTTPProvider(BASE_RPC))
+        factory = Web3.to_checksum_address("0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A")
+        import json
+        f_abi = json.loads('[{"inputs":[{"name":"","type":"address"},{"name":"","type":"address"},{"name":"","type":"int24"}],"name":"getPool","outputs":[{"name":"","type":"address"}],"stateMutability":"view","type":"function"}]')
+        factory_c = w3_local.eth.contract(address=factory, abi=f_abi)
+        t0 = Web3.to_checksum_address(pool_cfg["token0"])
+        t1 = Web3.to_checksum_address(pool_cfg["token1"])
+        pool = factory_c.functions.getPool(t0, t1, pool_cfg["tickSpacing"]).call()
+        if pool == "0x0000000000000000000000000000000000000000":
+            raise ValueError("Pool does not exist on Aerodrome")
+        return pool
+    except Exception as e:
+        raise RuntimeError(f"Cannot resolve Aerodrome pool: {e}")
+
+SLOT0_ABI = json.dumps([{"inputs":[],"name":"slot0","outputs":[
+    {"internalType":"uint160","name":"sqrtPriceX96","type":"uint160"},
+    {"internalType":"int24","name":"tick","type":"int24"}],
+    "stateMutability":"view","type":"function"}])
+
+# Helper: build the 14-field arg tuple for the Aerodrome mint+stake facet fn
+# (selector 0xf32f1e56). Layout verified byte-exact against the successful
+# on-chain mint 0x1723377a... (ZORA/USDC, Base, 2026-06-14):
+#   token0, token1, tickLower, tickUpper, tickSpacing,
+#   amount0Desired(wei), amount1Desired(wei), amount0Min(wei), amount1Min(wei),
+#   uint256 const=300, int24 currentTick, 0, 0, 0
+# Both amounts are NATIVE/wei units; there is NO recipient or unix-deadline
+# field, tickSpacing IS part of the args, and the last tick field is the live
+# pool tick (not sqrtPriceX96). The three trailing zero words are
+# sqrtPriceX96=0 / borrow-if-needed bools = false (all zero either way).
+def _aero_in_account_balance(account, symbol: str) -> int:
+    """In-account spendable balance (base units) of `symbol` on the Degen Account.
+
+    The mint+stake facet pulls token0/token1 from the account's own holdings, the
+    same balance getBalance(bytes32) reports (verified equal to ERC20.balanceOf on
+    the account 2026-06-14). Subtract any pending withdrawal-intent lock so we never
+    treat reserved funds as available. Returns 0 if the view reverts."""
+    try:
+        bal = account.functions.getBalance(asset_b32(symbol)).call()
+    except Exception:
+        return 0
+    try:
+        locked = account.functions.getTotalIntentAmount(asset_b32(symbol)).call()
+    except Exception:
+        locked = 0
+    return bal - locked if bal > locked else 0
+
+def _aero_cap_to_balance(account, pool_cfg: dict, amt0_wei: int, amt1_wei: int) -> tuple:
+    """Cap each requested amount to what the account actually holds, minus a 1-wei
+    margin so display round-up can never push the request past the real balance.
+    Returns (amt0_capped, amt1_capped, notes) where notes lists human cap messages."""
+    notes = []
+    sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
+    dec0, dec1 = pool_cfg["decimals0"], pool_cfg["decimals1"]
+    for amt, sym, dec, idx in ((amt0_wei, sym0, dec0, 0), (amt1_wei, sym1, dec1, 1)):
+        if amt <= 0:
+            continue
+        avail = _aero_in_account_balance(account, sym)
+        safe = avail - 1 if avail > 0 else 0  # 1-wei margin vs rounding overshoot
+        if amt > safe:
+            capped = safe if safe > 0 else 0
+            notes.append((idx, capped,
+                          f"Capped {sym} to {fmt_token_amount(capped, dec)} "
+                          f"(on-chain balance {fmt_token_amount(avail, dec)})"))
+    amt0_out, amt1_out = amt0_wei, amt1_wei
+    for idx, capped, _msg in notes:
+        if idx == 0:
+            amt0_out = capped
+        else:
+            amt1_out = capped
+    return amt0_out, amt1_out, [m for _i, _c, m in notes]
+
+def _aero_simulate_mint(w3, from_addr: str, account_addr: str, calldata: bytes) -> tuple:
+    """eth_call-simulate the mint+stake before broadcasting. Returns (ok, info):
+    ok=True + would-be tokenId on success, ok=False + revert detail on failure.
+    Read-only — never signs or sends."""
+    try:
+        ret = w3.eth.call({"from": from_addr, "to": account_addr,
+                           "data": "0x" + calldata.hex()})
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:200]}"
+    token_id = int.from_bytes(bytes(ret)[:32], "big") if len(ret) >= 32 else None
+    return True, token_id
+
+def _aero_mint_params(pool_cfg: dict, amount0_wei: int, amount1_wei: int,
                       tick_lower: int, tick_upper: int,
-                      recipient: str, slippage_pct: float) -> tuple:
-    """Build MintParams=(token0,token1,tickSpacing,tickLower,tickUpper,
-    amount0Desired,amount1Desired,amount0Min,amount1Min,recipient,deadline,
-    sqrtPriceX96). sqrtPriceX96=0 means the NPM uses the pool's current price."""
+                      current_tick: int, slippage_pct: float) -> tuple:
     slippage = Decimal(str(slippage_pct)) / Decimal(100)
-    amount0_min = int(Decimal(str(amount0)) * (Decimal(1) - slippage))
-    amount1_min = int(Decimal(str(amount1)) * (Decimal(1) - slippage))
-    deadline = int(time.time()) + 1800  # 30 minutes
+    amount0_min = int(Decimal(str(amount0_wei)) * (Decimal(1) - slippage))
+    amount1_min = int(Decimal(str(amount1_wei)) * (Decimal(1) - slippage))
     return (
         Web3.to_checksum_address(pool_cfg["token0"]),
         Web3.to_checksum_address(pool_cfg["token1"]),
-        pool_cfg["tickSpacing"],
         tick_lower,
         tick_upper,
-        amount0,
-        amount1,
-        amount0_min,
-        amount1_min,
-        Web3.to_checksum_address(recipient),
-        deadline,
-        0,  # sqrtPriceX96: 0 = use current pool price
+        pool_cfg["tickSpacing"],
+        amount0_wei,          # amount0Desired (wei)
+        amount1_wei,          # amount1Desired (wei)
+        amount0_min,          # amount0Min (wei)
+        amount1_min,          # amount1Min (wei)
+        300,                  # word9 constant (frontend passes 300)
+        int(current_tick),    # word10: live pool tick
+        0, 0, 0,              # word11-13: zero (sqrtPriceX96=0 / bools false)
     )
 
 # Helper: build DecreaseLiquidityParams tuple (5 fields).
@@ -3196,26 +3315,28 @@ def _aero_decrease_params(token_id: int, liquidity: int,
 
 # Helper: compute tick range around a desired centre price.
 def _aero_tick_range(tick_spacing: int, centre_price: float = None,
-                     width_pct: float = 2.0) -> tuple:
-    """Return (tickLower, tickUpper) for a symmetrical range ±width_pct around
-    centre_price. If centre_price is None, uses full-range positions.
-    tickSpacing must be valid (1, 5, 10, 30, 100, 200, etc.).
-    Ticks are snapped to the tickSpacing grid."""
-    if centre_price is None or centre_price <= 0:
-        # Full range: MIN_TICK to MAX_TICK (snapped to spacing)
-        MIN_TICK = -887272
-        MAX_TICK = 887272
+                     width_pct: float = 2.0, pool_tick: int = None) -> tuple:
+    """Return (tickLower, tickUpper) for +/-width_pct around centre.
+    Priority: pool_tick > centre_price > full range."""
+    import math
+    MIN_TICK, MAX_TICK = -887272, 887272
+
+    if pool_tick is not None:
+        tick_delta = int(abs(math.log(1.0 + width_pct / 100.0) / math.log(1.0001))) + 1
+        raw_lower = pool_tick - tick_delta
+        raw_upper = pool_tick + tick_delta
+    elif centre_price is not None and centre_price > 0:
+        lower_price = centre_price * max(1e-12, 1.0 - width_pct / 100.0)
+        upper_price = centre_price * (1.0 + width_pct / 100.0)
+        raw_lower = math.log(lower_price) / math.log(1.0001)
+        raw_upper = math.log(upper_price) / math.log(1.0001)
+    else:
         t_lower = (MIN_TICK // tick_spacing) * tick_spacing
         t_upper = (MAX_TICK // tick_spacing) * tick_spacing
         return (t_lower, t_upper)
-    # Convert price to tick: tick = floor(log(price) / log(1.0001))
-    import math
-    centre_tick = int(math.log(centre_price) / math.log(1.0001))
-    half_width_ticks = int(centre_tick * width_pct / 100.0)
-    tick_lower = ((centre_tick - half_width_ticks) // tick_spacing) * tick_spacing
-    tick_upper = ((centre_tick + half_width_ticks) // tick_spacing) * tick_spacing
-    # Clamp to valid range
-    MIN_TICK, MAX_TICK = -887272, 887272
+
+    tick_lower = math.floor(raw_lower / tick_spacing) * tick_spacing
+    tick_upper = math.ceil(raw_upper / tick_spacing) * tick_spacing
     tick_lower = max(MIN_TICK, min(MAX_TICK, tick_lower))
     tick_upper = max(MIN_TICK, min(MAX_TICK, tick_upper))
     if tick_lower >= tick_upper:
@@ -3259,43 +3380,81 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
         print("At least one of --amount-<token0> / --amount-<token1> must be > 0")
         return
 
-    # Get current price from KuCoin for tick range calculation
-    price_sym = pool_cfg["symbol0"] + "-USDT"
+    # Auto-cap each side to the account's real in-account balance. The summary
+    # display can round a dust balance UP, so a request matching the shown value
+    # could exceed the true balance and revert AFTER burning gas (2026-06-14).
+    amt0, amt1, cap_notes = _aero_cap_to_balance(account, pool_cfg, amt0, amt1)
+    for note in cap_notes:
+        print(f"  {note}")
+    if amt0 == 0 and amt1 == 0:
+        print("  Nothing to deposit after capping to on-chain balance.")
+        return
+
+    # Get pool's on-chain tick from slot0 for accurate range computation
+    pool_tick = None
     centre_price = None
     try:
-        r = requests.get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={price_sym}", timeout=3)
-        if r.status_code == 200 and r.json().get("code") == "200000":
-            centre_price = float(r.json()["data"]["price"])
+        pool_addr = _aero_pool_address(pool_cfg)
+        pool_abi = json.loads(SLOT0_ABI)
+        pool_c = w3.eth.contract(address=pool_addr, abi=pool_abi)
+        slot0 = pool_c.functions.slot0().call()
+        pool_tick = slot0[1]
+        print(f"  Pool tick (on-chain): {pool_tick}")
     except Exception:
-        pass
+        # Fallback to KuCoin price
+        price_sym = pool_cfg["symbol0"] + "-USDT"
+        try:
+            r = requests.get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={price_sym}", timeout=3)
+            if r.status_code == 200 and r.json().get("code") == "200000":
+                centre_price = float(r.json()["data"]["price"])
+        except Exception:
+            pass
 
-    tick_lower, tick_upper = _aero_tick_range(pool_cfg["tickSpacing"], centre_price, width_pct)
+    tick_lower, tick_upper = _aero_tick_range(pool_cfg["tickSpacing"], centre_price, width_pct, pool_tick)
     params = _aero_mint_params(pool_cfg, amt0, amt1, tick_lower, tick_upper,
-                               pa, slippage_pct)
+                               pool_tick if pool_tick is not None else (tick_lower + tick_upper) // 2,
+                               slippage_pct)
 
     sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
     print(f"Pool: {sym0}/{sym1} (tickSpacing={pool_cfg['tickSpacing']})")
-    if centre_price:
+    if pool_tick is not None:
+        print(f"  Tick range: [{tick_lower}, {tick_upper}] (width: +/-{width_pct}%)")
+    elif centre_price:
         print(f"  Current {sym0} price: ${centre_price:,.2f}")
         print(f"  Tick range: [{tick_lower}, {tick_upper}] → price [{1.0001**tick_lower:.4f}, {1.0001**tick_upper:.4f}]")
         print(f"  Width: ±{width_pct}%")
     else:
         print(f"  Full-range position (no price data available)")
-    print(f"  {sym0}: {amount0 or 0} ({amt0} wei)  {sym1}: {amount1 or 0} ({amt1} wei)")
+    print(f"  {sym0}: {fmt_token_amount(amt0, pool_cfg['decimals0'])}  "
+          f"{sym1}: {fmt_token_amount(amt1, pool_cfg['decimals1'])}")
+
+    # Build RedStone payload + final mint+stake calldata (selector 0xf32f1e56).
+    # 14 flat args; amounts in native wei; tickSpacing + live tick included.
+    # Verified byte-exact vs the successful manual mint 0x1723377a.... Built once
+    # so the same bytes feed both the pre-flight simulation and the broadcast.
+    feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
+    payload = build_redstone_payload(feeds)
+    from eth_abi import encode as abi_encode
+    flat_types = ['address', 'address', 'int24', 'int24', 'int24',
+                  'uint256', 'uint256', 'uint256', 'uint256',
+                  'uint256', 'int24', 'uint256', 'uint256', 'uint256']
+    encoded_params = abi_encode(flat_types, list(params))
+    mint_calldata = AERODROME_SEL_MINT + encoded_params + payload
+
+    # Pre-flight eth_call simulation — catches reverts (insufficient balance,
+    # slippage/PSC, solvency) BEFORE any gas is spent. Gates every broadcast.
+    sim_ok, sim_info = _aero_simulate_mint(w3, acct.address, account.address, mint_calldata)
+    if not sim_ok:
+        print(f"  Simulation reverted — aborting before broadcast: {sim_info}")
+        return
+    if sim_info is not None:
+        print(f"  Simulation passed — would-be tokenId: {sim_info}")
+    else:
+        print("  Simulation passed.")
 
     if not execute:
         print("Preview only. Run with --execute to broadcast.")
         return
-
-    # Build RedStone payload for solvency check
-    feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
-    payload = build_redstone_payload(feeds)
-
-    # Encode the mint call: use the probed selector + ABI-encoded params
-    mint_data = account.encode_abi("mintAerodrome", args=[params])
-    # encode_abi returns hex string "0x...", extract params bytes after selector
-    mint_params_bytes = bytes.fromhex(mint_data[2:])[4:]
-    mint_calldata = AERODROME_SEL_MINT + mint_params_bytes + payload
 
     tx = {
         "from": acct.address,
@@ -3328,21 +3487,20 @@ def cmd_aero_remove_liquidity(token_id: int, percentage: float = 100.0,
     account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
     print(f"Degen Account: {pa}")
 
-    # Read the position's current liquidity
-    try:
-        pos = account.functions.getPositionCompositionSimplified(token_id).call()
-    except Exception as e:
-        print(f"  Cannot read position {token_id}: {e}")
+    # Read the position's current liquidity from NPM.positions() — correct for
+    # staked positions too (the simplified facet view reports 0 liquidity once the
+    # NFT is held by the gauge).
+    pos = _aero_read_position(w3, token_id)
+    if pos is None:
+        print(f"  Cannot read position {token_id}.")
         return
-    token0, token1, tick_data, current_liq = pos
+    token0, token1, tick_lower, tick_upper, current_liq = pos
     if current_liq == 0:
         print(f"  Position {token_id} has 0 liquidity (may already be closed).")
         return
 
     sym0 = _resolve_token_symbol(w3, token0)
     sym1 = _resolve_token_symbol(w3, token1)
-    tick_lower = _int24_from_hi128(tick_data)
-    tick_upper = _int24_from_lo128(tick_data)
 
     remove_liq = int(Decimal(str(current_liq)) * Decimal(str(percentage)) / Decimal(100))
     if remove_liq <= 0:
@@ -3353,15 +3511,25 @@ def cmd_aero_remove_liquidity(token_id: int, percentage: float = 100.0,
     print(f"  Current liquidity: {current_liq}")
     print(f"  Removing: {remove_liq} ({percentage}%)")
 
-    if not execute:
-        print("Preview only. Run with --execute to broadcast.")
-        return
-
     params = _aero_decrease_params(token_id, remove_liq, 0, 0)
     # decreaseLiquidity on the facet (selector ca15558b)
     dec_data = account.encode_abi("decreaseAerodromeLiquidity", args=[params])
     dec_params_bytes = bytes.fromhex(dec_data[2:])[4:]
     dec_calldata = AERODROME_SEL_DECREASE + dec_params_bytes
+
+    # Pre-flight eth_call simulation — refuse to broadcast on revert. The decrease
+    # path is not RedStone-gated, so a bare eth_call is sufficient.
+    try:
+        w3.eth.call({"from": acct.address, "to": account.address,
+                     "data": "0x" + dec_calldata.hex()})
+    except Exception as e:
+        print(f"  Simulation reverted — aborting before broadcast: {type(e).__name__}: {str(e)[:200]}")
+        return
+    print("  Simulation passed.")
+
+    if not execute:
+        print("Preview only. Run with --execute to broadcast.")
+        return
 
     tx = {
         "from": acct.address,

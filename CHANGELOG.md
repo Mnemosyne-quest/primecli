@@ -4,6 +4,35 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.8.0] - 2026-06-14
+
+### Fixed
+- **Aerodrome concentrated-liquidity mint encoding (DegenPrime, Base).** The
+  `mintAndStakeLiquidityAerodrome` calldata (selector `0xf32f1e56`) is now encoded
+  to match the live facet byte-for-byte: 14 flat args including `tickSpacing`,
+  native-wei amounts, the live/center pool tick (not `sqrtPriceX96`), and no
+  recipient field. Previously the encoder dropped `tickSpacing` (shifting every
+  later arg) and sent the stable side in human units, so every CLI mint reverted
+  with no data. Verified against a live mint (Base tx `0x1a99a420…`).
+- **Staked Aerodrome position reads.** `aerodrome-positions` (and the remove-liquidity
+  read) now read `NPM.positions(tokenId)` directly. Staked NFTs are owned by the
+  gauge, so the simplified-composition view returned liquidity 0 and garbage ticks;
+  staked positions now report correct liquidity and tick range.
+- **Solvency display.** A no-debt account (where `isSolvent()` can return null) no
+  longer renders a false `Solvent: NO - liquidatable`.
+- Removed a dead/misleading inline `mintAndStakeLiquidityAerodrome` ABI that hashed
+  to the wrong selector and was never used.
+
+### Added
+- **Simulate-before-broadcast for Aerodrome add/remove-liquidity.** Every `--execute`
+  runs an `eth_call` on the exact final calldata first and aborts with the revert
+  reason instead of broadcasting (and burning gas) on a call that would fail.
+- **Auto-cap LP amounts to on-chain balance.** Requested amounts are capped to the
+  Degen Account's actual in-account balance (minus 1 wei), preventing the
+  "requested the rounded display value, over-requested the real balance" revert.
+- **Dust-balance display precision.** Balances that 6-dp rounding would show as zero
+  or misleadingly round up now render in scientific notation plus raw wei.
+
 ## [0.7.5] - 2026-06-14
 
 ### Added
