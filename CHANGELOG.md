@@ -4,6 +4,17 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.7.5] - 2026-06-14
+
+### Added
+- **`--owner <address>` keyless read-only mode for `deltaprime` and `arbprime`.**
+  Lets monitoring / simulation jobs inspect a wallet's Prime Account and positions
+  (`defi`, `lb-positions`) without resolving or loading a private key — a public EOA
+  address is enough. `get_account()` returns a read-only account (address only,
+  cannot sign) when `--owner` is set; write commands are refused while `--owner` is
+  active (read-only commands only). Upstreamed from the defi-sims engines' vendored
+  fork so those engines can run against canonical primecli (single source).
+
 ## [0.7.4] - 2026-06-13
 
 ### Added

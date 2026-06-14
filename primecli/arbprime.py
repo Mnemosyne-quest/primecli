@@ -262,6 +262,7 @@ AGENTS = {
 }
 _SELECTED_AGENT = None        # set by the --as CLI flag in main()
 _CLI_KEY = None               # set by the --key CLI flag in main()
+_OWNER_ADDRESS = None          # set by --owner for keyless read-only commands (main())
 # Core protocol addresses — the LIVE Arbitrum deployment (DeploymentConstants.sol),
 # on-chain verified 2026-06-03. The stale *TUP.json deployment (factory 0x97f4C81…)
 # has only ETH+USDC pools — NOT used here.
@@ -847,6 +848,14 @@ def resolve_private_key():
     )
 
 def get_account() -> Account:
+    # --owner provides a keyless read-only account (address only, cannot sign) for
+    # monitoring/sim reads that need the wallet owner (e.g. to locate a Prime Account)
+    # but never broadcast. Write paths are blocked in main() when --owner is set.
+    if _OWNER_ADDRESS:
+        class _ReadOnlyAccount:
+            def __init__(self, address):
+                self.address = Web3.to_checksum_address(address)
+        return _ReadOnlyAccount(_OWNER_ADDRESS)
     return Account.from_key(resolve_private_key())
 
 def to_wei_units(amount, decimals):
@@ -5587,7 +5596,7 @@ def main():
     check_version()
     args = sys.argv[1:] if len(sys.argv) > 1 else []
     # Global wallet selector: --as <agent>, stripped before command dispatch.
-    global _SELECTED_AGENT, _CLI_KEY
+    global _SELECTED_AGENT, _CLI_KEY, _OWNER_ADDRESS
     if "--as" in args:
         i = args.index("--as")
         if i + 1 >= len(args):
@@ -5603,11 +5612,27 @@ def main():
             return
         _CLI_KEY = args[i + 1]
         del args[i:i + 2]
+    # Public owner-address selector for read-only commands. Lets monitoring/sim jobs
+    # inspect a wallet's Prime Account / positions without resolving or loading a key.
+    if "--owner" in args:
+        i = args.index("--owner")
+        if i + 1 >= len(args):
+            print("--owner requires an EVM address. Example: --owner 0xabc...")
+            return
+        try:
+            _OWNER_ADDRESS = Web3.to_checksum_address(args[i + 1])
+        except Exception:
+            print(f"Invalid --owner address: {args[i + 1]}")
+            return
+        del args[i:i + 2]
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)
         return
 
     cmd = args[0]
+    if _OWNER_ADDRESS and cmd not in {"defi", "lb-positions"}:
+        print("--owner is only supported for read-only commands: defi, lb-positions")
+        return
     if cmd == "pool-info":
         # First positional after `pool-info` is the pool name; --json is an opt-in flag
         # that switches output from human tables to a compact JSON shape (one object for
