@@ -214,6 +214,22 @@ def append_history(state_dir: str, entry: dict):
         path.write_text("\n".join(lines[-1000:]) + "\n")
 
 
+NOTIFY_SCRIPT = os.path.expanduser("/root/.openclaw/workspace/scripts/notify.sh")
+
+
+def _notify(text: str):
+    """Send a Telegram notification via the notify.sh script."""
+    if not os.path.exists(NOTIFY_SCRIPT):
+        return
+    try:
+        subprocess.run(
+            ["bash", NOTIFY_SCRIPT, text],
+            capture_output=True, timeout=30,
+        )
+    except Exception:
+        pass
+
+
 def load_baseline_equity(state_dir: str) -> float | None:
     """Load baseline equity for stop-loss tracking."""
     path = Path(state_dir) / "baseline-equity"
@@ -325,7 +341,46 @@ def run_tick(
     # 3. Compute health
     health = compute_health(defi_data, max_mult)
     health["tier"] = tier
+
+    # 4. Load strategy (do this early so rebalance mode is known before equity checks)
+    strategy = load_strategy(strategy_path)
+    mode = strategy.get("mode", "observer")
+    health["mode"] = mode
+    result.update(health)
+    result["mode"] = mode
+
+    # 5. Check for unfunded or unpriced accounts
     if health.get("error") == "equity near zero":
+        # Check if there are actual token balances without USD prices (RedStone off?)
+        has_balances = False
+        groups = defi_data.get("groups", [])
+        if groups:
+            for g in groups:
+                for s in g.get("supplied", []):
+                    bal = s.get("balance", 0)
+                    try:
+                        if float(bal) > 0:
+                            has_balances = True
+                            break
+                    except (ValueError, TypeError):
+                        pass
+                if has_balances:
+                    break
+        else:
+            for s in defi_data.get("supplied", []):
+                bal = s.get("balance", 0)
+                try:
+                    if float(bal) > 0:
+                        has_balances = True
+                        break
+                except (ValueError, TypeError):
+                    pass
+
+        if has_balances:
+            # Positions exist but USD prices unavailable — skip this tick
+            result["action"] = "skip (unpriced positions)"
+            return result
+
         # Only escalate if there's actual debt — an empty unfunded wallet is not an emergency
         if health.get("debt_usd", 0) and health["debt_usd"] > 0.5:
             write_escalation(state_dir, "equity-near-zero", {
@@ -338,17 +393,9 @@ def run_tick(
             result["mode"] = "escalated"
         else:
             result["action"] = "none (unfunded account)"
-        result.update(health)
         return result
 
-    # 4. Load strategy (position/market/side are optional hints now — auto-detected from defi_data)
-    strategy = load_strategy(strategy_path)
-    mode = strategy.get("mode", "observer")
-    health["mode"] = mode
-    result.update(health)
-    result["mode"] = mode
-
-    # 5. Health swing detection (always)
+    # 6. Health swing detection (always)
     last_pct = load_last_health(state_dir)
     if last_pct is not None and health["health_pct"] is not None:
         diff = abs(health["health_pct"] - last_pct)
@@ -363,7 +410,7 @@ def run_tick(
             result["escalation"] = "health_swing"
     save_last_health(state_dir, health["health_pct"] or 0.0)
 
-    # 6. Append to history
+    # 7. Append to history
     entry = {
         "ts": now_iso, "mode": mode,
         "pct": health["health_pct"],
@@ -373,7 +420,7 @@ def run_tick(
     }
     append_history(state_dir, entry)
 
-    # 7. Rebalance mode logic
+    # 8. Rebalance mode logic
     if mode == "rebalance":
         # Valuation gate: never auto-lever/de-lever on incomplete or untrustworthy data
         # (missing RedStone feed → unpriced position → wrong equity/debt/health). Escalate
@@ -399,6 +446,7 @@ def run_tick(
         position_type = strategy.get("position", "")
         market = strategy.get("market", "avax-usdc")
         side = strategy.get("side", "short")
+        swap_target = strategy.get("swap_target", "")
         low, high = target_range[0], target_range[1]
 
         pct = health["health_pct"]
@@ -465,16 +513,73 @@ def run_tick(
                     return result
 
             if repay_amt > raw_usdc:
-                # Need to withdraw from position first — escalate
-                write_escalation(state_dir, "repay-no-usdc", {
-                    "reason": "repay_needs_position_close",
-                    "repay_needed": repay_amt,
-                    "raw_usdc": raw_usdc,
-                    "health_pct": pct,
-                    "label": label,
-                })
-                result["action"] = "escalate (need close)"
-                return result
+                # Build supply_rows from defi_data for potential swap source
+                supply_rows = []
+                groups = defi_data.get("groups", [])
+                if groups:
+                    for g in groups:
+                        supply_rows.extend(g.get("supplied", []))
+                else:
+                    supply_rows.extend(defi_data.get("supplied", []))
+
+                # Need more USDC — try to swap from swap_target if configured
+                if swap_target:
+                    for s in list(supply_rows):
+                        sym = s.get("symbol", "")
+                        usd_val = s.get("usd", 0) or 0
+                        if sym.upper() == swap_target.upper() and usd_val > 1:
+                            raw_amt = s.get("amount", 0)
+                            swap_token_amt = raw_amt * 0.95
+                            if swap_token_amt < 0.001:
+                                break
+                            try:
+                                sr = subprocess.run(
+                                    [sys.executable, tool_path, "swap",
+                                     "--from", swap_target,
+                                     "--to", "USDC",
+                                     "--amount", f"{swap_token_amt:.6f}",
+                                     "--slippage", "1.0",
+                                     "--execute"],
+                                    capture_output=True, text=True, timeout=180,
+                                )
+                                if sr.returncode == 0:
+                                    result["swap"] = f"swapped {swap_token_amt:.4f} {swap_target} -> USDC"
+                                else:
+                                    write_escalation(state_dir, "repay-swap-failed", {
+                                        "reason": "repay_swap_failed",
+                                        "swap_source": swap_target,
+                                        "swap_amount": swap_token_amt,
+                                        "stderr": sr.stderr[:200],
+                                        "health_pct": pct,
+                                        "label": label,
+                                    })
+                                    result["error"] = f"swap failed: {sr.stderr[:200]}"
+                                    result["action"] = "escalate (swap failed)"
+                                    return result
+                            except Exception as e:
+                                result["error"] = f"swap error: {e}"
+                                return result
+                            break
+                    else:
+                        write_escalation(state_dir, "repay-no-usdc", {
+                            "reason": "repay_needs_position_close",
+                            "repay_needed": repay_amt,
+                            "raw_usdc": raw_usdc,
+                            "health_pct": pct,
+                            "label": label,
+                        })
+                        result["action"] = "escalate (need close)"
+                        return result
+                else:
+                    write_escalation(state_dir, "repay-no-usdc", {
+                        "reason": "repay_needs_position_close",
+                        "repay_needed": repay_amt,
+                        "raw_usdc": raw_usdc,
+                        "health_pct": pct,
+                        "label": label,
+                    })
+                    result["action"] = "escalate (need close)"
+                    return result
 
             if dry_run:
                 result["action"] = f"would repay ${repay_amt:.2f} USDC"
@@ -490,6 +595,7 @@ def run_tick(
                 if r.returncode == 0:
                     cooldown_file.write_text(str(int(time.time())))
                     result["action"] = f"repaid ${repay_amt:.2f}"
+                    _notify(f"🔄 Rebalance: {label} repaid ${repay_amt:.2f} USDC (health was {pct}%)")
                 else:
                     result["error"] = f"repay failed: {r.stderr[:200]}"
             except Exception as e:
@@ -527,99 +633,126 @@ def run_tick(
                 result["error"] = f"borrow error: {e}"
                 return result
 
-            # Deploy into whatever positions are open (detected dynamically from defi_data)
-            has_gmx = health.get("has_gmx", False)
-            has_lb = health.get("has_lb", False)
-            has_aero = health.get("has_aero", False)
-            open_positions = []
-            if has_gmx: open_positions.append("gmx")
-            if has_lb:  open_positions.append("lb")
-            if has_aero: open_positions.append("aero")
+            # If swap_target is set, deploy by swapping borrowed USDC to that token
+            if swap_target and swap_target.upper() != "USDC":
+                split_amt = borrow_amt
+                try:
+                    sr = subprocess.run(
+                        [sys.executable, tool_path, "swap",
+                         "--from", "USDC",
+                         "--to", swap_target,
+                         "--amount", f"{split_amt:.2f}",
+                         "--slippage", "1.0",
+                         "--execute"],
+                        capture_output=True, text=True, timeout=180,
+                    )
+                    if sr.returncode == 0:
+                        cooldown_file.write_text(str(int(time.time())))
+                        result["action"] = f"borrowed ${borrow_amt:.2f}, swapped {split_amt:.2f} USDC -> {swap_target}"
+                        _notify(f"🔄 Rebalance: {label} borrowed ${borrow_amt:.2f} USDC \u2192 swapped to {swap_target} (health was {pct}%)")
+                    else:
+                        result["warning"] = f"swap to {swap_target} failed after borrow: {sr.stderr[:200]}"
+                        cooldown_file.write_text(str(int(time.time())))
+                except Exception as e:
+                    result["error"] = f"borrow+swap error: {e}"
+                    cooldown_file.write_text(str(int(time.time())))
 
-            if not open_positions:
-                # No open positions — just borrow and leave as USDC (or deploy to default)
-                result["action"] = f"borrowed ${borrow_amt:.2f} (no positions to deploy into)"
-                cooldown_file.write_text(str(int(time.time())))
             else:
-                # Split borrow amount proportionally across open positions
-                split_amt = borrow_amt / len(open_positions)
-                deployed_ok = 0
-                deployed_fail = 0
+                # Deploy into whatever positions are open (detected dynamically from defi_data)
+                has_gmx = health.get("has_gmx", False)
+                has_lb = health.get("has_lb", False)
+                has_aero = health.get("has_aero", False)
+                open_positions = []
+                if has_gmx: open_positions.append("gmx")
+                if has_lb:  open_positions.append("lb")
+                if has_aero: open_positions.append("aero")
 
-                for pos_type in open_positions:
-                    if pos_type == "gmx":
-                        # Use market/side from strategy as hint, fall back to sensible defaults
-                        mkt = strategy.get("market", "avax-usdc") if tool_path else "avax-usdc"
-                        sd = strategy.get("side", "long") if tool_path else "long"
-                        try:
-                            r = subprocess.run(
-                                [sys.executable, tool_path, "gmx-deposit",
-                                 "--market", mkt, "--amount", f"{split_amt:.2f}",
-                                 "--side", sd, "--fee-buffer", "1.5", "--execute"],
-                                capture_output=True, text=True, timeout=120,
-                            )
-                            if r.returncode == 0:
-                                deployed_ok += 1
-                            else:
-                                result["warning"] = f"gmx deposit failed: {r.stderr[:200]}"
-                                deployed_fail += 1
-                        except Exception as e:
-                            result["error"] = f"gmx deposit error: {e}"
-                            deployed_fail += 1
+                if not open_positions:
+                    # No open positions — just borrow and leave as USDC (or deploy to default)
+                    result["action"] = f"borrowed ${borrow_amt:.2f} (no positions to deploy into)"
+                    cooldown_file.write_text(str(int(time.time())))
+                    _notify(f"🔄 Rebalance: {label} borrowed ${borrow_amt:.2f} USDC (no positions to deploy, health was {pct}%)")
+                else:
+                    # Split borrow amount proportionally across open positions
+                    split_amt = borrow_amt / len(open_positions)
+                    deployed_ok = 0
+                    deployed_fail = 0
 
-                    elif pos_type == "lb":
-                        # Detect LB pair from defi data (look for "TraderJoe V2 LB" group)
-                        lb_pairs = []
-                        for g in defi_data.get("groups", []):
-                            if g.get("type") == "TraderJoe V2 LB":
-                                for item in g.get("items", []):
-                                    label = item.get("label", "")
-                                    m = re.match(r'\[([^\]]+)\]', label)
-                                    if m:
-                                        lb_pairs.append(m.group(1))
-
-                        # Skip if tool doesn't support lb-add (degenprime)
-                        tool_bn = os.path.basename(tool_path) if tool_path else ""
-                        if "degenprime" in tool_bn:
-                            result["action"] = f"lb-add not available on degenprime — leaving ${split_amt:.2f} as USDC"
-                            deployed_fail += 1
-                        elif not lb_pairs:
-                            result["warning"] = f"has_lb=True but no LB pair found in defi data — leaving ${split_amt:.2f} as USDC"
-                            deployed_fail += 1
-                        else:
-                            pair_key = lb_pairs[0]
+                    for pos_type in open_positions:
+                        if pos_type == "gmx":
+                            # Use market/side from strategy as hint, fall back to sensible defaults
+                            mkt = strategy.get("market", "avax-usdc") if tool_path else "avax-usdc"
+                            sd = strategy.get("side", "long") if tool_path else "long"
                             try:
                                 r = subprocess.run(
-                                    [sys.executable, tool_path, "lb-add",
-                                     "--pair", pair_key,
-                                     "--amount-x", "0",
-                                     "--amount-y", f"{split_amt:.2f}",
-                                     "--shape", "spot",
-                                     "--range", "15",
-                                     "--execute"],
+                                    [sys.executable, tool_path, "gmx-deposit",
+                                     "--market", mkt, "--amount", f"{split_amt:.2f}",
+                                     "--side", sd, "--fee-buffer", "1.5", "--execute"],
                                     capture_output=True, text=True, timeout=120,
                                 )
                                 if r.returncode == 0:
                                     deployed_ok += 1
                                 else:
-                                    result["warning"] = f"lb-add failed: {r.stderr[:200]}"
+                                    result["warning"] = f"gmx deposit failed: {r.stderr[:200]}"
                                     deployed_fail += 1
                             except Exception as e:
-                                result["error"] = f"lb-add error: {e}"
+                                result["error"] = f"gmx deposit error: {e}"
                                 deployed_fail += 1
 
-                    elif pos_type == "aero":
-                        # Aerodrome CL: degenprime has read-only aerodrome-positions,
-                        # but no deposit/withdraw commands yet (write paths deferred to
-                        # v2 — on-chain signatures vary by Aerodrome version).
-                        # Use `degenprime aerodrome-positions` to list your NFT tokenIds.
-                        result["action"] = f"aero deposit not yet supported (read-only via aerodrome-positions, writes deferred to v2) — leaving ${split_amt:.2f} as USDC"
+                        elif pos_type == "lb":
+                            # Detect LB pair from defi data (look for "TraderJoe V2 LB" group)
+                            lb_pairs = []
+                            for g in defi_data.get("groups", []):
+                                if g.get("type") == "TraderJoe V2 LB":
+                                    for item in g.get("items", []):
+                                        label = item.get("label", "")
+                                        m = re.match(r'\[([^\]]+)\]', label)
+                                        if m:
+                                            lb_pairs.append(m.group(1))
 
-                if deployed_ok > 0:
-                    cooldown_file.write_text(str(int(time.time())))
-                    result["action"] = f"borrowed ${borrow_amt:.2f}, deployed ${split_amt:.2f} to {deployed_ok} position(s)"
-                else:
-                    result["warning"] = f"borrow ok but all deposits failed" 
+                            # Skip if tool doesn't support lb-add (degenprime)
+                            tool_bn = os.path.basename(tool_path) if tool_path else ""
+                            if "degenprime" in tool_bn:
+                                result["action"] = f"lb-add not available on degenprime — leaving ${split_amt:.2f} as USDC"
+                                deployed_fail += 1
+                            elif not lb_pairs:
+                                result["warning"] = f"has_lb=True but no LB pair found in defi data — leaving ${split_amt:.2f} as USDC"
+                                deployed_fail += 1
+                            else:
+                                pair_key = lb_pairs[0]
+                                try:
+                                    r = subprocess.run(
+                                        [sys.executable, tool_path, "lb-add",
+                                         "--pair", pair_key,
+                                         "--amount-x", "0",
+                                         "--amount-y", f"{split_amt:.2f}",
+                                         "--shape", "spot",
+                                         "--range", "15",
+                                         "--execute"],
+                                        capture_output=True, text=True, timeout=120,
+                                    )
+                                    if r.returncode == 0:
+                                        deployed_ok += 1
+                                    else:
+                                        result["warning"] = f"lb-add failed: {r.stderr[:200]}"
+                                        deployed_fail += 1
+                                except Exception as e:
+                                    result["error"] = f"lb-add error: {e}"
+                                    deployed_fail += 1
+
+                        elif pos_type == "aero":
+                            # Aerodrome CL: degenprime has read-only aerodrome-positions,
+                            # but no deposit/withdraw commands yet (write paths deferred to
+                            # v2 — on-chain signatures vary by Aerodrome version).
+                            # Use `degenprime aerodrome-positions` to list your NFT tokenIds.
+                            result["action"] = f"aero deposit not yet supported (read-only via aerodrome-positions, writes deferred to v2) — leaving ${split_amt:.2f} as USDC"
+
+                    if deployed_ok > 0:
+                        cooldown_file.write_text(str(int(time.time())))
+                        result["action"] = f"borrowed ${borrow_amt:.2f}, deployed ${split_amt:.2f} to {deployed_ok} position(s)"
+                        _notify(f"🔄 Rebalance: {label} borrowed ${borrow_amt:.2f} USDC, deployed {split_amt:.2f} to {deployed_ok} position(s) (health was {pct}%)")
+                    else:
+                        result["warning"] = f"borrow ok but all deposits failed" 
 
     return result
 
