@@ -2364,7 +2364,7 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
               f"(total {in_acct_wei / 10**cfg['decimals']:.6f} minus "
               f"{total_intent_wei / 10**cfg['decimals']:.6f} pending withdrawal intent) — "
               f"swap into {symbol} first or wait for intents to mature.")
-        return
+        sys.exit(2)
     cap_notes = []
     if amount_wei < requested_wei:
         if available_wei < min(requested_wei, debt_wei):

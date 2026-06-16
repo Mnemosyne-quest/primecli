@@ -304,6 +304,14 @@ def test_resolve_dc_tiered_reverts_falls_back_untiered(monkeypatch):
     assert calls["batches"] == 3  # addr + tiered(revert) + untiered
 
 
+def test_degen_redstone_available_uses_protocol_cb_symbols(monkeypatch):
+    """DegenPrime getPrices expects protocol symbols; payload creation maps cb* to feeds."""
+    monkeypatch.setattr(DEGEN, "_redstone_fetch_packages", lambda: {"BTC": []})
+    assert "cbBTC" in DEGEN.REDSTONE_AVAILABLE_FEEDS
+    assert "BTC" not in DEGEN.REDSTONE_AVAILABLE_FEEDS
+    assert DEGEN._redstone_data_feed_id("cbBTC") == "BTC"
+
+
 def test_resolve_dc_unresolvable_symbol_is_zero(monkeypatch):
     """A symbol whose getAssetAddress returns the zero address (not listed) gets dc=0 — it
     then contributes nothing to the health meter, matching the contract skipping it."""
