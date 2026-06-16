@@ -346,3 +346,109 @@ def test_resolve_dc_is_cached(monkeypatch):
     second = DELTA._resolve_debt_coverages(w3, ["USDC"], tier_code=1)
     assert first == second
     assert calls["n"] == n_after_first  # no new batches on the cached call
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Synthetic-LP gap fallback hardening (degenprime, 2026-06-16)
+#
+# _compute_degen_account_health injects a synthetic "LP" collateral row for the
+# getTotalValue-over-priced-collateral gap, but ONLY when a staked Aerodrome NFT
+# actually exists (decomposition failed). With zero staked NFTs the gap is not an
+# LP and must NOT be injected — otherwise it overstates health with phantom
+# collateral. These tests pin both branches. Rows carry pre-resolved `dc`, so the
+# computation is fully offline (w3 is never consulted).
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _priced(symbol: str, usd: float, dc: float = DC_MAJOR) -> dict:
+    return {"symbol": symbol, "dc": dc, "usd": usd}
+
+
+def test_gap_injected_when_staked_nft_exists():
+    """Staked NFT exists but aero_legs empty (decomposition failed): the gap is the
+    undecomposed LP -> inject it, health reflects the extra collateral."""
+    supplied = [_priced("USDC", 100.0)]
+    borrowed = [_priced("WETH", 200.0)]
+    # getTotalValue ($500) exceeds priced collateral ($100) by $400: the staked LP.
+    hp = DEGEN._compute_degen_account_health(
+        supplied, borrowed, aero_legs=[], get_total_value=500.0,
+        w3=None, has_staked_nft=True)
+    # The $400 LP row was added -> total supplied seen by health is $500, not $100,
+    # and equity is positive (collateral covers debt) instead of negative.
+    # (health_pct itself stays 0 offline because the synthetic LP row carries no
+    # debtCoverage with w3=None — live, _resolve_debt_coverages supplies it.)
+    assert hp["supplied_usd"] == pytest.approx(500.0)
+    assert hp["equity"] == pytest.approx(300.0)
+
+
+def test_gap_NOT_injected_without_staked_nft():
+    """No staked NFT + pure USD gap: must NOT inject phantom collateral (the bug).
+    Health is computed on the real $100 collateral only."""
+    supplied = [_priced("USDC", 100.0)]
+    borrowed = [_priced("WETH", 200.0)]
+    hp = DEGEN._compute_degen_account_health(
+        supplied, borrowed, aero_legs=[], get_total_value=500.0,
+        w3=None, has_staked_nft=False)
+    # No synthetic LP -> supplied stays $100 (phantom $400 NOT counted).
+    assert hp["supplied_usd"] == pytest.approx(100.0)
+
+
+def test_gap_default_off_is_safe():
+    """has_staked_nft defaults to False -> a caller that forgets it can't overstate
+    health by accident (fail-closed default)."""
+    supplied = [_priced("USDC", 100.0)]
+    borrowed = [_priced("WETH", 50.0)]
+    hp = DEGEN._compute_degen_account_health(
+        supplied, borrowed, aero_legs=[], get_total_value=500.0, w3=None)
+    assert hp["supplied_usd"] == pytest.approx(100.0)
+
+
+def test_real_aero_legs_unaffected_by_gating():
+    """When aero_legs is non-empty (real decomposed LP), the gating is irrelevant —
+    the gap fallback never runs and the real legs (already in supplied_rows) stand."""
+    supplied = [_priced("USDC", 100.0), _priced("AERO", 400.0)]
+    borrowed = [_priced("WETH", 200.0)]
+    real_legs = [{"token_id": 7, "sym0": "AERO", "sym1": "CBBTC"}]
+    hp_no_staked = DEGEN._compute_degen_account_health(
+        supplied, borrowed, aero_legs=real_legs, get_total_value=500.0,
+        w3=None, has_staked_nft=False)
+    hp_staked = DEGEN._compute_degen_account_health(
+        supplied, borrowed, aero_legs=real_legs, get_total_value=500.0,
+        w3=None, has_staked_nft=True)
+    # Identical regardless of the flag: fallback is gated on `not aero_legs`.
+    assert hp_no_staked["supplied_usd"] == pytest.approx(500.0)
+    assert hp_staked["supplied_usd"] == pytest.approx(500.0)
+
+
+class _FakeFn:
+    def __init__(self, result=None, raises=False):
+        self._result = result
+        self._raises = raises
+
+    def call(self):
+        if self._raises:
+            raise RuntimeError("revert")
+        return self._result
+
+
+class _FakeAccount:
+    def __init__(self, ids=None, raises=False):
+        self.functions = self
+        self._ids = ids
+        self._raises = raises
+
+    def getOwnedStakedAerodromeTokenIds(self):
+        return _FakeFn(result=self._ids, raises=self._raises)
+
+
+def test_has_staked_aero_token_ids_nonempty():
+    assert DEGEN._has_staked_aero_token_ids(_FakeAccount(ids=[123])) is True
+
+
+def test_has_staked_aero_token_ids_empty():
+    assert DEGEN._has_staked_aero_token_ids(_FakeAccount(ids=[])) is False
+
+
+def test_has_staked_aero_token_ids_revert_is_false():
+    """A revert/read error must read as 'no staked NFT' — never invent collateral."""
+    assert DEGEN._has_staked_aero_token_ids(_FakeAccount(raises=True)) is False

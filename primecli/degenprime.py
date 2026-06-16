@@ -2181,6 +2181,21 @@ def _aero_gauge_earned(w3, degen_account: 'Web3.eth.Contract', token_id: int) ->
         return 0.0
 
 
+def _has_staked_aero_token_ids(account) -> bool:
+    """True iff the Degen Account owns at least one staked Aerodrome Slipstream NFT.
+
+    Read-only. Used to gate the synthetic-LP gap fallback: a getTotalValue >
+    priced-collateral gap should only be treated as an undecomposed LP when a staked
+    tokenId actually EXISTS but its decomposition failed (e.g. an unreadable pool /
+    unresolved decimals). With zero staked NFTs the gap is NOT an LP, so injecting a
+    synthetic LP entry would be phantom collateral that overstates health. Reverts are
+    treated as 'no staked NFT' (fail-closed — never invent collateral on a read error)."""
+    try:
+        return bool(account.functions.getOwnedStakedAerodromeTokenIds().call())
+    except Exception:
+        return False
+
+
 def _aero_position_legs(w3, account):
     """Decompose each staked Aerodrome Slipstream position the Degen Account owns into
     its underlying token legs (token0/token1 amounts) using the pool's live sqrtPrice.
@@ -2248,24 +2263,28 @@ def _aero_position_legs(w3, account):
 
 
 def _compute_degen_account_health(supplied_rows, borrowed_rows, aero_legs,
-                                  get_total_value, w3=None):
+                                  get_total_value, w3=None, has_staked_nft=False):
     """Compute health_pct with LP gap fallback — shared by gather_defi & cmd_summary.
 
     supplied_rows/borrowed_rows: lists of dicts with at least {symbol, usd}.
     aero_legs: from _aero_position_legs (already injected into supplied_rows by
     the caller for real legs, but used here for the gap fallback when it's empty).
     get_total_value: on-chain getTotalValue in USD (SolvencyFacet).
+    has_staked_nft: True iff getOwnedStakedAerodromeTokenIds is non-empty (caller
+    passes _has_staked_aero_token_ids); gates the gap fallback.
 
-    The getTotalValue gap fallback (Issue 3): when aero_legs is empty but
-    getTotalValue exceeds priced supplied by >$1, inject a synthetic LP entry.
+    The getTotalValue gap fallback (Issue 3): when aero_legs is empty but a staked
+    NFT exists whose decomposition failed, inject a synthetic LP entry for the gap.
     This is the shared health computation used by both defi --json and
     summary --json (Issue 4 consistency guarantee)."""
     hp_rows = list(supplied_rows)
     hp_borrowed = list(borrowed_rows)
 
-    # Gap fallback: _aero_position_legs might miss staked NFTs. When aero_legs
-    # is empty/None but getTotalValue > priced_supplied, inject the gap.
-    if not aero_legs and get_total_value is not None:
+    # Gap fallback: _aero_position_legs might miss a staked NFT whose decomposition
+    # failed. Only inject when a staked tokenId actually EXISTS (has_staked_nft) —
+    # a pure USD gap with zero staked NFTs is NOT an LP, and injecting it would be
+    # phantom collateral that overstates health.
+    if not aero_legs and has_staked_nft and get_total_value is not None:
         priced_supplied = sum(r.get("usd", 0) or 0 for r in hp_rows)
         gap = get_total_value - priced_supplied
         if gap > 1.0:
@@ -2312,6 +2331,9 @@ def gather_defi() -> dict:
         # match getTotalValue, and the health calc sees the collateral instead of reading
         # negative equity. (Bruno, 2026-06-14 — wallet page was blind to the Aero pool.)
         aero_legs = _aero_position_legs(w3, account)
+        # Does a staked Aerodrome NFT actually exist? Computed once; gates the
+        # synthetic-LP gap fallback (below + in _compute_degen_account_health).
+        _has_staked = _has_staked_aero_token_ids(account)
 
         # Back-solve a single unpriced collateral symbol from getTotalValue. getPrices
         # only returns RedStone-feed symbols; getTotalValue also values feed-less tokens
@@ -2334,14 +2356,15 @@ def gather_defi() -> dict:
                 _resid = result["total_usd"] - priced_total
                 if _resid > 0 and _amt > 0:
                     price_map[_s] = _resid / _amt
-            # FIX issue-3: _aero_position_legs may miss staked NFTs when
-            # getOwnedStakedAerodromeTokenIds returns empty (e.g. the NFT was staked
-            # through a path the Degen Account doesn't track). When aero_legs is empty
-            # but getTotalValue exceeds priced collateral by a material amount (>$1),
-            # the gap is almost certainly a staked LP position. Inject it as a
+            # FIX issue-3: _aero_position_legs may miss a staked NFT whose
+            # decomposition failed (unreadable pool / unresolved decimals) even though
+            # getOwnedStakedAerodromeTokenIds is non-empty. In that case a getTotalValue
+            # gap over priced collateral (>$1) is the undecomposed LP — inject it as a
             # synthetic LP entry so health_pct sees the collateral instead of reading
             # negative equity, and the wallet panel shows the LP instead of being blank.
-            if not aero_legs and not unpriced:
+            # Gated on _has_staked: with NO staked NFTs the gap is not an LP, so we must
+            # not inject phantom collateral that would overstate health.
+            if not aero_legs and not unpriced and _has_staked:
                 _gap = result["total_usd"] - priced_total
                 if _gap > 1.0:
                     aero_legs = [{
@@ -2406,7 +2429,7 @@ def gather_defi() -> dict:
         # legs, so a leveraged LP doesn't read as zero equity.
         _hp = _compute_degen_account_health(
             _rows_supplied + aero_health_rows, _rows_borrowed,
-            aero_legs, result["total_usd"], w3=w3)
+            aero_legs, result["total_usd"], w3=w3, has_staked_nft=_has_staked)
         result["health_pct"] = _hp.get("health_pct")
 
         if supplied or borrowed:
@@ -2537,6 +2560,7 @@ def cmd_summary(as_json: bool = False):
         # Equity-based health (0-100%) including Aerodrome LP positions so a
         # leveraged LP doesn't read as zero equity (same calc as gather_defi).
         aero_legs = _aero_position_legs(w3, account)
+        _has_staked = _has_staked_aero_token_ids(account)
         prices = solvency["prices"]
         # Resolve unpriced symbols same way as gather_defi does.
         price_map = dict(prices)
@@ -2556,7 +2580,8 @@ def cmd_summary(as_json: bool = False):
         # inject the gap as a synthetic LP entry so health_pct is consistent.
         _hp_borrowed = [_asset_row(r) for r in borrowed]
         _hp = _compute_degen_account_health(_hp_rows, _hp_borrowed,
-                                            aero_legs, solvency["total"], w3=w3)
+                                            aero_legs, solvency["total"], w3=w3,
+                                            has_staked_nft=_has_staked)
 
         out = {
             "wallet": acct.address,
@@ -2612,6 +2637,7 @@ def cmd_summary(as_json: bool = False):
         # LP doesn't read as zero equity. 0% = liquidation, 50% = half borrowing power
         # used, 100% = no debt.
         _aero_legs = _aero_position_legs(w3, account)
+        _has_staked = _has_staked_aero_token_ids(account)
         _hp_rows = []
         for r in supplied:
             if solvency["prices"].get(r["symbol"]):
@@ -2637,7 +2663,8 @@ def cmd_summary(as_json: bool = False):
                     "symbol": r["symbol"], "balance": "0", "dc": r.get("dc", 0.0),
                     "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)})
         _hp = _compute_degen_account_health(_hp_rows, _hp_borrowed,
-                                            _aero_legs, solvency["total"], w3=w3)
+                                            _aero_legs, solvency["total"], w3=w3,
+                                            has_staked_nft=_has_staked)
         if "error" not in _hp:
             print(f"  Health (0-100%): {_hp['health_pct']:.1f}%")
             print(f"    (supplied=${_hp['supplied_usd']:.2f}, debt=${_hp['debt_usd']:.2f},"
