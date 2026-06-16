@@ -30,6 +30,10 @@ Usage:
   degenprime aero-increase-liquidity --pool weth-usdc-100 --token-id N --amount-token0 X --amount-token1 Y [--slippage 1] [--execute]
   degenprime aero-remove-liquidity --token-id N [--token-id M ...] [--execute]   (full close only)
   degenprime aero-collect-fees --token-id N [--execute]
+  degenprime aero-rebalance status [--token-id N] [--check] [--history] [--json]
+  degenprime aero-rebalance create --token-id N --width-pct W [--mode outside|inside] [--trigger-bps T] [--max-fee-weth F] [--mint-slip-bps 100] [--swap-slip-bps 100] [--execute]
+  degenprime aero-rebalance update --token-id N --width-pct W [...same as create] [--execute]
+  degenprime aero-rebalance cancel --token-id N [--execute]
 
 Configuration (env vars):
   DEGENPRIME_PRIVATE_KEY  Raw 0x... private key for the signer. Falls back to
@@ -93,6 +97,29 @@ unstakes from the gauge, removes all liquidity, collects fees, and burns the NFT
 is no partial/percentage decrease on this path — it always closes 100%. The call is
 solvency-gated, so the calldata carries a RedStone payload (verified byte-exact against
 the manual close 0x0d65...0a50).
+
+aero-rebalance manages the on-chain auto-rebalancer (AerodromeRebalancerFacet) attached
+to a CL position. An order stores a reference price + a range band + a trigger, all in
+basis points (1% = 100 bps), and an off-chain executor unwinds->swaps->re-mints the
+position (a NEW tokenId) when price drifts past the trigger. Subcommands:
+  status  — list active orders (getAllRebalanceOrders, plain read; getRebalanceOrder
+            for one --token-id). Resolves the underlying Aerodrome position by trying
+            v2 then v3 NPM.positions(). --check adds shouldRebalance (RedStone-gated).
+            --history reads the shared RebalanceEventEmitter for this account, chaining
+            RebalanceExecuted tokenId->newTokenId. --json emits a machine-readable shape.
+  create  — turn the rebalancer ON via createRebalanceOrder(CreateRebalanceOrderParams).
+            --width-pct sets a symmetric ±band; --mode outside (default; rebalance after
+            price LEAVES the range, lowerTrigger<0/upperTrigger>0) or inside (rebalance
+            early, lowerTrigger>0/upperTrigger<0 with |trigger|<|range|); --trigger-bps
+            is the trigger magnitude. executionFeeWeth (--max-fee-weth, default 0.001)
+            is a per-rebalance fee CEILING (not a deposit), validated > the live
+            getAutomationProtocolFee() floor. The write only STORES the order (fee-floor
+            check, no solvency), so NO RedStone payload is appended — confirmed by the
+            pre-flight eth_call passing clean without one. Preview-then-confirm: prints
+            the band/trigger/fee and requires --execute to broadcast.
+  update  — re-tune an existing order (updateRebalanceOrder, same args/struct/gating).
+  cancel  — turn the rebalancer OFF (cancelRebalanceOrder, bare uint256). The rollback
+            primitive; not solvency-gated (no RedStone).
 """
 
 import json, os, sys, time, base64
@@ -226,6 +253,24 @@ AERODROME_SEL_MINT = bytes.fromhex("f32f1e56")          # mintAndStakeLiquidityA
 AERODROME_SEL_INCREASE = bytes.fromhex("2c710777")      # inferred: increaseLiquidity
 AERODROME_SEL_BURN = bytes.fromhex("27bed82e")           # batchRemoveStakedLiquidityAerodrome
 AERODROME_SEL_COLLECT = bytes.fromhex("887e4b7e")        # collectAerodromeFees
+
+# ── Aerodrome auto-rebalancer (AerodromeRebalancerFacet) ──────────────────────
+# Two Aerodrome Slipstream deployments coexist on Base; a tokenId belongs to
+# exactly one. Resolve which by trying positions(tokenId) on each NPM (the
+# non-owning deployment reverts). v2 is the original CL (our cbbtc-200 position
+# lives here, whitelisted); v3 is the newer "Gauges V3" deployment.
+AERODROME_NPM_V2 = "0x827922686190790b37229fd06084350E74485b72"  # == AERODROME_NPM
+AERODROME_NPM_V3 = "0xe1f8cd9AC4e4A65F54f38a5CdAfCA44f6dD68b53"
+# Single shared emitter for the 4 order lifecycle/execution events (since the
+# 2026-06-16 migration). Filter getLogs by topics=[topic0, padded(primeAccount)].
+REBALANCE_EVENT_EMITTER = "0x74a1b3715DD3dcB565c7483551b4C67F8FF3E3dc"
+# topic0 (event signature hashes) — precomputed in the feature doc §4.
+REBALANCE_TOPIC0 = {
+    "RebalanceOrderCreated":  "0x4cb21e6335aff9c3dc194e8ba569d80a836ff7e85c8ac6e00b29c60dcabd203f",
+    "RebalanceOrderUpdated":  "0xcf110733c3d79243454a78611f39c969cfad28c677c730f2411cb6b944685a74",
+    "RebalanceOrderCanceled": "0xac877909cb8982d2cbc4ba584659922771e99a7d68777b68fe8c46bdaa5144d9",
+    "RebalanceExecuted":      "0xc314b9b8c9e55873144ca3fd31788bbb05b0a65949a007bf5c0b875ccfb2dae2",
+}
 
 # Whitelisted Aerodrome CL pools exposed as tool keys — the authoritative set of
 # ~31 DegenPrime-supported SlipStream pools. Every entry was verified on-chain
@@ -823,6 +868,63 @@ PRIME_ACCOUNT_ABI = [
     # batchRemoveStakedLiquidityAerodrome(uint256[]) — selector 0x27bed82e
     # (== AERODROME_SEL_BURN, verified). Unstakes + closes the listed positions.
     {"inputs":[{"internalType":"uint256[]","name":"tokenIds","type":"uint256[]"}],"name":"batchRemoveStakedLiquidityAerodrome","outputs":[],"stateMutability":"nonpayable","type":"function"},
+    # AerodromeRebalancerFacet — on-chain auto-rebalancer attached to a CL position.
+    # The two getRebalanceOrder* views are PLAIN storage reads (no oracle data);
+    # shouldRebalance is price-consuming -> RedStone-gated (wrap via redstone_view_call).
+    # createRebalanceOrder/updateRebalanceOrder take CreateRebalanceOrderParams (the
+    # struct WITHOUT referenceSqrtPriceX96/createdOn — those are set by the contract);
+    # cancelRebalanceOrder takes a bare tokenId. Selectors confirmed live 2026-06-16
+    # (getAllRebalanceOrders 0x8d6c1fef returns a clean array on a real account).
+    {"inputs": [], "name": "getAllRebalanceOrders",
+     "outputs": [{"name": "", "type": "tuple[]", "components": [
+         {"name": "tokenId", "type": "uint256"},
+         {"name": "order", "type": "tuple", "components": [
+             {"name": "referenceSqrtPriceX96", "type": "uint160"},
+             {"name": "lowerRangePercentageBps", "type": "int24"},
+             {"name": "upperRangePercentageBps", "type": "int24"},
+             {"name": "lowerTriggerPercentageBps", "type": "int24"},
+             {"name": "upperTriggerPercentageBps", "type": "int24"},
+             {"name": "mintSlippageBps", "type": "uint256"},
+             {"name": "swapSlippageBps", "type": "uint256"},
+             {"name": "createdOn", "type": "uint256"},
+             {"name": "maxExecutionFee", "type": "uint256"}]}]}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "tokenId", "type": "uint256"}], "name": "getRebalanceOrder",
+     "outputs": [{"name": "", "type": "tuple", "components": [
+         {"name": "referenceSqrtPriceX96", "type": "uint160"},
+         {"name": "lowerRangePercentageBps", "type": "int24"},
+         {"name": "upperRangePercentageBps", "type": "int24"},
+         {"name": "lowerTriggerPercentageBps", "type": "int24"},
+         {"name": "upperTriggerPercentageBps", "type": "int24"},
+         {"name": "mintSlippageBps", "type": "uint256"},
+         {"name": "swapSlippageBps", "type": "uint256"},
+         {"name": "createdOn", "type": "uint256"},
+         {"name": "maxExecutionFee", "type": "uint256"}]}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "tokenId", "type": "uint256"}], "name": "shouldRebalance",
+     "outputs": [{"name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "params", "type": "tuple", "components": [
+        {"name": "tokenId", "type": "uint256"},
+        {"name": "lowerRangePercentageBps", "type": "int24"},
+        {"name": "upperRangePercentageBps", "type": "int24"},
+        {"name": "lowerTriggerPercentageBps", "type": "int24"},
+        {"name": "upperTriggerPercentageBps", "type": "int24"},
+        {"name": "mintSlippageBps", "type": "uint256"},
+        {"name": "swapSlippageBps", "type": "uint256"},
+        {"name": "executionFeeWeth", "type": "uint256"}]}],
+     "name": "createRebalanceOrder", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+    {"inputs": [{"name": "params", "type": "tuple", "components": [
+        {"name": "tokenId", "type": "uint256"},
+        {"name": "lowerRangePercentageBps", "type": "int24"},
+        {"name": "upperRangePercentageBps", "type": "int24"},
+        {"name": "lowerTriggerPercentageBps", "type": "int24"},
+        {"name": "upperTriggerPercentageBps", "type": "int24"},
+        {"name": "mintSlippageBps", "type": "uint256"},
+        {"name": "swapSlippageBps", "type": "uint256"},
+        {"name": "executionFeeWeth", "type": "uint256"}]}],
+     "name": "updateRebalanceOrder", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+    {"inputs": [{"name": "tokenId", "type": "uint256"}], "name": "cancelRebalanceOrder",
+     "outputs": [], "stateMutability": "nonpayable", "type": "function"},
 ]
 
 # TokenManager ABI - minimal subset for symbol/decimals lookups + supported tokens
@@ -838,6 +940,11 @@ TOKEN_MANAGER_ABI = [
      "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "getSupportedTokensAddresses",
      "outputs": [{"type": "address[]"}], "stateMutability": "view", "type": "function"},
+    # Per-rebalance protocol fee FLOOR (WETH). createRebalanceOrder reverts
+    # InsufficientExecutionFee unless executionFeeWeth exceeds this. 0 as of
+    # 2026-06-16 but governance-settable, so read it live each run.
+    {"inputs": [], "name": "getAutomationProtocolFee",
+     "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
 ]
 
 # Minimal ERC20 ABI - balanceOf + approve + decimals. Used for wallet token reads,
@@ -4154,6 +4261,416 @@ def cmd_aero_collect_fees(token_id: int, execute: bool = False):
     ok = receipt["status"] == 1
 
 
+# ─── Aerodrome Auto-Rebalancer (AerodromeRebalancerFacet) ─────────────────────
+
+def _aero_resolve_npm(w3, token_id: int):
+    """Resolve which Aerodrome deployment owns a tokenId by trying positions() on
+    each NPM (v2 first — our whitelisted cbbtc-200 lives there — then v3). The
+    non-owning deployment reverts. Returns (deployment, position_struct) where
+    deployment is 'v2'/'v3' and the struct is the raw positions() tuple, or
+    (None, None) if neither deployment knows the tokenId (burned/unknown)."""
+    for ver, addr in (("v2", AERODROME_NPM_V2), ("v3", AERODROME_NPM_V3)):
+        try:
+            npm = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=AERODROME_NPM_ABI)
+            return ver, npm.functions.positions(token_id).call()
+        except Exception:
+            continue
+    return None, None
+
+
+def _bps_band_from_width(width_pct: float) -> tuple:
+    """Units bridge: a symmetric ±width_pct LP band as (lowerRangeBps, upperRangeBps).
+    1% = 100 bps; lower edge is negative, upper positive. e.g. width_pct=3 ->
+    (-300, +300)."""
+    band = round(width_pct * 100)
+    return (-band, band)
+
+
+def _trigger_bps(mode: str, range_bps: int, trigger_bps: int) -> tuple:
+    """Map a mode + trigger magnitude to (lowerTriggerBps, upperTriggerBps), applying
+    the sign rules from the feature doc §3:
+
+      OUTSIDE — rebalance only after price LEAVES the range: lowerTrigger < 0
+                (a further drop below the lower edge), upperTrigger > 0.
+      INSIDE  — rebalance EARLY while still in range: lowerTrigger > 0,
+                upperTrigger < 0, with |trigger| < |range|.
+
+    `range_bps` is the positive band magnitude (upperRangeBps). `trigger_bps` is the
+    caller-supplied positive magnitude. Returns the signed pair; raises ValueError on
+    an INSIDE trigger that is not strictly inside the band."""
+    mag = abs(trigger_bps)
+    if mode == "inside":
+        if mag >= range_bps:
+            raise ValueError(
+                f"INSIDE trigger magnitude {mag} bps must be smaller than the range "
+                f"band {range_bps} bps (|trigger| < |range|).")
+        return (mag, -mag)
+    # OUTSIDE (default)
+    return (-mag, mag)
+
+
+def _aero_rebalance_events(account: str, from_block=None, to_block="latest"):
+    """Read this account's rebalance lifecycle/execution events from the shared
+    RebalanceEventEmitter. Filters server-side by topics=[topic0, padded(account)],
+    one getLogs per event type. Decodes the non-indexed args per the doc §4 layout and
+    chains RebalanceExecuted tokenId->newTokenId so a logical position can be followed
+    across rebalances (the old NFT is burned each time). Returns a list of dicts
+    sorted by (blockNumber, logIndex)."""
+    w3 = get_w3()
+    emitter = Web3.to_checksum_address(REBALANCE_EVENT_EMITTER)
+    acct_topic = "0x" + Web3.to_checksum_address(account)[2:].lower().rjust(64, "0")
+    latest = w3.eth.block_number
+    if to_block == "latest":
+        to_block = latest
+    if from_block is None:
+        # The shared emitter went live with the 2026-06-16 migration; a recent window
+        # covers all post-migration history. Public Base RPCs cap getLogs at 50k blocks,
+        # so default to ~180k blocks back (≈4 days at 2s/block) and page under the cap.
+        from_block = max(0, latest - 180_000)
+    # Non-indexed arg types per event (indexed userContract/user/tokenId/executor live
+    # in the topics, not the data blob).
+    nonindexed = {
+        "RebalanceOrderCreated":  ["int24", "int24", "int24", "int24", "uint256", "uint256"],
+        "RebalanceOrderUpdated":  ["int24", "int24", "int24", "int24", "uint256"],
+        "RebalanceOrderCanceled": ["uint256"],
+        "RebalanceExecuted":      ["uint160", "uint160", "uint256", "uint256"],
+    }
+    CHUNK = 45_000  # under the public-RPC 50k-block getLogs cap
+    out = []
+    for name, topic0 in REBALANCE_TOPIC0.items():
+        logs = []
+        start = from_block
+        try:
+            while start <= to_block:
+                end = min(start + CHUNK - 1, to_block)
+                logs.extend(w3.eth.get_logs({"address": emitter, "fromBlock": start,
+                                             "toBlock": end, "topics": [topic0, acct_topic]}))
+                start = end + 1
+        except Exception as e:
+            print(f"  (getLogs failed for {name}: {type(e).__name__}: {str(e)[:120]})")
+            continue
+        for lg in logs:
+            ev = {"event": name, "block": lg["blockNumber"],
+                  "logIndex": lg["logIndex"], "tx": lg["transactionHash"].hex()}
+            # topic2 is tokenId (Created/Updated/Canceled) or executor (Executed);
+            # for Executed the OLD tokenId is topic3.
+            topics = lg["topics"]
+            decoded = w3.codec.decode(nonindexed[name], bytes(lg["data"]))
+            if name == "RebalanceExecuted":
+                ev["executor"] = "0x" + topics[2].hex()[-40:]
+                ev["tokenId"] = int(topics[3].hex(), 16)
+                ev["oldRefSqrtPriceX96"] = decoded[0]
+                ev["currentSqrtPriceX96"] = decoded[1]
+                ev["newTokenId"] = decoded[2]
+                ev["timestamp"] = decoded[3]
+            else:
+                ev["tokenId"] = int(topics[3].hex(), 16) if len(topics) > 3 else None
+                if name == "RebalanceOrderCreated":
+                    ev["rangeBps"] = [decoded[0], decoded[1]]
+                    ev["triggerBps"] = [decoded[2], decoded[3]]
+                    ev["executionFeeWeth"] = decoded[4]
+                    ev["timestamp"] = decoded[5]
+                elif name == "RebalanceOrderUpdated":
+                    ev["rangeBps"] = [decoded[0], decoded[1]]
+                    ev["triggerBps"] = [decoded[2], decoded[3]]
+                    ev["timestamp"] = decoded[4]
+                elif name == "RebalanceOrderCanceled":
+                    ev["timestamp"] = decoded[0]
+            out.append(ev)
+    out.sort(key=lambda e: (e["block"], e["logIndex"]))
+    return out
+
+
+def _order_to_dict(token_id: int, order: tuple) -> dict:
+    """Decode a RebalanceOrder tuple (referenceSqrtPriceX96, lowerRangeBps,
+    upperRangeBps, lowerTriggerBps, upperTriggerBps, mintSlippageBps, swapSlippageBps,
+    createdOn, maxExecutionFee) into a JSON-friendly dict."""
+    return {
+        "tokenId": int(token_id),
+        "referenceSqrtPriceX96": int(order[0]),
+        "rangeBps": [int(order[1]), int(order[2])],
+        "triggerBps": [int(order[3]), int(order[4])],
+        "mintSlippageBps": int(order[5]),
+        "swapSlippageBps": int(order[6]),
+        "createdOn": int(order[7]),
+        "maxExecutionFeeWei": int(order[8]),
+        "maxExecutionFeeWeth": int(order[8]) / 1e18,
+    }
+
+
+def cmd_aero_rebalance_status(token_id: int = None, check: bool = False,
+                              history: bool = False, as_json: bool = False):
+    """Read-only: list active on-chain rebalance orders on the Degen Account (or one
+    order if --token-id). Decodes each order's band/trigger bps, createdOn, and max
+    execution fee, and resolves the underlying Aerodrome position (v2 then v3 NPM).
+    With --check, also calls shouldRebalance (RedStone-gated). With --history, reads
+    the shared emitter for this account's order lifecycle + execution events."""
+    w3 = get_w3()
+    acct = get_account()
+    pa = get_prime_account(w3, acct.address)
+    if not pa:
+        if as_json:
+            print(json.dumps({"account": None, "orders": []}))
+        else:
+            print(f"Wallet: {acct.address}\nNo Degen Account yet - no rebalance orders.")
+        return
+    account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
+
+    # Pull orders (plain storage reads, no RedStone).
+    try:
+        if token_id is not None:
+            raw = account.functions.getRebalanceOrder(token_id).call()
+            orders = [(token_id, raw)] if int(raw[7]) > 0 else []
+        else:
+            orders = [(o[0], o[1]) for o in account.functions.getAllRebalanceOrders().call()]
+    except Exception as e:
+        if as_json:
+            print(json.dumps({"account": pa, "error": f"{type(e).__name__}: {str(e)[:200]}"}))
+        else:
+            print(f"  Rebalance order read failed: {type(e).__name__}: {e}")
+        return
+
+    decoded = []
+    for tid, order in orders:
+        d = _order_to_dict(tid, order)
+        ver, pos = _aero_resolve_npm(w3, tid)
+        if pos is not None:
+            sym0 = _resolve_token_symbol(w3, pos[2])
+            sym1 = _resolve_token_symbol(w3, pos[3])
+            d["position"] = {"deployment": ver, "token0": sym0, "token1": sym1,
+                             "tickLower": int(pos[5]), "tickUpper": int(pos[6]),
+                             "liquidity": int(pos[7])}
+        else:
+            d["position"] = None
+        if check:
+            try:
+                payload = build_redstone_payload(degen_account_price_feeds(account))
+                d["shouldRebalance"] = bool(redstone_view_call(
+                    w3, account, "shouldRebalance", payload, args=[tid])[0])
+            except Exception as e:
+                d["shouldRebalance"] = None
+                d["shouldRebalanceError"] = f"{type(e).__name__}: {str(e)[:150]}"
+        decoded.append(d)
+
+    events = None
+    if history:
+        events = _aero_rebalance_events(pa)
+
+    if as_json:
+        out = {"account": pa, "orders": decoded}
+        if events is not None:
+            out["events"] = events
+        print(json.dumps(out))
+        return
+
+    print(f"Wallet: {acct.address}")
+    print(f"Degen Account: {pa}")
+    if not decoded:
+        print("  No active rebalance orders.")
+    else:
+        print(f"  {len(decoded)} active rebalance order(s):")
+        for d in decoded:
+            rng = d["rangeBps"]
+            trg = d["triggerBps"]
+            mode = "inside" if trg[0] > 0 else "outside"
+            pos = d["position"]
+            pair = f"{pos['token0']}/{pos['token1']} ({pos['deployment']})" if pos else "position not resolved"
+            created = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(d["createdOn"])) if d["createdOn"] else "n/a"
+            print(f"    [{d['tokenId']}] {pair}")
+            print(f"        range: {rng[0]/100:+.2f}% / {rng[1]/100:+.2f}%  "
+                  f"trigger: {trg[0]/100:+.2f}% / {trg[1]/100:+.2f}% ({mode})")
+            print(f"        mint/swap slippage: {d['mintSlippageBps']/100:.2f}% / {d['swapSlippageBps']/100:.2f}%  "
+                  f"max fee: {d['maxExecutionFeeWeth']:.6g} WETH")
+            print(f"        created: {created}")
+            if check:
+                sr = d.get("shouldRebalance")
+                if sr is None:
+                    print(f"        shouldRebalance: ERROR ({d.get('shouldRebalanceError', '?')})")
+                else:
+                    print(f"        shouldRebalance: {sr}")
+    if events is not None:
+        if not events:
+            print("  No rebalance history events for this account.")
+        else:
+            print(f"  History ({len(events)} event(s)):")
+            for e in events:
+                ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(e["timestamp"])) if e.get("timestamp") else "?"
+                if e["event"] == "RebalanceExecuted":
+                    print(f"    {ts}  Executed  tokenId {e['tokenId']} -> {e['newTokenId']}  (blk {e['block']})")
+                else:
+                    label = e["event"].replace("RebalanceOrder", "")
+                    print(f"    {ts}  {label}  tokenId {e['tokenId']}  (blk {e['block']})")
+
+
+def _build_rebalance_order_params(token_id: int, width_pct: float, mode: str,
+                                  trigger_bps: int, max_fee_weth: float,
+                                  mint_slip_bps: int, swap_slip_bps: int) -> tuple:
+    """Build the CreateRebalanceOrderParams tuple from human inputs. Returns
+    (params_tuple, preview_dict). Raises ValueError on an out-of-band INSIDE trigger."""
+    lower_range, upper_range = _bps_band_from_width(width_pct)
+    lower_trig, upper_trig = _trigger_bps(mode, upper_range, trigger_bps)
+    fee_wei = int(Decimal(str(max_fee_weth)) * Decimal(10) ** 18)
+    params = (token_id, lower_range, upper_range, lower_trig, upper_trig,
+              int(mint_slip_bps), int(swap_slip_bps), fee_wei)
+    preview = {
+        "tokenId": token_id,
+        "rangeBps": [lower_range, upper_range],
+        "triggerBps": [lower_trig, upper_trig],
+        "mode": mode,
+        "mintSlippageBps": int(mint_slip_bps),
+        "swapSlippageBps": int(swap_slip_bps),
+        "maxExecutionFeeWeth": float(max_fee_weth),
+        "maxExecutionFeeWei": fee_wei,
+    }
+    return params, preview
+
+
+def _aero_rebalance_write(fn_name: str, params: tuple, preview: dict, label: str,
+                          execute: bool):
+    """Shared create/update path: validate the execution fee against the live
+    protocol-fee floor, pre-flight eth_call (abort on revert), print a human preview,
+    and broadcast only under --execute. RedStone gating for the WRITE is settled
+    empirically: createRebalanceOrder/updateRebalanceOrder only STORE the order
+    (fee-floor check, no solvency), so no payload is appended; the pre-flight dry-call
+    is the proof (it passes clean without a payload)."""
+    w3 = get_w3()
+    acct = get_account()
+    print(f"Wallet: {acct.address}")
+    pa = get_prime_account(w3, acct.address)
+    if not pa:
+        print("No Degen Account yet.")
+        return
+    account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
+    print(f"Degen Account: {pa}")
+
+    # Validate executionFeeWeth > the live protocol-fee floor (governance-settable).
+    fee_wei = preview["maxExecutionFeeWei"]
+    try:
+        tm = get_token_manager(w3)
+        floor = tm.functions.getAutomationProtocolFee().call()
+    except Exception as e:
+        print(f"  Cannot read getAutomationProtocolFee floor: {type(e).__name__}: {str(e)[:150]}")
+        return
+    if fee_wei <= floor:
+        print(f"  executionFeeWeth ({fee_wei} wei = {fee_wei/1e18:.6g} WETH) must EXCEED "
+              f"the protocol fee floor ({floor} wei = {floor/1e18:.6g} WETH). "
+              f"Raise --max-fee-weth.")
+        return
+
+    # Human preview.
+    rng, trg = preview["rangeBps"], preview["triggerBps"]
+    print(f"  {label}:")
+    print(f"    tokenId: {preview['tokenId']}")
+    print(f"    range: {rng[0]/100:+.2f}% / {rng[1]/100:+.2f}%")
+    print(f"    trigger: {trg[0]/100:+.2f}% / {trg[1]/100:+.2f}% ({preview['mode']})")
+    print(f"    mint/swap slippage: {preview['mintSlippageBps']/100:.2f}% / {preview['swapSlippageBps']/100:.2f}%")
+    print(f"    max execution fee: {preview['maxExecutionFeeWeth']:.6g} WETH "
+          f"(ceiling, not a deposit; protocol floor {floor/1e18:.6g} WETH)")
+
+    # Build calldata: selector + ABI-encoded params, NO RedStone payload (order store).
+    calldata = bytes.fromhex(account.encode_abi(fn_name, args=[params])[2:])
+
+    # Pre-flight eth_call — abort on revert.
+    try:
+        w3.eth.call({"from": acct.address, "to": account.address,
+                     "data": "0x" + calldata.hex()})
+    except Exception as e:
+        print(f"  Simulation reverted — aborting before broadcast: {type(e).__name__}: {str(e)[:200]}")
+        return
+    print("  Simulation passed.")
+
+    if not execute:
+        print("Preview only. Run with --execute to broadcast.")
+        return
+
+    tx = {
+        "from": acct.address,
+        "to": account.address,
+        "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 2000000,
+        "chainId": CHAIN_ID,
+        "data": "0x" + calldata.hex(),
+    }
+    receipt = _sign_and_send(w3, acct, tx, label, timeout=300, fallback_gas=2000000)
+    if receipt["status"] == 1:
+        print(f"  {label} confirmed for tokenId {preview['tokenId']}.")
+
+
+def cmd_aero_rebalance_create(token_id: int, width_pct: float, mode: str = "outside",
+                              trigger_bps: int = 100, max_fee_weth: float = 0.001,
+                              mint_slip_bps: int = 100, swap_slip_bps: int = 100,
+                              execute: bool = False):
+    """Turn on the auto-rebalancer for an existing Aerodrome position. Builds
+    CreateRebalanceOrderParams from a symmetric ±width_pct band + a trigger mode, then
+    creates the order via createRebalanceOrder."""
+    try:
+        params, preview = _build_rebalance_order_params(
+            token_id, width_pct, mode, trigger_bps, max_fee_weth, mint_slip_bps, swap_slip_bps)
+    except ValueError as e:
+        print(f"  {e}")
+        return
+    _aero_rebalance_write("createRebalanceOrder", params, preview,
+                          "Create rebalance order", execute)
+
+
+def cmd_aero_rebalance_update(token_id: int, width_pct: float, mode: str = "outside",
+                              trigger_bps: int = 100, max_fee_weth: float = 0.001,
+                              mint_slip_bps: int = 100, swap_slip_bps: int = 100,
+                              execute: bool = False):
+    """Re-tune an existing rebalance order's bands/trigger/fee via updateRebalanceOrder.
+    Same args/struct as create."""
+    try:
+        params, preview = _build_rebalance_order_params(
+            token_id, width_pct, mode, trigger_bps, max_fee_weth, mint_slip_bps, swap_slip_bps)
+    except ValueError as e:
+        print(f"  {e}")
+        return
+    _aero_rebalance_write("updateRebalanceOrder", params, preview,
+                          "Update rebalance order", execute)
+
+
+def cmd_aero_rebalance_cancel(token_id: int, execute: bool = False):
+    """Turn off the auto-rebalancer for a position via cancelRebalanceOrder (bare
+    uint256 tokenId). This is the rollback primitive — cancelling reverts a position
+    to off-chain monitoring. Not solvency-gated, so no RedStone payload (the pre-flight
+    dry-call confirms it passes clean without one)."""
+    w3 = get_w3()
+    acct = get_account()
+    print(f"Wallet: {acct.address}")
+    pa = get_prime_account(w3, acct.address)
+    if not pa:
+        print("No Degen Account yet.")
+        return
+    account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
+    print(f"Degen Account: {pa}")
+    print(f"  Cancel rebalance order for tokenId {token_id}")
+
+    calldata = bytes.fromhex(account.encode_abi("cancelRebalanceOrder", args=[token_id])[2:])
+    try:
+        w3.eth.call({"from": acct.address, "to": account.address,
+                     "data": "0x" + calldata.hex()})
+    except Exception as e:
+        print(f"  Simulation reverted — aborting before broadcast: {type(e).__name__}: {str(e)[:200]}")
+        return
+    print("  Simulation passed.")
+
+    if not execute:
+        print("Preview only. Run with --execute to broadcast.")
+        return
+
+    tx = {
+        "from": acct.address,
+        "to": account.address,
+        "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 1500000,
+        "chainId": CHAIN_ID,
+        "data": "0x" + calldata.hex(),
+    }
+    receipt = _sign_and_send(w3, acct, tx, "Cancel rebalance order", timeout=300, fallback_gas=1500000)
+    if receipt["status"] == 1:
+        print(f"  Rebalance order canceled for tokenId {token_id}.")
+
+
 def main():
     check_version()
     try:
@@ -4410,6 +4927,49 @@ def _dispatch():
     elif cmd == "aero-claim-rewards":
         execute = "--execute" in args
         cmd_aero_claim_rewards(execute)
+    elif cmd == "aero-rebalance":
+        sub = args[1] if len(args) > 1 and not args[1].startswith("--") else None
+        execute = "--execute" in args
+        token_id = None
+        width_pct = None
+        mode = "outside"
+        trigger_bps = 100
+        max_fee_weth = 0.001
+        mint_slip_bps = 100
+        swap_slip_bps = 100
+        as_json = "--json" in args
+        check = "--check" in args
+        history = "--history" in args
+        for i, a in enumerate(args):
+            if a == "--token-id" and i + 1 < len(args): token_id = int(args[i + 1])
+            if a == "--width-pct" and i + 1 < len(args): width_pct = float(args[i + 1])
+            if a == "--mode" and i + 1 < len(args): mode = args[i + 1]
+            if a == "--trigger-bps" and i + 1 < len(args): trigger_bps = int(args[i + 1])
+            if a == "--max-fee-weth" and i + 1 < len(args): max_fee_weth = float(args[i + 1])
+            if a == "--mint-slip-bps" and i + 1 < len(args): mint_slip_bps = int(args[i + 1])
+            if a == "--swap-slip-bps" and i + 1 < len(args): swap_slip_bps = int(args[i + 1])
+        if mode not in ("outside", "inside"):
+            print("--mode must be 'outside' or 'inside'.")
+            return
+        if sub in (None, "status"):
+            cmd_aero_rebalance_status(token_id, check, history, as_json)
+        elif sub in ("create", "update"):
+            if token_id is None or width_pct is None:
+                print(f"Usage: degenprime aero-rebalance {sub} --token-id N --width-pct W "
+                      f"[--mode outside|inside] [--trigger-bps T] [--max-fee-weth F] "
+                      f"[--mint-slip-bps 100] [--swap-slip-bps 100] [--execute]")
+                return
+            fn = cmd_aero_rebalance_create if sub == "create" else cmd_aero_rebalance_update
+            fn(token_id, width_pct, mode, trigger_bps, max_fee_weth,
+               mint_slip_bps, swap_slip_bps, execute)
+        elif sub == "cancel":
+            if token_id is None:
+                print("Usage: degenprime aero-rebalance cancel --token-id N [--execute]")
+                return
+            cmd_aero_rebalance_cancel(token_id, execute)
+        else:
+            print(f"Unknown aero-rebalance subcommand '{sub}'. "
+                  f"Choose from: status, create, update, cancel.")
     elif cmd == "health":
         os.environ.setdefault("PRIMECLI_TOOL", sys.argv[0])
         if health_monitor:

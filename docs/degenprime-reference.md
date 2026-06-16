@@ -130,6 +130,37 @@ Aerodrome is the canonical Base DEX (a Solidly fork) and DegenPrime's only nativ
 
 v1 lists tokenIds and points the user at the Aerodrome UI for manage / claim. Once the composition return shape is decoded and the write signatures probed against a live position, v2 can expose `aerodrome-claim` / `aerodrome-decrease` and eventually full add/stake.
 
+### 5b. Aerodrome auto-rebalancer (`AerodromeRebalancerFacet`)
+
+The diamond exposes an on-chain auto-rebalancer that keeps a CL position centred on price. An **order** attached to a position stores a reference price + a **range** band + a **trigger**, all in basis points (1 bps = 0.01%, 100 bps = 1%). When price drifts past the trigger an off-chain executor calls `rebalance(tokenId)`, which unwinds → swaps → re-mints a **new** position (a new Aerodrome tokenId; the old NFT is burned). The order migrates to the new tokenId.
+
+Exposed by the `aero-rebalance status|create|update|cancel` command group (selectors confirmed live 16-06-2026):
+
+| Function | Selector | Gating |
+|---|---|---|
+| `getAllRebalanceOrders() -> (uint256 tokenId, RebalanceOrder order)[]` | `0x8d6c1fef` | plain read |
+| `getRebalanceOrder(uint256) -> RebalanceOrder` | `0x4f6a4629` | plain read |
+| `shouldRebalance(uint256) -> bool` | `0x619c2245` | **RedStone-gated** |
+| `createRebalanceOrder(CreateRebalanceOrderParams)` | `0x569719c4` | **not** RedStone-gated (order store only) |
+| `updateRebalanceOrder(CreateRebalanceOrderParams)` | `0x83b63144` | **not** RedStone-gated |
+| `cancelRebalanceOrder(uint256)` | `0x098b060b` | **not** RedStone-gated |
+
+`RebalanceOrder` (returned by the views): `(uint160 referenceSqrtPriceX96, int24 lowerRangePercentageBps, int24 upperRangePercentageBps, int24 lowerTriggerPercentageBps, int24 upperTriggerPercentageBps, uint256 mintSlippageBps, uint256 swapSlippageBps, uint256 createdOn, uint256 maxExecutionFee)`. `createdOn == 0` ⇒ no order.
+
+`CreateRebalanceOrderParams` (the create/update arg): the same fields **without** `referenceSqrtPriceX96` and `createdOn` (the contract sets those), i.e. `(uint256 tokenId, int24 lowerRangeBps, int24 upperRangeBps, int24 lowerTriggerBps, int24 upperTriggerBps, uint256 mintSlippageBps, uint256 swapSlippageBps, uint256 executionFeeWeth)`.
+
+**Range** is where the new position mints: `lowerRangeBps < 0`, `upperRangeBps > 0` (a symmetric ±W% band is `(-W·100, +W·100)`). **Trigger** sign selects the mode:
+- **OUTSIDE** (default) — rebalance only *after* price leaves the range: `lowerTrigger < 0`, `upperTrigger > 0`.
+- **INSIDE** — rebalance *early*, still in range: `lowerTrigger > 0`, `upperTrigger < 0`, with `|trigger| < |range|`.
+
+`executionFeeWeth` is a per-rebalance fee **ceiling, not a deposit** — `create`/`update` only check it exceeds `TokenManager.getAutomationProtocolFee()` (selector `0x5d3df3ed`; **0** as of 16-06-2026 but governance-settable, so read live). The real fee is charged at execution and sourced WETH → wrapped ETH → borrowed ETH, so no WETH pre-funding is needed — just enough borrow capacity / solvency, and a high-enough ceiling.
+
+**RedStone-gating finding (empirical, 16-06-2026):** dry-calling `createRebalanceOrder` against an account that already had an order returned the identical custom error `0x966753c5` (`OrderAlreadyExists()`) **with and without** an appended RedStone payload — never the `0xe7764c9e` (`CalldataMustHaveValidPayload`) / `0x2b13aef5` (signer) errors a gated path throws. So the writes reach business logic without oracle data: `create`/`update`/`cancel` append **no** payload. Only `shouldRebalance` is gated (wrapped via `redstone_view_call`).
+
+**Events.** The four lifecycle/execution events fire from a single shared `RebalanceEventEmitter` (`0x74a1b3715DD3dcB565c7483551b4C67F8FF3E3dc`) since the 16-06-2026 migration, with the Prime Account as indexed `userContract` (topic1). `aero-rebalance status --history` filters `getLogs` by `topics=[topic0, padded(account)]` (paged in 45k-block chunks to stay under the public-RPC 50k cap) and chains `RebalanceExecuted.tokenId → newTokenId`. topic0s: Created `0x4cb21e63…203f`, Updated `0xcf110733…85a74`, Canceled `0xac877909…5144d9`, Executed `0xc314b9b8…dae2`.
+
+**Two Aerodrome deployments.** A tokenId belongs to exactly one of v2 NPM `0x827922…b72` (our whitelisted cbbtc-200 lives here) or v3 NPM `0xe1f8cd9A…68b53`. `status` resolves it by trying `positions(tokenId)` on each (v2 first); the non-owning deployment reverts.
+
 ---
 
 ## 6. Differences from DeltaPrime
@@ -286,6 +317,10 @@ The tool ships **17 commands**. State-changing commands default to a PREVIEW; ad
 | `execute-withdrawal --pool X [--index N] [--execute]` | state-changing (gated) | Step 2: pulls matured intent(s) to the wallet (`executeWithdrawalIntent`). Default executes all currently-actionable intents for the asset. |
 | `cancel-withdrawal --pool X --index N [--execute]` | state-changing | Cancel a pending intent before maturity. Oracle-free, no payload. |
 | `aerodrome-positions` | read-only | Lists the Aerodrome NFT tokenIds the Degen Account owns/has staked via `getOwnedStakedAerodromeTokenIds`. v1 lists IDs only — composition + write paths deferred to v2. |
+| `aero-rebalance status [--token-id N] [--check] [--history] [--json]` | read-only | List active on-chain rebalance orders (`getAllRebalanceOrders`, plain read; `getRebalanceOrder` for one `--token-id`) with band/trigger bps, createdOn, max fee. Resolves the underlying Aerodrome position (tries v2 then v3 NPM). `--check` adds `shouldRebalance` (RedStone-gated). `--history` reads the shared `RebalanceEventEmitter` for this account, chaining `RebalanceExecuted` tokenId→newTokenId. `--json` for agent ingestion. |
+| `aero-rebalance create --token-id N --width-pct W [--mode outside\|inside] [--trigger-bps T] [--max-fee-weth F] [--mint-slip-bps 100] [--swap-slip-bps 100] [--execute]` | state-changing | Turn the auto-rebalancer ON for a position (`createRebalanceOrder`). `--width-pct` sets a symmetric ±band; mode `outside` (default) rebalances after price leaves the range, `inside` rebalances early. `--max-fee-weth` (default 0.001) is a per-rebalance fee **ceiling**, validated > the live `getAutomationProtocolFee()` floor. **NOT RedStone-gated** (the write only stores the order; verified by a clean no-payload pre-flight `eth_call`). |
+| `aero-rebalance update --token-id N --width-pct W [...same as create] [--execute]` | state-changing | Re-tune an existing order (`updateRebalanceOrder`, same args/struct/gating). |
+| `aero-rebalance cancel --token-id N [--execute]` | state-changing | Turn the auto-rebalancer OFF (`cancelRebalanceOrder`, bare uint256). The rollback primitive. **NOT RedStone-gated** (verified by a clean no-payload pre-flight). |
 
 **Approve targets differ by command** (easy to get wrong, all handled correctly by the tool): `deposit` approves the **pool**; `fund` approves the **Degen Account**; `create-account --fund-*` approves the **factory**; `swap` / `swap-debt` operate on balances already inside the Degen Account, so the EOA approves nothing for them (the facet itself approves the Augustus router mid-tx).
 

@@ -227,6 +227,32 @@ The v1 command lists tokenIds and points the user at the Aerodrome UI for manage
 
 ---
 
+## 9b. Aerodrome auto-rebalancer — ✅ SHIPPED as `aero-rebalance {status|create|update|cancel}`
+
+On-chain auto-rebalancer (`AerodromeRebalancerFacet`) that keeps a CL position centred on price. An order stores a reference price + range band + trigger (all in bps); an off-chain executor unwinds → swaps → re-mints a new position (new tokenId, old NFT burned) when price drifts past the trigger.
+
+```
+DegenAccount.getAllRebalanceOrders() -> (uint256 tokenId, RebalanceOrder)[]   // 0x8d6c1fef, plain read
+DegenAccount.getRebalanceOrder(uint256) -> RebalanceOrder                       // 0x4f6a4629, plain read
+DegenAccount.shouldRebalance(uint256) -> bool                                   // 0x619c2245, RedStone-gated
+DegenAccount.createRebalanceOrder(CreateRebalanceOrderParams)                   // 0x569719c4, NO payload
+DegenAccount.updateRebalanceOrder(CreateRebalanceOrderParams)                   // 0x83b63144, NO payload
+DegenAccount.cancelRebalanceOrder(uint256)                                      // 0x098b060b, NO payload
+TokenManager.getAutomationProtocolFee() -> uint256                              // 0x5d3df3ed, fee floor (0 @ 16-06-2026)
+```
+
+- `RebalanceOrder` = `(uint160 referenceSqrtPriceX96, int24 lowerRangeBps, int24 upperRangeBps, int24 lowerTriggerBps, int24 upperTriggerBps, uint256 mintSlippageBps, uint256 swapSlippageBps, uint256 createdOn, uint256 maxExecutionFee)`. `createdOn == 0` ⇒ no order.
+- `CreateRebalanceOrderParams` = the same minus `referenceSqrtPriceX96`/`createdOn` (contract-set): `(uint256 tokenId, int24 lowerRangeBps, int24 upperRangeBps, int24 lowerTriggerBps, int24 upperTriggerBps, uint256 mintSlippageBps, uint256 swapSlippageBps, uint256 executionFeeWeth)`.
+- **Band/trigger units:** symmetric ±W% band → `(-W·100, +W·100)`. OUTSIDE trigger (default): `lowerTrigger<0, upperTrigger>0`. INSIDE: `lowerTrigger>0, upperTrigger<0`, `|trigger|<|range|`.
+- **`executionFeeWeth` is a ceiling, not a deposit:** validated `> getAutomationProtocolFee()`; the fee is charged at execution (WETH → wrap ETH → borrow ETH), so no pre-funding.
+- **RedStone-gating settled empirically (16-06-2026):** a `createRebalanceOrder` dry-call reverted identically (`0x966753c5` = `OrderAlreadyExists()`) with and without an appended payload — not the `0xe7764c9e`/`0x2b13aef5` errors a gated path throws — so the writes append **no** payload. Only `shouldRebalance` is gated.
+- **Events:** shared `RebalanceEventEmitter` `0x74a1b3715DD3dcB565c7483551b4C67F8FF3E3dc` (since 16-06-2026), Prime Account as indexed `userContract`. `status --history` pages `getLogs` (45k-block chunks) and chains `RebalanceExecuted.tokenId → newTokenId`.
+- **v2/v3:** a tokenId belongs to exactly one NPM (v2 `0x827922…b72` / v3 `0xe1f8cd9A…68b53`); `status` resolves by trying `positions()` on each (v2 first).
+
+State-changing subcommands default to a PREVIEW (human band/trigger/fee printout + pre-flight `eth_call`); add `--execute` to broadcast.
+
+---
+
 ## RedStone wrapping — SHIPPED (`build_redstone_payload` in the `degenprime` module)
 
 RedStone config on Base is **identical** to DeltaPrime's Avalanche config (same data service `redstone-primary-prod`, same 5 authorised signers, same 3-of-5 threshold, same marker bytes, same gateways). The wrap implementation is a direct port:
