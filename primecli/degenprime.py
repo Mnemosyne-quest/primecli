@@ -2368,8 +2368,20 @@ def cmd_summary(as_json: bool = False):
                 row["usd"] = round(row["amount"] * usd, 2)
             return row
 
-        # Compute equity-based health (0-100%)
+        # Equity-based health (0-100%) including Aerodrome LP positions so a
+        # leveraged LP doesn't read as zero equity (same calc as gather_defi).
+        aero_legs = _aero_position_legs(w3, account)
+        prices = solvency["prices"]
+        # Resolve unpriced symbols same way as gather_defi does.
+        price_map = dict(prices)
         _hp_rows = [_asset_row(r) for r in supplied]
+        if aero_legs:
+            for lg in aero_legs:
+                u0, u1 = price_map.get(lg["sym0"]), price_map.get(lg["sym1"])
+                if u0 is not None:
+                    _hp_rows.append({"symbol": lg["sym0"], "usd": round(lg["amt0"] * u0, 2)})
+                if u1 is not None:
+                    _hp_rows.append({"symbol": lg["sym1"], "usd": round(lg["amt1"] * u1, 2)})
         _hp_borrowed = [_asset_row(r) for r in borrowed]
         _hp = _compute_health_pct(_hp_rows, _hp_borrowed, w3=w3)
 
@@ -2377,8 +2389,8 @@ def cmd_summary(as_json: bool = False):
             "wallet": acct.address,
             "account": pa,
             "nativeBalance": pa_eth if pa_eth >= 1e-9 else None,
-            "supplied": _hp_rows,
-            "borrowed": _hp_borrowed,
+            "supplied": [_asset_row(r) for r in supplied],
+            "borrowed": [_asset_row(r) for r in borrowed],
             "poolDeposits": [_asset_row(r) for r in pool_deposits],
             "totalValueUsd": solvency["total"],
             "debtUsd": solvency["debt"],
@@ -2419,35 +2431,45 @@ def cmd_summary(as_json: bool = False):
             print(f"    {r['symbol']:<8} {fmt_token_amount(r['raw'], r['decimals'])}{usd_str}")
 
     if solvency["error"] is None:
-        # A solvency view can come back None even with no error (e.g. a multicall leg that
-        # decoded empty); guard the currency format so summary never crashes on it.
         tv_str = f"${solvency['total']:,.2f}" if solvency["total"] is not None else "n/a"
         debt_str = f"${solvency['debt']:,.2f}" if solvency["debt"] is not None else "n/a"
         print(f"  Total value:        {tv_str}")
         print(f"  Debt:               {debt_str}")
-        if solvency["ratio"] is not None and solvency["ratio"] <= 1000:
-            ratio_pct = max(0.0, 100.0 - 100.0 / solvency["ratio"])
-            print(f"  Health (chain):     {ratio_pct:.1f}%")
-        else:
-            print(f"  Health (chain):     >99.9% (negligible debt)")
-        # ─── Equity-based health (0-100%) ───
-        # Different from health_ratio!
-        hp = _compute_health_pct(
-            [{"symbol": r["symbol"], "balance": "0", "dc": r.get("dc", 0.0),
-              "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)}
-             for r in supplied if solvency["prices"].get(r["symbol"])],
-            [{"symbol": r["symbol"], "balance": "0", "dc": r.get("dc", 0.0),
-              "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)}
-             for r in borrowed if solvency["prices"].get(r["symbol"])],
-            w3=w3,
-        )
-        if "error" not in hp:
-            print(f"  Health (0-100%): {hp['health_pct']:.1f}%")
-            print(f"    (supplied=${hp['supplied_usd']:.2f}, debt=${hp['debt_usd']:.2f},"
-                  f" equity=${hp['equity']:.2f}, max_debt=${hp['max_debt']:.2f}, {hp.get('tier','')})")
+        # Health meter (0-100%) with Aerodrome LP positions included, so a leveraged
+        # LP doesn't read as zero equity. 0% = liquidation, 50% = half borrowing power
+        # used, 100% = no debt.
+        _aero_legs = _aero_position_legs(w3, account)
+        _hp_rows = []
+        for r in supplied:
+            if solvency["prices"].get(r["symbol"]):
+                _hp_rows.append({
+                    "symbol": r["symbol"], "balance": "0", "dc": r.get("dc", 0.0),
+                    "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)})
+        for lg in _aero_legs:
+            u0, u1 = solvency["prices"].get(lg["sym0"]), solvency["prices"].get(lg["sym1"])
+            if u0 is not None:
+                _hp_rows.append({"symbol": lg["sym0"], "balance": "0", "dc": 0.0,
+                                "usd": round(lg["amt0"] * u0, 2)})
+            if u1 is not None:
+                _hp_rows.append({"symbol": lg["sym1"], "balance": "0", "dc": 0.0,
+                                "usd": round(lg["amt1"] * u1, 2)})
+        _hp_borrowed = []
+        for r in borrowed:
+            if solvency["prices"].get(r["symbol"]):
+                _hp_borrowed.append({
+                    "symbol": r["symbol"], "balance": "0", "dc": r.get("dc", 0.0),
+                    "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)})
+        _hp = _compute_health_pct(_hp_rows, _hp_borrowed, w3=w3)
+        if "error" not in _hp:
+            print(f"  Health (0-100%): {_hp['health_pct']:.1f}%")
+            print(f"    (supplied=${_hp['supplied_usd']:.2f}, debt=${_hp['debt_usd']:.2f},"
+                  f" equity=${_hp['equity']:.2f}, max_debt=${_hp['max_debt']:.2f}, {_hp.get('tier','')})")
             print(f"    0%=liquidation  50%=half borrowing power used  100%=no debt")
+        elif solvency["ratio"] is not None:
+            r = solvency["ratio"]
+            print(f"  Collateral/Debt:   {r:.4f}x  (chain ratio; 1.0 = liquidation)")
         else:
-            print(f"  Health (0-100%): N/A ({hp['error']})")
+            print(f"  Health:            N/A (RedStone unavailable)")
         # An account with no debt cannot be liquidated. isSolvent() can come back
         # None on a no-debt account (empty multicall leg), which used to render a
         # misleading "NO - liquidatable" despite ratio >1000 and ~$0 debt. Treat
