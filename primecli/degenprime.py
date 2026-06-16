@@ -2140,6 +2140,33 @@ def _aero_position_legs(w3, account):
     return legs
 
 
+def _compute_degen_account_health(supplied_rows, borrowed_rows, aero_legs,
+                                  get_total_value, w3=None):
+    """Compute health_pct with LP gap fallback — shared by gather_defi & cmd_summary.
+
+    supplied_rows/borrowed_rows: lists of dicts with at least {symbol, usd}.
+    aero_legs: from _aero_position_legs (already injected into supplied_rows by
+    the caller for real legs, but used here for the gap fallback when it's empty).
+    get_total_value: on-chain getTotalValue in USD (SolvencyFacet).
+
+    The getTotalValue gap fallback (Issue 3): when aero_legs is empty but
+    getTotalValue exceeds priced supplied by >$1, inject a synthetic LP entry.
+    This is the shared health computation used by both defi --json and
+    summary --json (Issue 4 consistency guarantee)."""
+    hp_rows = list(supplied_rows)
+    hp_borrowed = list(borrowed_rows)
+
+    # Gap fallback: _aero_position_legs might miss staked NFTs. When aero_legs
+    # is empty/None but getTotalValue > priced_supplied, inject the gap.
+    if not aero_legs and get_total_value is not None:
+        priced_supplied = sum(r.get("usd", 0) or 0 for r in hp_rows)
+        gap = get_total_value - priced_supplied
+        if gap > 1.0:
+            hp_rows.append({"symbol": "LP", "usd": round(gap, 2)})
+
+    return _compute_health_pct(hp_rows, hp_borrowed, w3=w3)
+
+
 def gather_defi() -> dict:
     """Aggregate ALL DegenPrime positions for the selected wallet into one DeBank-style dict,
     matching the cross-tool shape `deltaprime defi --json` emits. Read-only: reuses the same
@@ -2200,6 +2227,24 @@ def gather_defi() -> dict:
                 _resid = result["total_usd"] - priced_total
                 if _resid > 0 and _amt > 0:
                     price_map[_s] = _resid / _amt
+            # FIX issue-3: _aero_position_legs may miss staked NFTs when
+            # getOwnedStakedAerodromeTokenIds returns empty (e.g. the NFT was staked
+            # through a path the Degen Account doesn't track). When aero_legs is empty
+            # but getTotalValue exceeds priced collateral by a material amount (>$1),
+            # the gap is almost certainly a staked LP position. Inject it as a
+            # synthetic LP entry so health_pct sees the collateral instead of reading
+            # negative equity, and the wallet panel shows the LP instead of being blank.
+            if not aero_legs and not unpriced:
+                _gap = result["total_usd"] - priced_total
+                if _gap > 1.0:
+                    aero_legs = [{
+                        "token_id": -1, "sym0": "LP", "sym1": "LP",
+                        "dec0": 18, "dec1": 18,
+                        "amt0": 0.0, "amt1": 0.0,
+                        "_synthetic": True, "_gap_usd": round(_gap, 2),
+                    }]
+                    # Also inject into price_map for the health rows below
+                    price_map["LP"] = 1.0  # gap is already USD
 
         def _row(r):
             amt = r["raw"] / 10**r["decimals"]
@@ -2217,6 +2262,18 @@ def gather_defi() -> dict:
         # one display item under an "Aerodrome" group.
         aero_health_rows, aero_items = [], []
         for lg in aero_legs:
+            if lg.get("_synthetic"):
+                # Fallback: getTotalValue gap injected as a synthetic LP entry.
+                # The health row is a single USD-denominated row so the health calc
+                # sees the collateral. The display item surfaces the back-solved gap.
+                _gap = lg["_gap_usd"]
+                aero_health_rows.append({"symbol": "LP", "usd": _gap})
+                aero_items.append({
+                    "symbol": "Staked LP", "label": "Staked LP (back-solved)",
+                    "balance": f"${_gap:,.2f} (estimated from getTotalValue gap)",
+                    "token_id": -1, "usd": _gap,
+                })
+                continue
             u0, u1 = price_map.get(lg["sym0"]), price_map.get(lg["sym1"])
             usd0 = round(lg["amt0"] * u0, 2) if u0 is not None else None
             usd1 = round(lg["amt1"] * u1, 2) if u1 is not None else None
@@ -2240,7 +2297,9 @@ def gather_defi() -> dict:
 
         # Equity-based health (0-100%) over in-account collateral PLUS the Aerodrome LP
         # legs, so a leveraged LP doesn't read as zero equity.
-        _hp = _compute_health_pct(_rows_supplied + aero_health_rows, _rows_borrowed, w3=w3)
+        _hp = _compute_degen_account_health(
+            _rows_supplied + aero_health_rows, _rows_borrowed,
+            aero_legs, result["total_usd"], w3=w3)
         result["health_pct"] = _hp.get("health_pct")
 
         if supplied or borrowed:
@@ -2377,13 +2436,20 @@ def cmd_summary(as_json: bool = False):
         _hp_rows = [_asset_row(r) for r in supplied]
         if aero_legs:
             for lg in aero_legs:
+                if lg.get("_synthetic"):
+                    _hp_rows.append({"symbol": "LP", "usd": lg["_gap_usd"]})
+                    continue
                 u0, u1 = price_map.get(lg["sym0"]), price_map.get(lg["sym1"])
                 if u0 is not None:
                     _hp_rows.append({"symbol": lg["sym0"], "usd": round(lg["amt0"] * u0, 2)})
                 if u1 is not None:
                     _hp_rows.append({"symbol": lg["sym1"], "usd": round(lg["amt1"] * u1, 2)})
+        # FIX issue-3 (cmd_summary json path): same getTotalValue gap fallback as
+        # gather_defi — when aero_legs is empty but getTotalValue > priced_supplied,
+        # inject the gap as a synthetic LP entry so health_pct is consistent.
         _hp_borrowed = [_asset_row(r) for r in borrowed]
-        _hp = _compute_health_pct(_hp_rows, _hp_borrowed, w3=w3)
+        _hp = _compute_degen_account_health(_hp_rows, _hp_borrowed,
+                                            aero_legs, solvency["total"], w3=w3)
 
         out = {
             "wallet": acct.address,
@@ -2446,6 +2512,10 @@ def cmd_summary(as_json: bool = False):
                     "symbol": r["symbol"], "balance": "0", "dc": r.get("dc", 0.0),
                     "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)})
         for lg in _aero_legs:
+            if lg.get("_synthetic"):
+                _hp_rows.append({"symbol": "LP", "balance": "0", "dc": 0.0,
+                                "usd": lg["_gap_usd"]})
+                continue
             u0, u1 = solvency["prices"].get(lg["sym0"]), solvency["prices"].get(lg["sym1"])
             if u0 is not None:
                 _hp_rows.append({"symbol": lg["sym0"], "balance": "0", "dc": 0.0,
@@ -2459,7 +2529,8 @@ def cmd_summary(as_json: bool = False):
                 _hp_borrowed.append({
                     "symbol": r["symbol"], "balance": "0", "dc": r.get("dc", 0.0),
                     "usd": (r["raw"] / 10**r["decimals"]) * solvency["prices"].get(r["symbol"], 0)})
-        _hp = _compute_health_pct(_hp_rows, _hp_borrowed, w3=w3)
+        _hp = _compute_degen_account_health(_hp_rows, _hp_borrowed,
+                                            _aero_legs, solvency["total"], w3=w3)
         if "error" not in _hp:
             print(f"  Health (0-100%): {_hp['health_pct']:.1f}%")
             print(f"    (supplied=${_hp['supplied_usd']:.2f}, debt=${_hp['debt_usd']:.2f},"
