@@ -428,6 +428,7 @@ PARASWAP_EXECUTORS = {
     "0x00c600b30fb0400701010f4b080409018b9006e0",
     "0xa0f408a000017007015e0f00320e470d00090a5b",
     "0x8faa0000c10015610005ca010ee000d006e0e820",
+    "0x6f0538001f90d0a5f0000060d01d34c002030900",  # Velora v1
 }
 
 # RedStone on-demand oracle config for DegenPrime on Base. Verified identical to
