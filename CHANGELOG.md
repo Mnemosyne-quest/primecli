@@ -4,6 +4,27 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.10.0] - 2026-06-17
+
+### Added
+- **Cross-chain `bridge` command.** Move native or ERC-20 funds between Avalanche, Base,
+  and Arbitrum for any wallet primecli knows (`parakletos`, `paraklaudios`, `core1`) via the
+  same `--as <agent>` interface the protocol commands use. Routes through the LiFi aggregator
+  (`li.quest`), mirroring the proven same-chain swap tx shape with `toChain != fromChain`.
+  - `bridge --as <agent> --from <chain> --to <chain> --token <SYM> --amount <N> [--to-token <SYM>]
+    [--to-address <addr>] [--slippage <pct>] [--poll] [--execute]`
+  - **Safety:** dry-run by default (`--execute` to broadcast); self-bridge only — the
+    destination is the signer's own EOA and a differing `--to-address` is refused; a slippage
+    cap (default 1%) refuses any quote whose `toAmountMin` implies worse; the destination token
+    defaults to the destination chain's native gas token (gas top-up).
+  - Validated live: bridged 1 AVAX (Avalanche) → ETH (Base) self-bridge, settled via the
+    `near` route at 2% in under a minute.
+
+### Changed
+- **Shared wallet key table (`primecli/_wallets.py`).** The agent→key resolution
+  (`AGENTS`, `_agent_key`) is now a single importable source of truth; `degenprime`
+  re-exports from it instead of carrying its own copy, and `bridge` consumes the same map.
+
 ## [0.9.1] - 2026-06-17
 
 ### Fixed
