@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/primecli.svg)](https://pypi.org/project/primecli/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-`primecli` installs three console commands, `deltaprime`, `degenprime`, and `arbprime`, that drive the lending and leverage protocols built by the DeltaPrimeLabs team on Avalanche C-chain, Base, and Arbitrum One respectively. All share a per-user smart-account architecture (EIP-2535 diamond) and are operated through the same CLI shape: savings pools, per-user Prime / Degen Accounts, borrow / repay / fund, swaps, debt refinancing, delayed collateral withdrawals. The Avalanche side additionally exposes GMX V2 LP (GM and GM+), TraderJoe V2 LB, sJOE staking, PRIME leverage tiers, and a leveraged-long zap macro. The Arbitrum side carries the same leverage stack adapted to GMX's home chain — 10 GM + 3 GM+ markets, GLV vaults, 11 TraderJoe LB pairs, PRIME tiers, zap (no sJOE). The Base side ships a read-only Aerodrome position inventory; write paths are deferred to v2.
+`primecli` installs four console commands. Three of them — `deltaprime`, `degenprime`, and `arbprime` — drive the lending and leverage protocols built by the DeltaPrimeLabs team on Avalanche C-chain, Base, and Arbitrum One respectively. The fourth, `bridge`, moves native or ERC-20 funds between those three chains (via the LiFi aggregator) for any wallet in the shared agent table. All share a per-user smart-account architecture (EIP-2535 diamond) and are operated through the same CLI shape: savings pools, per-user Prime / Degen Accounts, borrow / repay / fund, swaps, debt refinancing, delayed collateral withdrawals. The Avalanche side additionally exposes GMX V2 LP (GM and GM+), TraderJoe V2 LB, sJOE staking, PRIME leverage tiers, and a leveraged-long zap macro. The Arbitrum side carries the same leverage stack adapted to GMX's home chain — 10 GM + 3 GM+ markets, GLV vaults, 11 TraderJoe LB pairs, PRIME tiers, zap (no sJOE). The Base side ships a read-only Aerodrome position inventory; write paths are deferred to v2.
 
 Built for agent use:
 
@@ -139,6 +139,17 @@ Pools: `usdc`, `eth`, `arb`, `btc` (native-wrapped asset is WETH, account symbol
 Full per-command + address reference: [docs/arbprime-reference.md](docs/arbprime-reference.md).
 
 Note: DeltaPrime has TWO deployments on Arbitrum; `arbprime` targets the live one used by app.deltaprime.io (factory `0xFf5e…c20`, TokenManager `0x0a0D…E255`), with every address verified on-chain against the live SmartLoanDiamondBeacon. The stale artifact deployment (factory `0x97f4…E4E`) only carries ETH+USDC pools — don't use addresses from the repo's `deployments/arbitrum/*TUP.json` artifacts.
+
+### `bridge` (cross-chain, Avalanche / Base / Arbitrum)
+
+Moves native or ERC-20 funds between chains for any agent in the wallet table, via the LiFi aggregator (li.quest) — same `--as <agent>` interface as the protocol commands.
+
+```bash
+bridge --as <agent> --from <chain> --to <chain> --token <SYM> --amount <decimal> \
+       [--to-token <SYM>] [--to-address <addr>] [--slippage <pct>] [--poll] [--execute]
+```
+
+Chains: `avalanche` (43114), `base` (8453), `arbitrum` (42161). `--token` is the symbol on the source chain; `--to-token` defaults to the destination chain's native gas token (a gas top-up, e.g. `AVAX` → `ETH` when bridging to Base) and can be overridden for a same-asset bridge. Dry-run by default; `--execute` broadcasts on the source chain and prints the source tx hash, source explorer URL, and the LiFi status URL (`--poll` then waits for the cross-chain leg to settle). Safety rails: **self-bridge only** (a `--to-address` that differs from the signer is refused), and the bridge is refused if the quote's implied slippage exceeds `--slippage` (default 1.0%). Because LiFi picks the cheapest route per quote, a cross-asset bridge may land at or above the cap depending on the route — re-quote, or raise `--slippage` if the price impact is acceptable. RPCs are overridable via `BRIDGE_<CHAIN>_RPC`; `LIFI_API_KEY` is sent on quote/status calls if set.
 
 ## Configuration
 

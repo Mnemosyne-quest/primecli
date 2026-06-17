@@ -42,6 +42,7 @@ Documentation = "https://github.com/Mnemosyne-quest/primecli/tree/main/docs"
 deltaprime = "primecli.deltaprime:main"
 degenprime = "primecli.degenprime:main"
 arbprime = "primecli.arbprime:main"
+bridge = "primecli.bridge:main"
 
 [tool.setuptools.packages.find]
 include = ["primecli*"]

@@ -180,41 +180,15 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 # read lazily so read-only commands that don't sign never need a key at all.
 _CLI_KEY = None  # set by the --key CLI flag in main()
 
-# Named-wallet table shared with deltaprime/arbprime. Allows running via
+# Named-wallet table shared with deltaprime/arbprime/bridge. Allows running via
 # DEGENPRIME_AGENT=parakletos (or the fallback DELTAPRIME_AGENT) which is
 # cleaner than passing raw keys through environment variables.
 # Agent resolution also supports --as <agent> CLI flag.
-AGENTS = {
-    "parakletos":   ("/root/.openclaw/.env",                "PARAKLETOS_EVM_PRIVATE_KEY"),
-    "paraklaudios": ("/root/paraklaudios/.credentials.env", "PARAKLAUDIOS_EVM_PRIVATE_KEY"),
-    "core1":   ("/root/.openclaw/.env",                "BRUNO_CORE1_PRIVATE_KEY"),
-}
+# The map and its readers live in primecli._wallets as the single source of
+# truth; re-exported here so existing references (degenprime.AGENTS, etc.) and
+# resolve_private_key() below keep working unchanged.
+from primecli._wallets import AGENTS, _read_env_var, _agent_key  # noqa: E402
 _SELECTED_AGENT = None        # set by the --as CLI flag in main()
-
-
-def _read_env_var(path, var):
-    """Return the value of `var` from a KEY=VALUE env file, or None if absent."""
-    try:
-        for line in Path(path).read_text().splitlines():
-            s = line.strip()
-            if s.startswith(var + "="):
-                return s.split("=", 1)[1].strip().strip('"').strip("'")
-    except FileNotFoundError:
-        return None
-    return None
-
-
-def _agent_key(agent):
-    if agent not in AGENTS:
-        raise RuntimeError(
-            f"Unknown agent '{agent}'. Known agents: {', '.join(AGENTS)}. "
-            f"Or set DEGENPRIME_PRIVATE_KEY, or DEGENPRIME_KEY_FILE."
-        )
-    path, var = AGENTS[agent]
-    key = _read_env_var(path, var)
-    if not key:
-        raise RuntimeError(f"{var} not found in {path} (agent '{agent}').")
-    return key
 
 
 # Core protocol addresses (verified on Base 2026-05-29).
