@@ -4,6 +4,15 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.9.1] - 2026-06-17
+
+### Fixed
+- **`aero-rebalance status --history` performance.** The event scan issued one `getLogs`
+  per event type across a ~180k-block window (16 round-trips), which could time out a
+  per-tick caller (the defi-sims on-chain range-monitor) on a throttled public RPC. Now
+  fetches all four event types in a single `getLogs` per chunk (topic0 OR-list) over a
+  ~90k-block window (covers the 48h KO window), cutting round-trips ~8x (~2s in practice).
+
 ## [0.9.0] - 2026-06-17
 
 ### Added

@@ -4353,8 +4353,10 @@ def _aero_rebalance_events(account: str, from_block=None, to_block="latest"):
     if from_block is None:
         # The shared emitter went live with the 2026-06-16 migration; a recent window
         # covers all post-migration history. Public Base RPCs cap getLogs at 50k blocks,
-        # so default to ~180k blocks back (≈4 days at 2s/block) and page under the cap.
-        from_block = max(0, latest - 180_000)
+        # so default to ~90k blocks back (≈50h at 2s/block, covering the 48h KO window)
+        # and page under the cap. All four event types are fetched in ONE getLogs per
+        # chunk (topic0 OR-list) below, so this stays fast enough for a per-tick call.
+        from_block = max(0, latest - 90_000)
     # Non-indexed arg types per event (indexed userContract/user/tokenId/executor live
     # in the topics, not the data blob).
     nonindexed = {
@@ -4364,47 +4366,52 @@ def _aero_rebalance_events(account: str, from_block=None, to_block="latest"):
         "RebalanceExecuted":      ["uint160", "uint160", "uint256", "uint256"],
     }
     CHUNK = 45_000  # under the public-RPC 50k-block getLogs cap
+    # Reverse map topic0 -> event name so a SINGLE getLogs (topic0 as an OR-list) returns
+    # all four event types per chunk, then is demuxed here. One scan per event type
+    # (the previous approach) meant 4x the getLogs round-trips, which timed out the
+    # per-tick range-monitor call.
+    t0_to_name = {t.lower().removeprefix("0x"): n for n, t in REBALANCE_TOPIC0.items()}
+    all_topic0 = list(REBALANCE_TOPIC0.values())
     out = []
-    for name, topic0 in REBALANCE_TOPIC0.items():
-        logs = []
-        start = from_block
-        try:
-            while start <= to_block:
-                end = min(start + CHUNK - 1, to_block)
-                logs.extend(w3.eth.get_logs({"address": emitter, "fromBlock": start,
-                                             "toBlock": end, "topics": [topic0, acct_topic]}))
-                start = end + 1
-        except Exception as e:
-            print(f"  (getLogs failed for {name}: {type(e).__name__}: {str(e)[:120]})")
-            continue
-        for lg in logs:
-            ev = {"event": name, "block": lg["blockNumber"],
-                  "logIndex": lg["logIndex"], "tx": lg["transactionHash"].hex()}
-            # topic2 is tokenId (Created/Updated/Canceled) or executor (Executed);
-            # for Executed the OLD tokenId is topic3.
-            topics = lg["topics"]
-            decoded = w3.codec.decode(nonindexed[name], bytes(lg["data"]))
-            if name == "RebalanceExecuted":
-                ev["executor"] = "0x" + topics[2].hex()[-40:]
-                ev["tokenId"] = int(topics[3].hex(), 16)
-                ev["oldRefSqrtPriceX96"] = decoded[0]
-                ev["currentSqrtPriceX96"] = decoded[1]
-                ev["newTokenId"] = decoded[2]
-                ev["timestamp"] = decoded[3]
-            else:
-                ev["tokenId"] = int(topics[3].hex(), 16) if len(topics) > 3 else None
-                if name == "RebalanceOrderCreated":
-                    ev["rangeBps"] = [decoded[0], decoded[1]]
-                    ev["triggerBps"] = [decoded[2], decoded[3]]
-                    ev["executionFeeWeth"] = decoded[4]
-                    ev["timestamp"] = decoded[5]
-                elif name == "RebalanceOrderUpdated":
-                    ev["rangeBps"] = [decoded[0], decoded[1]]
-                    ev["triggerBps"] = [decoded[2], decoded[3]]
-                    ev["timestamp"] = decoded[4]
-                elif name == "RebalanceOrderCanceled":
-                    ev["timestamp"] = decoded[0]
-            out.append(ev)
+    start = from_block
+    try:
+        while start <= to_block:
+            end = min(start + CHUNK - 1, to_block)
+            chunk_logs = w3.eth.get_logs({"address": emitter, "fromBlock": start,
+                                          "toBlock": end, "topics": [all_topic0, acct_topic]})
+            for lg in chunk_logs:
+                name = t0_to_name.get(lg["topics"][0].hex().lower().removeprefix("0x"))
+                if name is None:
+                    continue
+                ev = {"event": name, "block": lg["blockNumber"],
+                      "logIndex": lg["logIndex"], "tx": lg["transactionHash"].hex()}
+                # topic2 is executor (Executed); topic3 is the tokenId (all four events).
+                topics = lg["topics"]
+                decoded = w3.codec.decode(nonindexed[name], bytes(lg["data"]))
+                if name == "RebalanceExecuted":
+                    ev["executor"] = "0x" + topics[2].hex()[-40:]
+                    ev["tokenId"] = int(topics[3].hex(), 16)
+                    ev["oldRefSqrtPriceX96"] = decoded[0]
+                    ev["currentSqrtPriceX96"] = decoded[1]
+                    ev["newTokenId"] = decoded[2]
+                    ev["timestamp"] = decoded[3]
+                else:
+                    ev["tokenId"] = int(topics[3].hex(), 16) if len(topics) > 3 else None
+                    if name == "RebalanceOrderCreated":
+                        ev["rangeBps"] = [decoded[0], decoded[1]]
+                        ev["triggerBps"] = [decoded[2], decoded[3]]
+                        ev["executionFeeWeth"] = decoded[4]
+                        ev["timestamp"] = decoded[5]
+                    elif name == "RebalanceOrderUpdated":
+                        ev["rangeBps"] = [decoded[0], decoded[1]]
+                        ev["triggerBps"] = [decoded[2], decoded[3]]
+                        ev["timestamp"] = decoded[4]
+                    elif name == "RebalanceOrderCanceled":
+                        ev["timestamp"] = decoded[0]
+                out.append(ev)
+            start = end + 1
+    except Exception as e:
+        print(f"  (getLogs failed: {type(e).__name__}: {str(e)[:120]})")
     out.sort(key=lambda e: (e["block"], e["logIndex"]))
     return out
 
