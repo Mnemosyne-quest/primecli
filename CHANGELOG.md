@@ -4,6 +4,31 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.9.0] - 2026-06-17
+
+### Added
+- **DegenPrime Aerodrome on-chain auto-rebalancer (`aero-rebalance`).** New command group to
+  manage the protocol's native rebalance orders on Aerodrome CL (Slipstream) positions:
+  - `aero-rebalance status [--token-id N] [--check] [--history] [--json]` — read active orders
+    (`getAllRebalanceOrders`), resolve the underlying Aerodrome NFP (v2/v3), optionally check
+    `shouldRebalance` (RedStone-gated) and decode lifecycle events from the shared
+    `RebalanceEventEmitter` (`0x74a1b3715DD3dcB565c7483551b4C67F8FF3E3dc`).
+  - `aero-rebalance create|update --token-id N --width-pct W [--mode outside|inside]
+    [--trigger-bps T] [--max-fee-weth F] [--mint-slip-bps] [--swap-slip-bps] [--execute]` —
+    create/update an order (symmetric range band + drift trigger in bps; the sign of the
+    trigger selects OUTSIDE vs INSIDE mode; `executionFeeWeth` is a max-fee ceiling, not a
+    deposit).
+  - `aero-rebalance cancel --token-id N [--execute]` — remove an order.
+  - create/update/cancel are owner-only and NOT RedStone-gated (settled empirically);
+    `shouldRebalance` IS gated. Every `--execute` is preceded by an `eth_call` pre-flight.
+    Validated end-to-end on a live Base position (create → status → cancel).
+
+### Fixed
+- **Health computation:** the synthetic-LP gap fallback is now gated on a real staked
+  Aerodrome NFT existing, so a price gap can't invent phantom collateral.
+- **ParaSwap executor whitelist:** added Velora v1 (`0x6f05…0900`) to `PARASWAP_EXECUTORS`,
+  removing a spurious not-whitelisted warning on Base swaps.
+
 ## [0.8.1] - 2026-06-14
 
 ### Fixed
