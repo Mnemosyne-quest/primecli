@@ -218,6 +218,7 @@ from eth_keys import keys as eth_keys
 from eth_abi import encode as abi_encode, decode as abi_decode
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
+from primecli import _flowledger
 
 # Health monitoring sub-system
 # Try both package import (installed) and local import (standalone script)
@@ -1922,7 +1923,29 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
         })
         receipt = _sign_and_send(w3, acct, fund_tx, f"Fund {amount} {symbol}", fallback_gas=3000000)
         ok = receipt["status"] == 1
+        if ok:
+            _log_fund_flow(pa, symbol, amount, receipt)
         return ok
+
+
+def _log_fund_flow(account_addr: str, symbol: str, amount: float, receipt) -> None:
+    """Append a 'deposit' flow record after a successful fund broadcast. asset is the
+    funded bytes32 symbol (the wrapped-native symbol for native funding, e.g. 'AVAX').
+    usd_value uses the current spot price (≈ flow-time price); None when unpriced.
+    Wrapped so a logging failure can never fail the financial op."""
+    try:
+        px = token_price(symbol)
+        usd = round(amount * px, 8) if px else None
+        rec = _flowledger.make_record(
+            ts=int(time.time()), ftype="deposit", asset=symbol,
+            token_amount=amount, usd_value=usd,
+            tx=receipt["transactionHash"].hex(), block=receipt["blockNumber"],
+            source="live-fund",
+        )
+        _flowledger.append_flow("avalanche", account_addr, rec)
+    except Exception as e:  # noqa: BLE001 — never fail the fund over logging
+        print(f"  WARN flow logging skipped ({type(e).__name__}: {e})", file=sys.stderr)
+
 
 def _prices_usd(w3, account, symbols: list, payload: bytes) -> dict:
     """Best-effort per-symbol USD price map via the RedStone-gated getPrices view (1e8-scaled).
@@ -3430,6 +3453,28 @@ def cmd_execute_withdrawal(pool_name: str, index: int = None, execute: bool = Fa
     }
     receipt = _sign_and_send(w3, acct, tx, "Execute withdrawal", fallback_gas=3000000)
     ok = receipt["status"] == 1
+    if ok:
+        executed_amount = sum(intents[i][0] for i in ready) / 10 ** cfg["decimals"]
+        _log_withdraw_flow(pa, symbol, executed_amount, receipt)
+
+
+def _log_withdraw_flow(account_addr: str, symbol: str, amount: float, receipt) -> None:
+    """Append a 'withdraw' flow record after a successful executeWithdrawalIntent
+    broadcast (funds left the account to the EOA). amount is the total executed across
+    the matured intents. usd_value uses current spot price; None when unpriced. Wrapped
+    so a logging failure can never fail the financial op."""
+    try:
+        px = token_price(symbol)
+        usd = round(amount * px, 8) if px else None
+        rec = _flowledger.make_record(
+            ts=int(time.time()), ftype="withdraw", asset=symbol,
+            token_amount=amount, usd_value=usd,
+            tx=receipt["transactionHash"].hex(), block=receipt["blockNumber"],
+            source="live-withdraw",
+        )
+        _flowledger.append_flow("avalanche", account_addr, rec)
+    except Exception as e:  # noqa: BLE001 — never fail the withdrawal over logging
+        print(f"  WARN flow logging skipped ({type(e).__name__}: {e})", file=sys.stderr)
 
 # ─── GMX V2 GM / GM+ LP (GmxV2FacetAvalanche / GmxV2PlusFacetAvalanche) ───────
 # GM tokens are GMX V2 market LP (two-sided long+short for GM, single-sided for GM+).
