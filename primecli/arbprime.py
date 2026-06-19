@@ -258,9 +258,52 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 # If none resolve, fail closed (no silent default key).
 #
 # To add another wallet: add a row to AGENTS, export ARBPRIME_PRIVATE_KEY, or pass --key.
+
+# ---------------------------------------------------------------------------
+# HD wallet derivation from a BIP39 seed file.
+# The seed file is a plaintext mnemonic with tight permissions (chmod 600).
+# The derivation functions NEVER log or print the mnemonic.
+# ---------------------------------------------------------------------------
+_HD_DERIVE_CACHE = {}
+def _ensure_hd_libs():
+    global _HD_DERIVE_CACHE
+    if "mnemonic" not in _HD_DERIVE_CACHE:
+        from mnemonic import Mnemonic
+        from bip32 import BIP32
+        _HD_DERIVE_CACHE["mnemonic"] = Mnemonic
+        _HD_DERIVE_CACHE["BIP32"] = BIP32
+def _derive_private_key(seed_path, derivation_path):
+    _ensure_hd_libs()
+    Mnemonic = _HD_DERIVE_CACHE["mnemonic"]
+    BIP32 = _HD_DERIVE_CACHE["BIP32"]
+    raw = Path(seed_path).read_text().strip()
+    if not raw:
+        raise RuntimeError(f"Seed file {seed_path} is empty")
+    words = raw.split()
+    if len(words) not in (12, 15, 18, 21, 24):
+        raise RuntimeError(f"Seed file {seed_path} has {len(words)} words; expected 12-24")
+    mnemo = Mnemonic("english")
+    if not mnemo.check(raw):
+        raise RuntimeError(f"Seed file {seed_path} contains an invalid mnemonic (checksum fail)")
+    seed = mnemo.to_seed(raw)
+    bip = BIP32.from_seed(seed)
+    privkey = bip.get_privkey_from_path(derivation_path)
+    return privkey.hex()
+# ---------------------------------------------------------------------------
+
 AGENTS = {
+    # Raw key entries (from env files)
     "parakletos":   ("/root/.openclaw/.env",                "PARAKLETOS_EVM_PRIVATE_KEY"),
     "paraklaudios": ("/root/paraklaudios/.credentials.env", "PARAKLAUDIOS_EVM_PRIVATE_KEY"),
+
+    # HD seed-derived entries (from Parakletos's BIP39 seed)
+    "parakletos-2": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/0'/0/0"),
+    "parakletos-3": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/0'/0/1"),
+    "parakletos-4": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/0'/0/2"),
+    "parakletos-5": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/0'/0/3"),
+    "parakletos-6": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/0'/0/4"),
+    "parakletos-7": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/1'/0/0"),
+    "parakletos-8": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/2'/0/0"),
 }
 _SELECTED_AGENT = None        # set by the --as CLI flag in main()
 _CLI_KEY = None               # set by the --key CLI flag in main()
@@ -743,7 +786,18 @@ def _agent_key(agent):
             f"Unknown agent '{agent}'. Known agents: {', '.join(AGENTS)}. "
             f"Or set ARBPRIME_PRIVATE_KEY, or ARBPRIME_ENV_FILE + ARBPRIME_KEY_VAR."
         )
-    path, var = AGENTS[agent]
+    entry = AGENTS[agent]
+    # HD wallet derivation (3-tuple with None in middle)
+    if len(entry) == 3 and entry[1] is None:
+        seed_path, _, deriv_path = entry
+        try:
+            return _derive_private_key(seed_path, deriv_path)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Failed to derive key for agent '{agent}' (deriv_path={deriv_path}): {e}"
+            ) from e
+    # Raw key from env file (existing logic)
+    path, var = entry
     key = _read_env_var(path, var)
     if not key:
         raise RuntimeError(f"{var} not found in {path} (agent '{agent}').")

@@ -28,6 +28,7 @@ Usage:
   degenprime cancel-withdrawal --pool usdc --index N [--execute]
   degenprime aerodrome-positions
   degenprime aero-add-liquidity --pool weth-usdc-100 --amount-weth 0.05 --amount-usdc 100 [--slippage 1] [--execute]
+  degenprime aero-add-liquidity --pool weth-usdc-100 --use-all-available [--width 2] [--slippage 1] [--execute]
   degenprime aero-increase-liquidity --pool weth-usdc-100 --token-id N --amount-token0 X --amount-token1 Y [--slippage 1] [--execute]
   degenprime aero-remove-liquidity --token-id N [--token-id M ...] [--execute]   (full close only)
   degenprime aero-collect-fees --token-id N [--execute]
@@ -35,6 +36,7 @@ Usage:
   degenprime aero-rebalance create --token-id N --width-pct W [--mode outside|inside] [--trigger-bps T] [--max-fee-weth F] [--mint-slip-bps 100] [--swap-slip-bps 100] [--execute]
   degenprime aero-rebalance update --token-id N --width-pct W [...same as create] [--execute]
   degenprime aero-rebalance cancel --token-id N [--execute]
+  degenprime aero-rebuild --token-id N [--width-pct 2] [--slippage 1] [--execute]
 
 Configuration (env vars):
   DEGENPRIME_PRIVATE_KEY  Raw 0x... private key for the signer. Falls back to
@@ -226,7 +228,8 @@ AERODROME_NPM = "0x827922686190790b37229fd06084350E74485b72"
 #   92b5a47e  (write, takes uint256 tokenId, checks position exists — burn/collect)
 #   46daca2c  (write, onlyOwnerOrLiquidator — emergency withdrawal)
 AERODROME_SEL_MINT = bytes.fromhex("f32f1e56")          # mintAndStakeLiquidityAerodrome
-AERODROME_SEL_INCREASE = bytes.fromhex("2c710777")      # inferred: increaseLiquidity
+AERODROME_SEL_INCREASE = bytes.fromhex("747f6827")      # increaseStakedLiquidityAerodrome (verified via Diamond Loupe 2026-06-19)
+AERODROME_SEL_EMISSIONS = bytes.fromhex("2c710777")     # collectEmissionsAerodrome (was wrongly assumed to be increase)
 AERODROME_SEL_BURN = bytes.fromhex("27bed82e")           # batchRemoveStakedLiquidityAerodrome
 AERODROME_SEL_COLLECT = bytes.fromhex("887e4b7e")        # collectAerodromeFees
 
@@ -3649,38 +3652,96 @@ def cmd_cancel_withdrawal(pool_name: str, index: int, execute: bool = False):
 
 # ─── Aerodrome (Slipstream CL) ──────────────────────────────────────────────
 
-def cmd_aerodrome_positions():
+def _aero_match_pool_cfg(token0, token1):
+    """Find the AERODROME_POOLS cfg for a position's token pair (order-insensitive)."""
+    pair = {token0.lower(), token1.lower()}
+    for cfg in AERODROME_POOLS.values():
+        if {cfg["token0"].lower(), cfg["token1"].lower()} == pair:
+            return cfg
+    return None
+
+
+def _aero_range_metrics(w3, pool_cfg, tick_lower, tick_upper):
+    """Read the live pool tick (slot0) and compute CL range metrics.
+
+    Returns a dict with the current tick, in/out-of-range status, how far through
+    the range the price currently sits, the ±half-width of the range, and how far
+    (in price %) the price can move before hitting each edge — the numbers you need
+    to judge rebalance risk. Returns None if the pool tick can't be read."""
+    try:
+        pool_addr = _aero_pool_address(pool_cfg)
+        pool_c = w3.eth.contract(address=Web3.to_checksum_address(pool_addr),
+                                 abi=json.loads(SLOT0_ABI))
+        cur_tick = pool_c.functions.slot0().call()[1]
+    except Exception:
+        return None
+    span = tick_upper - tick_lower
+    if span <= 0:
+        return None
+    return {
+        "current_tick": cur_tick,
+        "in_range": tick_lower <= cur_tick <= tick_upper,
+        "pct_through_range": round((cur_tick - tick_lower) / span * 100.0, 1),
+        "width_pct": round((1.0001 ** (span / 2.0) - 1.0) * 100.0, 1),
+        # price can fall this % before hitting the lower edge (negative = already below)
+        "dist_to_lower_pct": round((1.0001 ** (cur_tick - tick_lower) - 1.0) * 100.0, 2),
+        # price can rise this % before hitting the upper edge (negative = already above)
+        "dist_to_upper_pct": round((1.0001 ** (tick_upper - cur_tick) - 1.0) * 100.0, 2),
+    }
+
+
+def cmd_aerodrome_positions(json_out=False):
     """Read-only: list every Aerodrome Slipstream NFT position the Degen Account
-    owns/stakes, showing token pair, tick range, and liquidity. Enumerates tokenIds
-    via getOwnedStakedAerodromeTokenIds, then reads each from NPM.positions() (the
-    simplified facet view reports liquidity=0 + garbage ticks for staked NFTs)."""
+    owns/stakes, showing token pair, tick range, liquidity, and (when the pool tick
+    is readable) live range metrics. Enumerates tokenIds via
+    getOwnedStakedAerodromeTokenIds, then reads each from NPM.positions() (the
+    simplified facet view reports liquidity=0 + garbage ticks for staked NFTs).
+
+    --json emits a machine-readable object (and prints nothing else) so callers like
+    the portfolio report can render range % without scraping text."""
     w3 = get_w3()
     acct = get_account()
-    print(f"Wallet: {acct.address}")
     pa = get_prime_account(w3, acct.address)
     if not pa:
-        print("No Degen Account yet - no Aerodrome positions.")
+        if json_out:
+            print(json.dumps({"wallet": acct.address, "prime_account": None, "positions": []}))
+        else:
+            print(f"Wallet: {acct.address}")
+            print("No Degen Account yet - no Aerodrome positions.")
         return
     account = w3.eth.contract(address=Web3.to_checksum_address(pa), abi=PRIME_ACCOUNT_ABI)
-    print(f"Degen Account: {pa}")
+    if not json_out:
+        print(f"Wallet: {acct.address}")
+        print(f"Degen Account: {pa}")
     try:
         ids = account.functions.getOwnedStakedAerodromeTokenIds().call()
     except Exception as e:
-        print(f"  Aerodrome read failed: {type(e).__name__}: {e}")
+        if json_out:
+            print(json.dumps({"wallet": acct.address, "prime_account": pa,
+                              "positions": [], "error": f"{type(e).__name__}: {e}"}))
+        else:
+            print(f"  Aerodrome read failed: {type(e).__name__}: {e}")
         return
     if not ids:
-        print("  No Aerodrome positions (owned/staked tokenIds).")
+        if json_out:
+            print(json.dumps({"wallet": acct.address, "prime_account": pa, "positions": []}))
+        else:
+            print("  No Aerodrome positions (owned/staked tokenIds).")
         return
-    print(f"  {len(ids)} Aerodrome NFT position(s):")
+    if not json_out:
+        print(f"  {len(ids)} Aerodrome NFT position(s):")
 
     # Read each position straight from NPM.positions(). The account's enumerated
     # tokenIds include STAKED positions whose NFT now belongs to the gauge, and the
     # facet's getPositionCompositionSimplified reports liquidity=0 + garbage ticks
     # for those. NPM.positions() returns the real struct for any holder.
+    out = []
     for tid in ids:
         pos = _aero_read_position(w3, tid)
         if pos is None:
-            print(f"    [{tid}] position read failed")
+            if not json_out:
+                print(f"    [{tid}] position read failed")
+            out.append({"token_id": tid, "error": "position read failed"})
             continue
         token0, token1, tick_lower, tick_upper, liq = pos
         sym0 = _resolve_token_symbol(w3, token0)
@@ -3688,15 +3749,40 @@ def cmd_aerodrome_positions():
         # Human price = token1 per token0 = 1.0001**tick * 10**(dec0 - dec1).
         dec0 = _resolve_token_decimals(w3, token0)
         dec1 = _resolve_token_decimals(w3, token1)
+        price_lower = price_upper = None
         if dec0 is not None and dec1 is not None:
             scale = 10 ** (dec0 - dec1)
             price_lower = 1.0001 ** tick_lower * scale
             price_upper = 1.0001 ** tick_upper * scale
-            print(f"    [{tid}] {sym0}/{sym1}  ticks=[{tick_lower}, {tick_upper}]"
-                  f"  liq={liq}  price_range=[{price_lower:.6g}, {price_upper:.6g}] ({sym1}/{sym0})")
-        else:
-            print(f"    [{tid}] {sym0}/{sym1}  ticks=[{tick_lower}, {tick_upper}]  liq={liq}")
-    print("  Manage on Aerodrome UI: https://aerodrome.finance/positions")
+
+        pool_cfg = _aero_match_pool_cfg(token0, token1)
+        rng = _aero_range_metrics(w3, pool_cfg, tick_lower, tick_upper) if pool_cfg else None
+
+        entry = {
+            "token_id": tid, "pair": f"{sym0}/{sym1}",
+            "tick_lower": tick_lower, "tick_upper": tick_upper, "liquidity": liq,
+            "price_lower": price_lower, "price_upper": price_upper,
+            "price_quote": f"{sym1}/{sym0}",
+        }
+        if rng:
+            entry.update(rng)
+        out.append(entry)
+
+        if not json_out:
+            base = (f"    [{tid}] {sym0}/{sym1}  ticks=[{tick_lower}, {tick_upper}]  liq={liq}")
+            if price_lower is not None:
+                base += f"  price_range=[{price_lower:.6g}, {price_upper:.6g}] ({sym1}/{sym0})"
+            print(base)
+            if rng:
+                status = "IN RANGE" if rng["in_range"] else "OUT OF RANGE"
+                print(f"         {status}  ±{rng['width_pct']}% wide  ·  "
+                      f"{rng['pct_through_range']}% through  ·  "
+                      f"-{rng['dist_to_lower_pct']}% to lower / +{rng['dist_to_upper_pct']}% to upper")
+
+    if json_out:
+        print(json.dumps({"wallet": acct.address, "prime_account": pa, "positions": out}))
+    else:
+        print("  Manage on Aerodrome UI: https://aerodrome.finance/positions")
 
 def _aero_read_position(w3, token_id: int):
     """Authoritative read of an Aerodrome Slipstream position via NPM.positions().
@@ -3959,16 +4045,48 @@ def _aero_fit_amounts_to_range(pool_cfg: dict, amt0_wei: int, amt1_wei: int,
         elif pool_tick >= tick_upper:
             fitted0, fitted1 = 0, amt1_wei
         else:
+            # Price is inside the range — both token sides are required.
+            # If only one side is specified, compute the matching amount for the other side
+            # from the pool ratio. Otherwise the NPM will silently revert.
             if amt0_wei <= 0 or amt1_wei <= 0:
-                notes.append("Current price is inside the range, so minting normally requires both token sides.")
-                return amt0_wei, amt1_wei, notes
-            l0 = Decimal(amt0_wei) * sqrt_p * sqrt_b / ((sqrt_b - sqrt_p) * q96)
-            l1 = Decimal(amt1_wei) * q96 / (sqrt_p - sqrt_a)
-            liquidity = min(l0, l1)
-            fitted0 = int(liquidity * (sqrt_b - sqrt_p) * q96 / (sqrt_p * sqrt_b))
-            fitted1 = int(liquidity * (sqrt_p - sqrt_a) / q96)
-            fitted0 = min(max(fitted0, 0), amt0_wei)
-            fitted1 = min(max(fitted1, 0), amt1_wei)
+                if amt0_wei > 0:
+                    # Compute matching token1 from token0
+                    l0 = Decimal(amt0_wei) * sqrt_p * sqrt_b / ((sqrt_b - sqrt_p) * q96)
+                    matched1 = int(l0 * (sqrt_p - sqrt_a) / q96)
+                    notes.append(
+                        f"Price is inside range — computed matching {sym1} from {sym0}: "
+                        f"{fmt_token_amount(matched1, dec1)}"
+                    )
+                    fitted0, fitted1 = amt0_wei, matched1
+                elif amt1_wei > 0:
+                    # Compute matching token0 from token1
+                    l1 = Decimal(amt1_wei) * q96 / (sqrt_p - sqrt_a)
+                    matched0 = int(l1 * (sqrt_b - sqrt_p) * q96 / (sqrt_p * sqrt_b))
+                    notes.append(
+                        f"Price is inside range — computed matching {sym0} from {sym1}: "
+                        f"{fmt_token_amount(matched0, dec0)}"
+                    )
+                    fitted0, fitted1 = matched0, amt1_wei
+                else:
+                    return amt0_wei, amt1_wei, notes
+            else:
+                l0 = Decimal(amt0_wei) * sqrt_p * sqrt_b / ((sqrt_b - sqrt_p) * q96)
+                l1 = Decimal(amt1_wei) * q96 / (sqrt_p - sqrt_a)
+                liquidity = min(l0, l1)
+                fitted0 = int(liquidity * (sqrt_b - sqrt_p) * q96 / (sqrt_p * sqrt_b))
+                fitted1 = int(liquidity * (sqrt_p - sqrt_a) / q96)
+                fitted0 = min(max(fitted0, 0), amt0_wei)
+                fitted1 = min(max(fitted1, 0), amt1_wei)
+
+    # Guard: if price is inside the range and one side rounds to 0, the NPM will
+    # silently revert (ProxyCalldataFailedWithoutErrMsg). Reject outright.
+    if pool_tick is not None and tick_lower < pool_tick < tick_upper:
+        if (fitted0 == 0 and fitted1 > 0) or (fitted0 > 0 and fitted1 == 0):
+            notes.append(
+                f"Amount too small: the matching {sym1 if fitted0 > 0 else sym0} "
+                f"side rounds to 0 at current pool price. Increase the deposit amount."
+            )
+            return 0, 0, notes
 
     if fitted0 != amt0_wei or fitted1 != amt1_wei:
         notes.append(
@@ -3979,9 +4097,264 @@ def _aero_fit_amounts_to_range(pool_cfg: dict, amt0_wei: int, amt1_wei: int,
     return fitted0, fitted1, notes
 
 
+def _swap_with_usdc_fallback(account, from_sym, to_sym, amount_human,
+                             slippage_pct, execute):
+    """cmd_swap(from->to); on failure during --execute, retry as a two-hop
+    through USDC (from->USDC->to).
+
+    Thin pool-token pairs (e.g. AERO<->cbBTC) often have no direct ParaSwap
+    route even though both legs route fine against USDC. Without this, the
+    use-all-available / rebuild deploy path strands idle pool tokens whenever
+    the direct hop has no route (the symptom: Core1 AERO/cbBTC leaving ~$100+
+    of AERO un-deployed because AERO->cbBTC wouldn't quote). This mirrors the
+    two-hop fallback already present in the defisims converge path.
+
+    cmd_swap returns truthy only on a successful broadcast; it returns None in
+    preview and on early failures, so the fallback only engages when execute is
+    True and the direct swap came back falsy. Hop 2 is sized from the *delta* of
+    in-account USDC so pre-existing USDC is never over-converted. Returns truthy
+    on success.
+    """
+    ok = cmd_swap(from_sym, to_sym, amount_human, slippage_pct, execute=execute)
+    if ok or not execute:
+        return ok
+    if from_sym.upper() == "USDC" or to_sym.upper() == "USDC":
+        return ok  # already a USDC leg — no intermediary to fall back to
+    print(f"  Direct {from_sym} -> {to_sym} swap failed; trying 2-hop via USDC...")
+    usdc_before = _aero_in_account_balance(account, "USDC")
+    if not cmd_swap(from_sym, "USDC", amount_human, slippage_pct, execute=True):
+        print(f"  2-hop fallback: {from_sym} -> USDC also failed. "
+              f"Leaving {from_sym} in-account.")
+        return False
+    produced = _aero_in_account_balance(account, "USDC") - usdc_before
+    usdc_human = produced / 1e6  # USDC has 6 decimals
+    if usdc_human <= 1.0:
+        print(f"  2-hop fallback: only {usdc_human:.4f} USDC produced by hop 1; "
+              f"too small for hop 2.")
+        return False
+    # Spend 99% to stay under the second hop's min-out / slippage floor.
+    if not cmd_swap("USDC", to_sym, usdc_human * 0.99, slippage_pct, execute=True):
+        print(f"  2-hop fallback: USDC -> {to_sym} failed; "
+              f"{from_sym} is now USDC in-account.")
+        return False
+    print(f"  ✓ 2-hop swap {from_sym} -> USDC -> {to_sym} completed.")
+    return True
+
+
+def _aero_use_all_available(
+    w3, acct, account, pa_cs, pool_cfg,
+    width_pct=2.0, slippage_pct=1.0, execute=False,
+):
+    """Use ALL available in-account funds (>$5 per asset) to open an Aerodrome CL position.
+
+    Inventories all REDSTONE-fed assets in the Degen Account, prices them via RedStone,
+    filters out sub-$5 dust, then:
+    1. Sweeps non-pool assets into whichever pool token is the bottleneck
+    2. Optimally balances the two pool tokens
+    3. Returns plan for mint
+
+    Returns (total0_wei, total1_wei, tick_lower, tick_upper, pool_tick) or False.
+    """
+    from decimal import localcontext, Decimal
+    import json
+
+    sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
+    dec0, dec1 = pool_cfg["decimals0"], pool_cfg["decimals1"]
+    MIN_USD_VALUE = 5.0
+
+    # 1. Inventory: check RedStone-fed assets + both pool tokens for balance
+    all_candidates = set(REDSTONE_AVAILABLE_FEEDS) | {sym0, sym1}
+    inventory = {}
+    for sym in sorted(all_candidates):
+        try:
+            bal = account.functions.getBalance(asset_b32(sym)).call()
+        except Exception:
+            bal = 0
+        if bal <= 0:
+            continue
+        try:
+            locked = account.functions.getTotalIntentAmount(asset_b32(sym)).call()
+        except Exception:
+            locked = 0
+        avail = bal - locked if bal > locked else 0
+        if avail <= 0:
+            continue
+        dec = pool_cfg["decimals0"] if sym == sym0 else (
+              pool_cfg["decimals1"] if sym == sym1 else None)
+        if dec is None:
+            meta = _swap_asset_meta(w3, sym)
+            if meta:
+                dec = meta.get("decimals")
+        if dec is None:
+            continue
+        inventory[sym] = [avail, dec, 0.0]
+
+    if not inventory:
+        print("  No in-account assets found with non-zero balance.")
+        return False
+
+    # 2. Get RedStone prices
+    priced_syms = [s for s in inventory if s in REDSTONE_AVAILABLE_FEEDS]
+    if priced_syms:
+        feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
+        payload = build_redstone_payload(feeds)
+        try:
+            prices = _read_prices_usd(w3, account, priced_syms, payload)
+            for i, sym in enumerate(priced_syms):
+                usd_val = (float(prices[i] * Decimal(inventory[sym][0]))
+                           / (10 ** inventory[sym][1]) / 1e18)
+                inventory[sym][2] = usd_val
+        except Exception as e:
+            print(f"  Warning: RedStone pricing failed ({e}).")
+
+    # 3. Read pool slot0
+    pool_tick = None
+    pool_price = None
+    try:
+        pool_addr = _aero_pool_address(pool_cfg)
+        pool_abi = json.loads(SLOT0_ABI)
+        pool_c = w3.eth.contract(address=pool_addr, abi=pool_abi)
+        slot0 = pool_c.functions.slot0().call()
+        pool_tick = slot0[1]
+        sqrt_price_x96 = slot0[0]
+        q96 = Decimal(2) ** 96
+        sq = Decimal(sqrt_price_x96) / q96
+        pool_price = float(sq * sq)
+    except Exception as e:
+        print(f"  Error reading pool slot0: {e}")
+        return False
+
+    # 4. Filter inventory > $5; fallback for pool tokens
+    valuable = {sym: bal for sym, (bal, dec, usd) in inventory.items()
+                if usd >= MIN_USD_VALUE}
+    if not valuable:
+        print("  No assets have RedStone prices above $5. Falling back to raw pool-token balances.")
+        for sym in (sym0, sym1):
+            if sym in inventory:
+                bal, dec, _ = inventory[sym]
+                valuable[sym] = bal
+    if not valuable:
+        print("  No available assets to deploy.")
+        return False
+
+    # 5. Identify non-pool assets (to sweep) and pool-token balances
+    sweeps = {}
+    pool0_bal_wei = valuable.get(sym0, 0)
+    pool1_bal_wei = valuable.get(sym1, 0)
+    for sym, bal_wei in valuable.items():
+        if sym == sym0:
+            pool0_bal_wei = bal_wei
+        elif sym == sym1:
+            pool1_bal_wei = bal_wei
+        else:
+            sweeps[sym] = bal_wei
+
+    # 6. Compute optimal allocation for pool tokens
+    tick_lower, tick_upper = _aero_tick_range(
+        pool_cfg["tickSpacing"], None, width_pct, pool_tick
+    )
+
+    with localcontext() as ctx:
+        ctx.prec = 80
+        q96 = Decimal(2) ** 96
+
+        def _sqrt_at(t: int) -> Decimal:
+            return (Decimal("1.0001") ** (Decimal(t) / Decimal(2))) * q96
+
+        sqrt_a = _sqrt_at(tick_lower)
+        sqrt_b = _sqrt_at(tick_upper)
+        sqrt_p = _sqrt_at(pool_tick)
+
+        if pool_tick <= tick_lower:
+            bottleneck = "token0"
+            total0_wei = pool0_bal_wei
+            total1_wei = 0
+        elif pool_tick >= tick_upper:
+            bottleneck = "token1"
+            total0_wei = 0
+            total1_wei = pool1_bal_wei
+        else:
+            k0 = (sqrt_b - sqrt_p) * q96 / (sqrt_p * sqrt_b)
+            k1 = (sqrt_p - sqrt_a) / q96
+            if k0 <= 0 or k1 <= 0:
+                print(f"  Error: degenerate range k0={k0}, k1={k1}")
+                return False
+
+            n0 = Decimal(pool0_bal_wei)
+            n1 = Decimal(pool1_bal_wei)
+            P = Decimal(str(pool_price))
+
+            excess_t1 = n1 * k0 - n0 * k1
+            excess_t0 = n0 * k1 - n1 * k0
+            TOL = Decimal("10")
+
+            if excess_t1 > TOL:
+                bottleneck = "token0"
+                denom = k0 + k1 / P
+                if denom <= 0:
+                    print(f"  Error: degenerate swap denominator {denom}")
+                    return False
+                s_pool = int(excess_t1 / denom)
+                if s_pool > n1:
+                    s_pool = int(n1)
+                total0_wei = int(n0 + Decimal(s_pool) / P)
+                total1_wei = int(n1 - Decimal(s_pool))
+            elif excess_t0 > TOL:
+                bottleneck = "token1"
+                denom = k1 + P * k0
+                if denom <= 0:
+                    print(f"  Error: degenerate swap denominator {denom}")
+                    return False
+                s_pool = int(excess_t0 / denom)
+                if s_pool > n0:
+                    s_pool = int(n0)
+                total0_wei = int(n0 - Decimal(s_pool))
+                total1_wei = int(n1 + Decimal(s_pool) * P)
+            else:
+                total0_wei = pool0_bal_wei
+                total1_wei = pool1_bal_wei
+
+    # 7. Report non-pool sweeps
+    if sweeps:
+        print(f"\n  Non-pool assets with >$5 value to sweep:")
+        for sym, bal in sorted(sweeps.items()):
+            meta = _swap_asset_meta(w3, sym)
+            if meta:
+                dec = meta["decimals"]
+                usd = inventory.get(sym, [0, 0, 0])[2]
+                print(f"    {sym}: {bal / 10**dec:.6f}  (~${usd:.2f})"
+                      f"  -> swapping to {sym1 if bottleneck == 'token1' else sym0}")
+            else:
+                print(f"    {sym}: {bal} raw (cannot resolve decimals)")
+
+    dest_sym = sym0 if bottleneck == "token0" else sym1
+    print(f"\n  Pool tokens after sweeps + balance swap:")
+    print(f"    {sym0}: {total0_wei / 10**dec0:.6f}  {sym1}: {total1_wei / 10**dec1:.6f}")
+    print(f"    Target: swap surplus to {dest_sym}")
+
+    # 8. Execute swaps if requested
+    if execute and sweeps:
+        for sym in sorted(sweeps):
+            meta = _swap_asset_meta(w3, sym)
+            if not meta:
+                print(f"  Skipping {sym}: cannot resolve swap metadata.")
+                continue
+            bal_wei = sweeps[sym]
+            amount_human = bal_wei / 10 ** meta["decimals"]
+            print(f"\n  Swapping {amount_human:.6f} {sym} -> {dest_sym}...")
+            ok = _swap_with_usdc_fallback(account, sym, dest_sym, amount_human,
+                                          slippage_pct, execute=True)
+            if not ok:
+                print(f"  Swap {sym} -> {dest_sym} failed (direct + USDC 2-hop). Aborting.")
+                return False
+
+    return (total0_wei, total1_wei, tick_lower, tick_upper, pool_tick)
+
+
 def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
                            amount1: float = None, slippage_pct: float = 1.0,
-                           execute: bool = False, width_pct: float = 2.0):
+                           execute: bool = False, width_pct: float = 2.0,
+                           use_all_available: bool = False):
     """Add concentrated liquidity to an Aerodrome Slipstream pool through the
     Degen Account's AerodromeFacet. Uses in-account token0/token1 balances.
 
@@ -3989,10 +4362,25 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
     --amount-weth / --amount-usdc (or --amount-token0 / --amount-token1) specify
     the desired liquidity amounts in token units. At least one side must be >0.
     --slippage sets the min-amount floor (default 1%).
-    --width sets the range ±width% around the current price (default 2%).
+    --width sets the range +/-width% around the current price (default 2%).
+
+    --use-all-available skips --amount-* and instead reads ALL non-pool
+    assets with >$5 value from the Degen Account, swaps them into the pool
+    tokens at the correct ratio, then mints. Dust (<$5) is left in account.
 
     The facet wraps the NPM mint(MintParams) call with remainsSolvent, so
     --execute appends a RedStone signed-price payload."""
+    if use_all_available:
+        return _cmd_aero_add_liquidity_all_available(
+            pool_key, slippage_pct, execute, width_pct
+        )
+    return _cmd_aero_add_liquidity_manual(
+        pool_key, amount0, amount1, slippage_pct, execute, width_pct
+    )
+
+
+def _cmd_aero_add_liquidity_manual(pool_key, amount0, amount1, slippage_pct, execute, width_pct):
+    """Original manual-path logic (unchanged)."""
     w3 = get_w3()
     acct = get_account()
     print(f"Wallet: {acct.address}")
@@ -4015,9 +4403,7 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
         print("At least one of --amount-<token0> / --amount-<token1> must be > 0")
         sys.exit(2)
 
-    # Auto-cap each side to the account's real in-account balance. The summary
-    # display can round a dust balance UP, so a request matching the shown value
-    # could exceed the true balance and revert AFTER burning gas (2026-06-14).
+    # Auto-cap each side to the account's real in-account balance.
     amt0, amt1, cap_notes = _aero_cap_to_balance(account, pool_cfg, amt0, amt1)
     for note in cap_notes:
         print(f"  {note}")
@@ -4025,7 +4411,7 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
         print("  Nothing to deposit after capping to on-chain balance.")
         sys.exit(2)
 
-    # Get pool's on-chain tick from slot0 for accurate range computation
+    # Get pool's on-chain tick from slot0
     pool_tick = None
     centre_price = None
     try:
@@ -4036,7 +4422,6 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
         pool_tick = slot0[1]
         print(f"  Pool tick (on-chain): {pool_tick}")
     except Exception:
-        # Fallback to KuCoin price
         price_sym = pool_cfg["symbol0"] + "-USDT"
         try:
             r = requests.get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={price_sym}", timeout=3)
@@ -4062,17 +4447,13 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
         print(f"  Tick range: [{tick_lower}, {tick_upper}] (width: +/-{width_pct}%)")
     elif centre_price:
         print(f"  Current {sym0} price: ${centre_price:,.2f}")
-        print(f"  Tick range: [{tick_lower}, {tick_upper}] → price [{1.0001**tick_lower:.4f}, {1.0001**tick_upper:.4f}]")
-        print(f"  Width: ±{width_pct}%")
+        print(f"  Tick range: [{tick_lower}, {tick_upper}]")
+        print(f"  Width: +/-{width_pct}%")
     else:
         print(f"  Full-range position (no price data available)")
     print(f"  {sym0}: {fmt_token_amount(amt0, pool_cfg['decimals0'])}  "
           f"{sym1}: {fmt_token_amount(amt1, pool_cfg['decimals1'])}")
 
-    # Build RedStone payload + final mint+stake calldata (selector 0xf32f1e56).
-    # 14 flat args; amounts in native wei; tickSpacing + live tick included.
-    # Verified byte-exact vs the successful manual mint 0x1723377a.... Built once
-    # so the same bytes feed both the pre-flight simulation and the broadcast.
     feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
     payload = build_redstone_payload(feeds)
     from eth_abi import encode as abi_encode
@@ -4082,14 +4463,12 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
     encoded_params = abi_encode(flat_types, list(params))
     mint_calldata = AERODROME_SEL_MINT + encoded_params + payload
 
-    # Pre-flight eth_call simulation — catches reverts (insufficient balance,
-    # slippage/PSC, solvency) BEFORE any gas is spent. Gates every broadcast.
     sim_ok, sim_info = _aero_simulate_mint(w3, acct.address, account.address, mint_calldata)
     if not sim_ok:
-        print(f"  Simulation reverted — aborting before broadcast: {sim_info}")
+        print(f"  Simulation reverted -- aborting before broadcast: {sim_info}")
         sys.exit(2)
     if sim_info is not None:
-        print(f"  Simulation passed — would-be tokenId: {sim_info}")
+        print(f"  Simulation passed -- would-be tokenId: {sim_info}")
     else:
         print("  Simulation passed.")
 
@@ -4109,20 +4488,288 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
     ok = receipt["status"] == 1
 
 
+def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width_pct):
+    """Use ALL available funds path for aero-add-liquidity."""
+    w3 = get_w3()
+    acct = get_account()
+    print(f"Wallet: {acct.address}")
+    pa = get_prime_account(w3, acct.address)
+    if not pa:
+        print("No Degen Account yet. Create with: degenprime create-account --execute")
+        sys.exit(2)
+    pa_cs = Web3.to_checksum_address(pa)
+    account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
+    print(f"Degen Account: {pa}")
+
+    if pool_key not in AERODROME_POOLS:
+        print(f"Unknown pool '{pool_key}'. Choose from: {', '.join(AERODROME_POOLS)}")
+        sys.exit(2)
+    pool_cfg = AERODROME_POOLS[pool_key]
+    sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
+    dec0, dec1 = pool_cfg["decimals0"], pool_cfg["decimals1"]
+
+    # Preview plan first
+    plan = _aero_use_all_available(
+        w3, acct, account, pa_cs, pool_cfg,
+        width_pct, slippage_pct, execute=False
+    )
+    if not plan:
+        return
+    total0_wei, total1_wei, tick_lower, tick_upper, pool_tick = plan
+
+    # Fit to range (safety net)
+    amt0, amt1, _ = _aero_fit_amounts_to_range(
+        pool_cfg, total0_wei, total1_wei, tick_lower, tick_upper, pool_tick
+    )
+    if amt0 == 0 and amt1 == 0:
+        print("  Nothing to deposit after fitting amounts to range.")
+        return
+
+    print(f"\n  {"=" * 60}")
+    print(f"  DEPLOY PLAN")
+    print(f"  {"=" * 60}")
+    print(f"  Pool: {sym0}/{sym1} (tickSpacing={pool_cfg['tickSpacing']})")
+    print(f"  Tick range: [{tick_lower}, {tick_upper}] (width: +/-{width_pct}%)")
+    print(f"  {sym0}: {fmt_token_amount(amt0, dec0)}")
+    print(f"  {sym1}: {fmt_token_amount(amt1, dec1)}")
+
+    if not execute:
+        print(f"\n  Preview only. Run with --execute to broadcast swaps + mint.")
+        return
+
+    # Execute: run swaps then mint
+    plan = _aero_use_all_available(
+        w3, acct, account, pa_cs, pool_cfg,
+        width_pct, slippage_pct, execute=True
+    )
+    if not plan:
+        print("  Swap execution finished but post-swap plan is empty. Aborting mint.")
+        return
+    total0_wei, total1_wei, tick_lower, tick_upper, pool_tick = plan
+
+    # ── Precision balance sweep ──────────────────────────────────
+    # After sweeping non-pool assets, the two pool tokens are rarely
+    # at the exact ratio required by the CL tick range.  Execute up
+    # to 3 precision swaps between pool tokens to converge, so that
+    # _aero_fit_amounts_to_range leaves at most a few dollars of
+    # residual rather than the $100+ that a single-pass sweep can
+    # strand.
+    from decimal import localcontext as _lc
+    import json as _json
+    _MAX_PRECISION_PASSES = 3
+
+    for _pass in range(_MAX_PRECISION_PASSES):
+        # Re-read pool tick — earlier swaps may have moved the price
+        try:
+            _pool_addr = _aero_pool_address(pool_cfg)
+            _pool_c = w3.eth.contract(address=_pool_addr, abi=_json.loads(SLOT0_ABI))
+            _slot0 = _pool_c.functions.slot0().call()
+            pool_tick = _slot0[1]
+            _spx96 = _slot0[0]
+            _q96_d = Decimal(2) ** 96
+            _sq = Decimal(_spx96) / _q96_d
+            _pool_price = float(_sq * _sq)
+        except Exception as e:
+            print(f"  Precision pass {_pass+1}: cannot read pool tick ({e}). Skipping.")
+            break
+
+        tick_lower, tick_upper = _aero_tick_range(
+            pool_cfg["tickSpacing"], None, width_pct, pool_tick
+        )
+
+        _bal0 = _aero_in_account_balance(account, sym0)
+        _bal1 = _aero_in_account_balance(account, sym1)
+        if _bal0 == 0 and _bal1 == 0:
+            break
+
+        # Outside the range → one-sided deposit (no ratio balancing)
+        if pool_tick <= tick_lower or pool_tick >= tick_upper:
+            break
+
+        with _lc() as ctx:
+            ctx.prec = 80
+
+            def _sqrt_at(t: int) -> Decimal:
+                return (Decimal("1.0001") ** (Decimal(t) / Decimal(2))) * _q96_d
+
+            _sqrt_a = _sqrt_at(tick_lower)
+            _sqrt_b = _sqrt_at(tick_upper)
+            _sqrt_p = _sqrt_at(pool_tick)
+
+            _k0 = (_sqrt_b - _sqrt_p) * _q96_d / (_sqrt_p * _sqrt_b)
+            _k1 = (_sqrt_p - _sqrt_a) / _q96_d
+            if _k0 <= 0 or _k1 <= 0:
+                break
+
+            _n0 = Decimal(_bal0)
+            _n1 = Decimal(_bal1)
+            _P = Decimal(str(_pool_price))
+
+            _excess_t1 = _n1 * _k0 - _n0 * _k1
+            _excess_t0 = _n0 * _k1 - _n1 * _k0
+            _TOL = Decimal("10")
+
+            if _excess_t1 > _TOL:
+                # Too much token1 relative to the range ratio —
+                # sell token1 for token0
+                _from_sym, _to_sym = sym1, sym0
+                _from_dec, _to_dec = dec1, dec0
+                _denom = _k0 + _k1 / _P
+                if _denom <= 0:
+                    break
+                _s_raw = _excess_t1 / _denom
+                _s_pool = int(_s_raw)
+                if _s_pool > int(_n1):
+                    _s_pool = int(_n1)
+                _swap_human = _s_pool / 10**_from_dec
+            elif _excess_t0 > _TOL:
+                # Too much token0 — sell token0 for token1
+                _from_sym, _to_sym = sym0, sym1
+                _from_dec, _to_dec = dec0, dec1
+                _denom = _k1 + _P * _k0
+                if _denom <= 0:
+                    break
+                _s_raw = _excess_t0 / _denom
+                _s_pool = int(_s_raw)
+                if _s_pool > int(_n0):
+                    _s_pool = int(_n0)
+                _swap_human = _s_pool / 10**_from_dec
+            else:
+                if _pass == 0:
+                    print("  Pool tokens already balanced at range ratio. ✓")
+                break
+
+        if _swap_human <= 0 or _s_pool <= 0:
+            break
+
+        # Rough USD estimate — skip swaps worth less than $5 after the
+        # first pass (convergence tail).
+        _usd_est = _swap_human * _pool_price if _from_sym == sym0 else _swap_human
+        if _usd_est < 5.0 and _pass > 0:
+            break
+
+        print(f"\n  Precision swap pass {_pass+1}: selling {_swap_human:.6f} {_from_sym} -> {_to_sym}"
+              f"  (residual ~${_usd_est:.2f})")
+        _ok = _swap_with_usdc_fallback(account, _from_sym, _to_sym, _swap_human,
+                                       slippage_pct, execute=execute)
+        if not _ok:
+            print(f"  Precision swap pass {_pass+1} failed (direct + USDC 2-hop). "
+                  f"Continuing with current balances.")
+            break
+
+    # Re-read balances and mint
+    amt0 = _aero_in_account_balance(account, sym0)
+    amt1 = _aero_in_account_balance(account, sym1)
+    if amt0 == 0 and amt1 == 0:
+        print("  Nothing in account after swaps.")
+        return
+
+    amt0, amt1, _ = _aero_fit_amounts_to_range(
+        pool_cfg, amt0, amt1, tick_lower, tick_upper, pool_tick
+    )
+    if amt0 == 0 and amt1 == 0:
+        print("  Nothing to deposit after fitting to range.")
+        return
+
+    params = _aero_mint_params(pool_cfg, amt0, amt1, tick_lower, tick_upper,
+                               pool_tick, slippage_pct)
+
+    print(f"\n  Minting position:")
+    print(f"    {sym0}: {fmt_token_amount(amt0, dec0)}")
+    print(f"    {sym1}: {fmt_token_amount(amt1, dec1)}")
+
+    feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
+    payload = build_redstone_payload(feeds)
+    from eth_abi import encode as abi_encode
+    flat_types = ['address', 'address', 'int24', 'int24', 'int24',
+                  'uint256', 'uint256', 'uint256', 'uint256',
+                  'uint256', 'int24', 'uint256', 'uint256', 'uint256']
+    encoded_params = abi_encode(flat_types, list(params))
+    mint_calldata = AERODROME_SEL_MINT + encoded_params + payload
+
+    sim_ok, sim_info = _aero_simulate_mint(w3, acct.address, account.address, mint_calldata)
+    if not sim_ok:
+        print(f"  Simulation reverted -- aborting: {sim_info}")
+        return
+    if sim_info is not None:
+        print(f"  Simulation passed -- would-be tokenId: {sim_info}")
+    else:
+        print("  Simulation passed.")
+
+    tx = {
+        "from": acct.address,
+        "to": account.address,
+        "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 5000000,
+        "chainId": CHAIN_ID,
+        "data": "0x" + mint_calldata.hex(),
+    }
+    receipt = _sign_and_send(w3, acct, tx, "Add liquidity", timeout=300, fallback_gas=5000000)
+    ok = receipt["status"] == 1
+
+
+def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float = 1.0,
+                     execute: bool = False):
+    """Remove an existing Aerodrome position, sweep all idle assets >$5 into the
+    correct pool-token ratio, and mint a brand-new position at ±width_pct around
+    the current tick. One-shot full rebuild that ensures no funds hang unused."""
+    w3 = get_w3()
+    acct = get_account()
+    print(f"Wallet: {acct.address}")
+    pa = get_prime_account(w3, acct.address)
+    if not pa:
+        print("No Degen Account yet. Create with: degenprime create-account --execute")
+        sys.exit(2)
+    pa_cs = Web3.to_checksum_address(pa)
+    account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
+    print(f"Degen Account: {pa}")
+
+    print(f"\nStep 1: Removing position #{token_id}...")
+    if execute:
+        cmd_aero_remove_liquidity([token_id], 100.0, execute=True)
+    else:
+        print("  Would remove position (preview). Run with --execute to proceed.")
+
+    # Find the pool from the position
+    pos = _aero_read_position(w3, token_id)
+    if pos is None:
+        print(f"Could not read position #{token_id}.")
+        sys.exit(2)
+    pos_t0, pos_t1, _, _, _ = pos
+    pool_key = next(
+        (pk for pk, pc in AERODROME_POOLS.items()
+         if pc["token0"].lower() == pos_t0.lower() and pc["token1"].lower() == pos_t1.lower()),
+        None
+    )
+    if not pool_key:
+        print(f"Cannot match position #{token_id} to a known pool.")
+        sys.exit(2)
+    pool_cfg = AERODROME_POOLS[pool_key]
+
+    print(f"\nStep 2: Sweeping idle assets >$5 to pool {pool_key}...")
+    _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg, execute=execute)
+
+    print(f"\nStep 3: Opening fresh {pool_key} position...")
+    if execute:
+        _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute=True, width_pct=width_pct)
+    else:
+        print(f"  Preview: degenprime aero-add-liquidity --pool {pool_key} --use-all-available --width {width_pct}")
+        # Run preview
+        _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute=False, width_pct=width_pct)
+
 def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
                                 amount0: float = None, amount1: float = None,
                                 slippage_pct: float = 1.0,
                                 execute: bool = False):
     """Increase liquidity on an existing staked Aerodrome Slipstream NFT.
 
-    Disabled: selector 0x2c710777 simulates and broadcasts successfully but was
-    observed to claim gauge rewards without depositing liquidity. Until the real
-    DegenPrime facet selector is verified from source, use remove + add/rebuild.
-    """
-    print("ABORT: standalone Aerodrome increase-liquidity is not verified on DegenPrime.")
-    print("Use the rebuild path (aero-remove-liquidity -> aero-add-liquidity) instead.")
-    sys.exit(2)
+    Selector 0x747f6827 = increaseStakedLiquidityAerodrome (uint256×6 tuple).
+    Verified on-chain via Diamond Loupe 2026-06-19 (beacon at 0x85C2BAA2...).
 
+    Sweeps idle in-account assets >$5 into the pool's bottleneck token first,
+    so any hanging funds get deployed alongside the requested amounts.
+    """
+    import time
     w3 = get_w3()
     acct = get_account()
     print(f"Wallet: {acct.address}")
@@ -4150,12 +4797,26 @@ def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
         print(f"TokenId {token_id} has no active liquidity.")
         sys.exit(2)
 
+    # Convert requested amounts to wei
     amt0 = to_wei_units(amount0, pool_cfg["decimals0"]) if amount0 else 0
     amt1 = to_wei_units(amount1, pool_cfg["decimals1"]) if amount1 else 0
+
+    # Sweep idle assets >$5 into the bottleneck pool token
+    pa_cs = Web3.to_checksum_address(pa)
+    print("  Checking for idle assets to sweep...")
+    _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg, execute=execute)
+
+    # Re-read updated balances after sweeps
+    avail0 = _aero_in_account_balance(account, pool_cfg["symbol0"])
+    avail1 = _aero_in_account_balance(account, pool_cfg["symbol1"])
+    amt0 = max(amt0, 0)
+    amt1 = max(amt1, 0)
+
     if amt0 == 0 and amt1 == 0:
         print("At least one of --amount-token0 / --amount-token1 must be > 0")
         sys.exit(2)
 
+    # Cap to actual balance
     amt0, amt1, cap_notes = _aero_cap_to_balance(account, pool_cfg, amt0, amt1)
     for note in cap_notes:
         print(f"  {note}")
@@ -4173,6 +4834,13 @@ def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
     except Exception:
         pass
 
+    if pool_tick is None:
+        print("  Cannot read pool tick from Aerodrome — aborting.")
+        sys.exit(2)
+
+    # Fit amounts to the EXISTING position's tick range (not a new range).
+    # When price is inside the range, this computes the matching amount for the
+    # other side if only one side was specified (otherwise the NPM reverts).
     amt0, amt1, ratio_notes = _aero_fit_amounts_to_range(
         pool_cfg, amt0, amt1, int(tick_lower), int(tick_upper), pool_tick)
     for note in ratio_notes:
@@ -4181,9 +4849,59 @@ def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
         print("  Nothing to deposit after fitting amounts to the NFT's current range.")
         sys.exit(2)
 
-    slippage = Decimal(str(slippage_pct)) / Decimal(100)
+    # Re-cap to actual balance after fitting (matching amounts may exceed balance).
+    # Then re-fit so both sides stay at the correct pool ratio — a one-sided cap
+    # would create a ratio mismatch and trip PSC.
+    amt0, amt1, post_fit_caps = _aero_cap_to_balance(account, pool_cfg, amt0, amt1)
+    for note in post_fit_caps:
+        print(f"  {note}")
+    if amt0 == 0 and amt1 == 0:
+        print("  Nothing to deposit after capping fitted amounts to on-chain balance.")
+        sys.exit(2)
+    if any("capped" in note.lower() for note in post_fit_caps):
+        amt0, amt1, refit_notes = _aero_fit_amounts_to_range(
+            pool_cfg, amt0, amt1, int(tick_lower), int(tick_upper), pool_tick)
+        for note in refit_notes:
+            print(f"  {note}")
+        if amt0 == 0 and amt1 == 0:
+            print("  Nothing to deposit after re-fitting post-cap amounts.")
+            sys.exit(2)
+
+    # PSC (Price Slippage Control) guard.
+    #
+    # PSC fires when the Aerodrome NPM's actual consumed amount falls below
+    # the declared minimum, which happens when one side's fitted amount is
+    # very small (e.g. single-digit wei at extreme pool ticks).  The NPM's
+    # liquidity math rounds the consumed amount down, and even a 1% slip
+    # (which collapses to a 1-wei gap) can't save it.
+    #
+    # Two-tier defence:
+    # 1. Slippage floor (0.5%): RedStone oracle prices may deviate from pool
+    #    spot prices, so even exact-pool-ratio amounts need ~0.3% buffer.
+    #    0.5% provides a safe universal margin.
+    # 2. Min-absolute-gap guard: for each side where the 0.5%-slip gap is
+    #    ≤ 2 wei (amount so tiny that slippage can't create a meaningful
+    #    buffer), zero its minimum.  The NPM passes trivially, and the
+    #    diamond's PSC compares *desired* amounts against the oracle — so
+    #    zeroing a min on one side is safe when the desired ratio is correct.
+    slippage_floor = Decimal("0.5")
+    effective_slip = max(Decimal(str(slippage_pct)), slippage_floor)
+    slippage = effective_slip / Decimal(100)
+    if Decimal(str(slippage_pct)) < slippage_floor:
+        print(f"  Note: slippage raised to {float(slippage_floor)}% (floor for PSC guard)")
     amount0_min = int(Decimal(str(amt0)) * (Decimal(1) - slippage))
     amount1_min = int(Decimal(str(amt1)) * (Decimal(1) - slippage))
+    # Minimum-absolute-gap guard: if a side's amount is below 1_000 wei
+    # (extremely asymmetric position -- the tiny side), NPM rounding can
+    # consume fewer tokens than even a wide slippage allows.  Zero the min
+    # so the NPM passes trivially.  The diamond's own RedStone PSC check
+    # on *desired* amounts (not mins) provides the real backstop.
+    TINY_THRESHOLD = 1_000  # wei
+    if amt0 > 0 and int(amt0) < TINY_THRESHOLD:
+        amount0_min = 0
+    if amt1 > 0 and int(amt1) < TINY_THRESHOLD:
+        amount1_min = 0
+    deadline = int(time.time()) + 300  # 5 minute deadline
 
     sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
     print(f"Pool: {sym0}/{sym1} (tickSpacing={pool_cfg['tickSpacing']})")
@@ -4191,18 +4909,36 @@ def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
     print(f"  {sym0}: {fmt_token_amount(amt0, pool_cfg['decimals0'])}  "
           f"{sym1}: {fmt_token_amount(amt1, pool_cfg['decimals1'])}")
 
+    # Encode: tokenId, amount0Desired, amount1Desired, amount0Min, amount1Min, deadline
     feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
     payload = build_redstone_payload(feeds)
     from eth_abi import encode as abi_encode
     encoded_params = abi_encode(
         ['uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256'],
-        [int(token_id), int(amt0), int(amt1), amount0_min, amount1_min, 0],
+        [int(token_id), int(amt0), int(amt1), amount0_min, amount1_min, deadline],
     )
     calldata = AERODROME_SEL_INCREASE + encoded_params + payload
 
     sim_ok, sim_info = _aero_simulate_call(w3, acct.address, account.address, calldata)
     if not sim_ok:
-        print(f"  Simulation reverted — aborting before broadcast: {sim_info}")
+        err_str = str(sim_info)
+        print(f"  Simulation reverted — aborting before broadcast.")
+        # Decode common revert reasons for actionable guidance
+        if "PSC" in err_str or "08c379a0" in err_str:
+            print(f"  → Reason: Price Slippage Control (PSC).")
+            print(f"    This means the amounts consumed by the NPM fell below the mínimums.")
+            print(f"    Common causes:")
+            print(f"    1. One side's fitted amount is tiny (< 100 wei) — NPM rounding consumes less.")
+            print(f"       Fix: use aero-rebuild to open a fresh position with more balanced amounts.")
+            print(f"    2. Pool tick moved between preview and execution.")
+            print(f"       Fix: re-run the command for fresh fitted amounts.")
+            print(f"    3. Slippage too tight. Try --slippage 2 or higher.")
+        elif "no data" in err_str.lower() or "0x" in err_str:
+            print(f"  → The Aerodrome NPM rejected the call (usually single-sided increase")
+            print(f"    while the position is in-range, requiring both token sides).")
+            print(f"    Use aero-rebuild to remove and re-deploy the position instead.")
+        else:
+            print(f"  → Error: {sim_info}")
         sys.exit(2)
     print("  Simulation passed.")
 
@@ -4214,14 +4950,15 @@ def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
         "from": acct.address,
         "to": account.address,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 5000000,
+        "gas": 3000000,
         "chainId": CHAIN_ID,
         "data": "0x" + calldata.hex(),
     }
-    receipt = _sign_and_send(w3, acct, tx, "Increase liquidity", timeout=300, fallback_gas=5000000)
-    if receipt["status"] != 1:
-        sys.exit(2)
-
+    receipt = _sign_and_send(w3, acct, tx, "Increase liquidity", timeout=300, fallback_gas=3000000)
+    ok = receipt["status"] == 1
+    if ok:
+        print(f"  Increase-liquidity confirmed for tokenId {token_id}.")
+    return ok
 
 def cmd_aero_remove_liquidity(token_ids, percentage: float = 100.0,
                                execute: bool = False):
@@ -4535,53 +5272,66 @@ def _aero_rebalance_events(account: str, from_block=None, to_block="latest"):
         "RebalanceOrderCanceled": ["uint256"],
         "RebalanceExecuted":      ["uint160", "uint160", "uint256", "uint256"],
     }
-    CHUNK = 45_000  # under the public-RPC 50k-block getLogs cap
-    # Reverse map topic0 -> event name so a SINGLE getLogs (topic0 as an OR-list) returns
-    # all four event types per chunk, then is demuxed here. One scan per event type
-    # (the previous approach) meant 4x the getLogs round-trips, which timed out the
-    # per-tick range-monitor call.
+    # Chunked getLogs with shrink-on-failure backoff. 45k-block chunks timed out on the
+    # throttled public Base RPC (ReadTimeout ~127s, benchmarked 2026-06-19); 10k chunks
+    # complete in <0.3s each on the SAME endpoint. So size down and, on any per-chunk
+    # error, halve the range and retry rather than abandoning the whole scan. A dedicated
+    # provider with a short read timeout makes a slow chunk fail fast into the backoff.
+    # All four event types come back in one getLogs (topic0 OR-list) and are demuxed here.
+    CHUNK = 10_000
+    CHUNK_FLOOR = 2_000
     t0_to_name = {t.lower().removeprefix("0x"): n for n, t in REBALANCE_TOPIC0.items()}
     all_topic0 = list(REBALANCE_TOPIC0.values())
+    scan_w3 = Web3(Web3.HTTPProvider(BASE_RPC, request_kwargs={"timeout": 20}))
     out = []
     start = from_block
-    try:
-        while start <= to_block:
-            end = min(start + CHUNK - 1, to_block)
-            chunk_logs = w3.eth.get_logs({"address": emitter, "fromBlock": start,
-                                          "toBlock": end, "topics": [all_topic0, acct_topic]})
-            for lg in chunk_logs:
-                name = t0_to_name.get(lg["topics"][0].hex().lower().removeprefix("0x"))
-                if name is None:
-                    continue
-                ev = {"event": name, "block": lg["blockNumber"],
-                      "logIndex": lg["logIndex"], "tx": lg["transactionHash"].hex()}
-                # topic2 is executor (Executed); topic3 is the tokenId (all four events).
-                topics = lg["topics"]
-                decoded = w3.codec.decode(nonindexed[name], bytes(lg["data"]))
-                if name == "RebalanceExecuted":
-                    ev["executor"] = "0x" + topics[2].hex()[-40:]
-                    ev["tokenId"] = int(topics[3].hex(), 16)
-                    ev["oldRefSqrtPriceX96"] = decoded[0]
-                    ev["currentSqrtPriceX96"] = decoded[1]
-                    ev["newTokenId"] = decoded[2]
-                    ev["timestamp"] = decoded[3]
-                else:
-                    ev["tokenId"] = int(topics[3].hex(), 16) if len(topics) > 3 else None
-                    if name == "RebalanceOrderCreated":
-                        ev["rangeBps"] = [decoded[0], decoded[1]]
-                        ev["triggerBps"] = [decoded[2], decoded[3]]
-                        ev["executionFeeWeth"] = decoded[4]
-                        ev["timestamp"] = decoded[5]
-                    elif name == "RebalanceOrderUpdated":
-                        ev["rangeBps"] = [decoded[0], decoded[1]]
-                        ev["triggerBps"] = [decoded[2], decoded[3]]
-                        ev["timestamp"] = decoded[4]
-                    elif name == "RebalanceOrderCanceled":
-                        ev["timestamp"] = decoded[0]
-                out.append(ev)
+    chunk = CHUNK
+    while start <= to_block:
+        end = min(start + chunk - 1, to_block)
+        try:
+            chunk_logs = scan_w3.eth.get_logs({"address": emitter, "fromBlock": start,
+                                               "toBlock": end, "topics": [all_topic0, acct_topic]})
+        except Exception as e:  # noqa: BLE001 — shrink the range and retry; skip at floor
+            if chunk > CHUNK_FLOOR:
+                chunk = max(CHUNK_FLOOR, chunk // 2)
+                continue
+            print(f"  (getLogs sub-range {start}-{end} failed at floor: "
+                  f"{type(e).__name__})", file=sys.stderr)
             start = end + 1
-    except Exception as e:
-        print(f"  (getLogs failed: {type(e).__name__}: {str(e)[:120]})")
+            continue
+        for lg in chunk_logs:
+            name = t0_to_name.get(lg["topics"][0].hex().lower().removeprefix("0x"))
+            if name is None:
+                continue
+            ev = {"event": name, "block": lg["blockNumber"],
+                  "logIndex": lg["logIndex"], "tx": lg["transactionHash"].hex()}
+            # topic2 is executor (Executed); topic3 is the tokenId (all four events).
+            topics = lg["topics"]
+            decoded = w3.codec.decode(nonindexed[name], bytes(lg["data"]))
+            if name == "RebalanceExecuted":
+                ev["executor"] = "0x" + topics[2].hex()[-40:]
+                ev["tokenId"] = int(topics[3].hex(), 16)
+                ev["oldRefSqrtPriceX96"] = decoded[0]
+                ev["currentSqrtPriceX96"] = decoded[1]
+                ev["newTokenId"] = decoded[2]
+                ev["timestamp"] = decoded[3]
+            else:
+                ev["tokenId"] = int(topics[3].hex(), 16) if len(topics) > 3 else None
+                if name == "RebalanceOrderCreated":
+                    ev["rangeBps"] = [decoded[0], decoded[1]]
+                    ev["triggerBps"] = [decoded[2], decoded[3]]
+                    ev["executionFeeWeth"] = decoded[4]
+                    ev["timestamp"] = decoded[5]
+                elif name == "RebalanceOrderUpdated":
+                    ev["rangeBps"] = [decoded[0], decoded[1]]
+                    ev["triggerBps"] = [decoded[2], decoded[3]]
+                    ev["timestamp"] = decoded[4]
+                elif name == "RebalanceOrderCanceled":
+                    ev["timestamp"] = decoded[0]
+            out.append(ev)
+        start = end + 1
+        if chunk < CHUNK:
+            chunk = min(CHUNK, chunk * 2)
     out.sort(key=lambda e: (e["block"], e["logIndex"]))
     return out
 
@@ -4801,13 +5551,158 @@ def _aero_rebalance_write(fn_name: str, params: tuple, preview: dict, label: str
         print(f"  {label} confirmed for tokenId {preview['tokenId']}.")
 
 
+
+def _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg=None, execute=False):
+    """Sweep idle assets >$5 into the pool's bottleneck token. Called by rebalance
+    and rebuild paths so idle funds get deployed alongside the position."""
+    if pool_cfg is None:
+        if pool_key not in AERODROME_POOLS:
+            print(f"  Unknown pool '{pool_key}'. Skipping asset sweep.")
+            return
+        pool_cfg = AERODROME_POOLS[pool_key]
+
+    sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
+    MIN_USD_VALUE = 5.0
+
+    # Inventory RedStone-priced assets
+    candidates = set(REDSTONE_AVAILABLE_FEEDS) | {sym0, sym1}
+    inventory = {}
+    for sym in sorted(candidates):
+        try:
+            bal = account.functions.getBalance(asset_b32(sym)).call()
+        except Exception:
+            bal = 0
+        if bal <= 0:
+            continue
+        try:
+            locked = account.functions.getTotalIntentAmount(asset_b32(sym)).call()
+        except Exception:
+            locked = 0
+        avail = bal - locked if bal > locked else 0
+        if avail <= 0:
+            continue
+        dec = pool_cfg["decimals0"] if sym == sym0 else (
+              pool_cfg["decimals1"] if sym == sym1 else None)
+        if dec is None:
+            meta = _swap_asset_meta(w3, sym)
+            if meta:
+                dec = meta.get("decimals")
+        if dec is None:
+            continue
+        inventory[sym] = [avail, dec, 0.0]
+
+    if not inventory:
+        return
+
+    # Get prices
+    priced_syms = [s for s in inventory if s in REDSTONE_AVAILABLE_FEEDS]
+    if priced_syms:
+        feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
+        payload = build_redstone_payload(feeds)
+        try:
+            prices = _read_prices_usd(w3, account, priced_syms, payload)
+            for i, sym in enumerate(priced_syms):
+                usd_val = (float(prices[i] * Decimal(inventory[sym][0]))
+                           / (10 ** inventory[sym][1]) / 1e18)
+                inventory[sym][2] = usd_val
+        except Exception:
+            pass
+
+    # Filter > $5
+    valuable = {sym: bal for sym, (bal, dec, usd) in inventory.items()
+                if usd >= MIN_USD_VALUE}
+    if not valuable:
+        return
+
+    # Determine which non-pool assets to sweep
+    sweeps = {}
+    for sym, bal_wei in valuable.items():
+        if sym not in (sym0, sym1):
+            sweeps[sym] = bal_wei
+
+    if not sweeps:
+        return
+
+    # Determine bottleneck: which pool token is scarce
+    try:
+        pool_addr = _aero_pool_address(pool_cfg)
+        pool_c = w3.eth.contract(address=pool_addr, abi=json.loads(SLOT0_ABI))
+        slot0 = pool_c.functions.slot0().call()
+        pool_tick = slot0[1]
+        sqrt_price_x96 = slot0[0]
+        q96 = Decimal(2) ** 96
+        sq = Decimal(sqrt_price_x96) / q96
+        P = float(sq * sq)
+    except Exception:
+        # Can't read pool tick — sweep everything to token0 (common bottleneck)
+        pool_tick = None
+
+    if pool_tick is not None:
+        from decimal import localcontext
+        with localcontext() as ctx:
+            ctx.prec = 80
+            q96 = Decimal(2) ** 96
+            def _st(t): return (Decimal("1.0001") ** (Decimal(t) / Decimal(2))) * q96
+            # Use a default tick range to estimate bottleneck
+            ts = pool_cfg["tickSpacing"]
+            tick_delta = int(abs(__import__('math').log(1.02) / __import__('math').log(1.0001))) + 1
+            rl = int((pool_tick - tick_delta) / ts) * ts
+            ru = int((pool_tick + tick_delta) / ts) * ts
+            if rl >= ru: ru = rl + ts
+            rl = max(-887272, min(887272, rl))
+            ru = max(-887272, min(887272, ru))
+            if pool_tick <= rl: bottleneck = sym0
+            elif pool_tick >= ru: bottleneck = sym1
+            else:
+                k0 = (_st(ru) - _st(pool_tick)) * q96 / (_st(pool_tick) * _st(ru))
+                k1 = (_st(pool_tick) - _st(rl)) / q96
+                pool0_bal = valuable.get(sym0, 0)
+                pool1_bal = valuable.get(sym1, 0)
+                xt1 = Decimal(pool1_bal) * k0 - Decimal(pool0_bal) * k1
+                bottleneck = sym0 if xt1 > 10 else sym1
+    else:
+        bottleneck = sym0
+
+    for sym, bal_wei in sorted(sweeps.items()):
+        meta = _swap_asset_meta(w3, sym)
+        if not meta:
+            continue
+        amt_human = bal_wei / 10 ** meta["decimals"]
+        print(f"  Sweeping {amt_human:.6f} {sym} -> {bottleneck}...")
+        if execute:
+            ok = cmd_swap(sym, bottleneck, amt_human, 1.0, execute=True)
+            if not ok:
+                print(f"  Swap {sym} -> {bottleneck} failed. Continuing.")
 def cmd_aero_rebalance_create(token_id: int, width_pct: float, mode: str = "outside",
                               trigger_bps: int = 100, max_fee_weth: float = 0.001,
                               mint_slip_bps: int = 100, swap_slip_bps: int = 100,
                               execute: bool = False):
     """Turn on the auto-rebalancer for an existing Aerodrome position. Builds
     CreateRebalanceOrderParams from a symmetric ±width_pct band + a trigger mode, then
-    creates the order via createRebalanceOrder."""
+    creates the order via createRebalanceOrder.
+
+    Before creating the order, sweeps idle in-account assets >$5 into the pool's
+    bottleneck token so they get deployed when the rebalancer reopens the position."""
+    # Sweep idle assets to the pool's bottleneck token
+    w3 = get_w3()
+    acct = get_account()
+    pa = get_prime_account(w3, acct.address)
+    if pa:
+        pa_cs = Web3.to_checksum_address(pa)
+        account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
+        pos = _aero_read_position(w3, token_id)
+        if pos:
+            pos_t0, pos_t1, _, _, _ = pos
+            pos_t0, pos_t1 = pos_t0.lower(), pos_t1.lower()
+            pool_key = next(
+                (pk for pk, pc in AERODROME_POOLS.items()
+                 if pc["token0"].lower() == pos_t0 and pc["token1"].lower() == pos_t1),
+                None
+            )
+            if pool_key:
+                print(f"  Auto-sweeping idle assets to pool: {pool_key}...")
+                _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, execute=execute)
+
     try:
         params, preview = _build_rebalance_order_params(
             token_id, width_pct, mode, trigger_bps, max_fee_weth, mint_slip_bps, swap_slip_bps)
@@ -5077,7 +5972,7 @@ def _dispatch():
             return
         cmd_execute_pool_withdrawal(pool, index, execute)
     elif cmd == "aerodrome-positions":
-        cmd_aerodrome_positions()
+        cmd_aerodrome_positions(json_out="--json" in args)
     elif cmd == "aero-add-liquidity":
         pool_key = None
         amt0, amt1 = None, None
@@ -5094,10 +5989,18 @@ def _dispatch():
             if a == "--amount-cbbtc" and i + 1 < len(args): amt1 = float(args[i + 1])
             if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
             if a == "--width" and i + 1 < len(args): width = float(args[i + 1])
-        if not pool_key or (amt0 is None and amt1 is None):
+        use_all = "--use-all-available" in args
+        if not pool_key:
             print("Usage: degenprime aero-add-liquidity --pool weth-usdc-100 --amount-weth 0.05 --amount-usdc 100 [--slippage 1] [--width 2] [--execute]")
             return
-        cmd_aero_add_liquidity(pool_key, amt0, amt1, slippage, execute, width)
+        if not use_all and (amt0 is None and amt1 is None):
+            print("Specify --amount-* values or add --use-all-available to auto-detect.")
+            print("Usage: degenprime aero-add-liquidity --pool weth-usdc-100 [--use-all-available] [--slippage 1] [--width 2] [--execute]")
+            return
+        if use_all:
+            cmd_aero_add_liquidity(pool_key, slippage_pct=slippage, execute=execute, width_pct=width, use_all_available=True)
+        else:
+            cmd_aero_add_liquidity(pool_key, amt0, amt1, slippage, execute, width)
     elif cmd == "aero-increase-liquidity":
         pool_key = None
         token_id = None
@@ -5139,6 +6042,20 @@ def _dispatch():
             print("Usage: degenprime aero-collect-fees --token-id N [--execute]")
             return
         cmd_aero_collect_fees(token_id, execute)
+    elif cmd == "aero-rebuild":
+        token_id = None
+        width_pct = 2.0
+        slippage = 1.0
+        execute = "--execute" in args
+        for i, a in enumerate(args):
+            if a == "--token-id" and i + 1 < len(args): token_id = int(args[i + 1])
+            if a == "--width-pct" and i + 1 < len(args): width_pct = float(args[i + 1])
+            if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
+        if token_id is None:
+            print("Usage: degenprime aero-rebuild --token-id N [--width-pct 2.0] [--slippage 1] [--execute]")
+            return
+        cmd_aero_rebuild(token_id, width_pct, slippage, execute)
+
     elif cmd == "aero-claim-rewards":
         execute = "--execute" in args
         cmd_aero_claim_rewards(execute)
