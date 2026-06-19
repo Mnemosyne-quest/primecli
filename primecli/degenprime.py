@@ -16,6 +16,7 @@ Usage:
   degenprime create-account --fund-pool usdc --fund-amount 100 [--execute]
   degenprime summary
   degenprime defi --json          (aggregate ALL positions as DeBank-style JSON; read-only)
+  degenprime equity [--json] [--account 0x..]   (net equity = total value - debt + unclaimed AERO; read-only)
   degenprime fund --pool usdc --amount 100 [--execute]
   degenprime borrow --pool usdc --amount 100 [--execute]
   degenprime repay --pool usdc --amount 100 [--execute]
@@ -2661,6 +2662,156 @@ def cmd_summary(as_json: bool = False):
     else:
         print(f"  Health/solvency:    RedStone fetch/call failed ({solvency['error']}); showing balances only")
 
+def _aero_unclaimed_usd(w3, account, solvency_prices: dict) -> float:
+    """Sum unclaimed AERO across the account's staked Aerodrome positions, priced in USD.
+
+    Read-only. Iterates getOwnedStakedAerodromeTokenIds(), reads each gauge's earned()
+    via _aero_gauge_earned, and prices the total with the AERO RedStone feed. Prefers the
+    AERO price already in the solvency multicall; falls back to a dedicated getPrices read
+    when AERO wasn't among the account's priced symbols. Returns 0.0 if nothing staked or
+    AERO can't be priced (fail-closed — never invents reward value)."""
+    try:
+        token_ids = account.functions.getOwnedStakedAerodromeTokenIds().call()
+    except Exception:
+        token_ids = []
+    if not token_ids:
+        return 0.0
+    total_aero = 0.0
+    for tid in token_ids:
+        total_aero += _aero_gauge_earned(w3, account, tid)
+    if total_aero <= 0:
+        return 0.0
+    aero_price = (solvency_prices or {}).get("AERO")
+    if aero_price is None:
+        try:
+            payload = build_redstone_payload(["AERO"])
+            aero_price = _prices_usd(w3, account, ["AERO"], payload).get("AERO")
+        except Exception:
+            aero_price = None
+    if aero_price is None:
+        return 0.0
+    return total_aero * aero_price
+
+def get_account_equity(account_addr: str = None) -> dict:
+    """Net equity of a Degen Account: total_value_usd - debt_usd + rewards_usd.
+
+    Read-only (eth_call only): reuses _gather_account_state for the RedStone-gated
+    getTotalValue/getDebt reads and _aero_unclaimed_usd for unclaimed AERO gauge rewards
+    (Aerodrome emissions are NOT inside getTotalValue, so they're added). `account_addr`
+    targets a specific Degen Account; when None it resolves the first account owned by the
+    --as wallet (Base owners can hold several — see cmd_equity for the multi-account view).
+
+    Returns {agent, chain, protocol, wallet, prime_account, total_value_usd, debt_usd,
+    rewards_usd, net_equity_usd, block, ts, status}. On any read error: status="error",
+    an `error` field, and the numeric fields set to None."""
+    base = {
+        "agent": _SELECTED_AGENT, "chain": "base", "protocol": "DegenPrime",
+        "wallet": None, "prime_account": None,
+        "total_value_usd": None, "debt_usd": None, "rewards_usd": None,
+        "net_equity_usd": None, "block": None, "ts": int(time.time()), "status": "ok",
+    }
+    try:
+        w3 = get_w3()
+        acct = get_account()
+        base["wallet"] = acct.address
+        base["block"] = w3.eth.block_number
+        if account_addr:
+            pa = account_addr
+        else:
+            loans = get_factory_contract(w3).functions.getLoansForOwner(
+                Web3.to_checksum_address(acct.address)).call()
+            pa = loans[0] if loans else None
+        if not pa:
+            base["status"] = "no_account"
+            return base
+        pa = Web3.to_checksum_address(pa)
+        base["prime_account"] = pa
+        account = w3.eth.contract(address=pa, abi=PRIME_ACCOUNT_ABI)
+        pool_deposits = _gather_pool_deposits(w3, acct.address)
+        _pa_eth, _supplied, _borrowed, solvency = _gather_account_state(w3, account, pool_deposits)
+        if solvency["error"] is not None or solvency["total"] is None:
+            base["status"] = "error"
+            base["error"] = solvency["error"] or "solvency read failed"
+            return base
+        total_value = solvency["total"]
+        debt = solvency["debt"] or 0.0
+        rewards = _aero_unclaimed_usd(w3, account, solvency["prices"])
+        base["total_value_usd"] = round(total_value, 2)
+        base["debt_usd"] = round(debt, 2)
+        base["rewards_usd"] = round(rewards, 2)
+        base["net_equity_usd"] = round(total_value - debt + rewards, 2)
+        return base
+    except Exception as e:
+        base["status"] = "error"
+        base["error"] = f"{type(e).__name__}: {e}"
+        return base
+
+def _print_equity_human(eq: dict):
+    """Render one equity dict as a short human table."""
+    print(f"Degen Account: {eq['prime_account']}")
+    if eq["status"] == "error":
+        print(f"  Equity: unavailable ({eq.get('error', 'read failed')})")
+        return
+    tv, debt, rw, net = (eq["total_value_usd"], eq["debt_usd"],
+                         eq["rewards_usd"], eq["net_equity_usd"])
+    health = (100.0 if debt < 0.01 else round((tv - debt) / tv * 100, 1)) if tv else 0.0
+    print(f"  Total value:   ${tv:,.2f}")
+    print(f"  Debt:          ${debt:,.2f}")
+    print(f"  Rewards:       ${rw:,.2f}  (unclaimed AERO emissions)")
+    print(f"  Net equity:    ${net:,.2f}  (total - debt + rewards)")
+    print(f"  Equity health: {health:.1f}%  (equity / total value)")
+
+def cmd_equity(as_json: bool = False, account_addr: str = None):
+    """Print net equity for the selected wallet's Degen Account(s) (read-only).
+
+    Base owners can hold multiple Degen Accounts (getLoansForOwner returns an array).
+    Without --account: defaults to the first account, but emits ALL of them — as a JSON
+    array (with a multi-account note) under --json, or listed in human mode."""
+    w3 = get_w3()
+    acct = get_account()
+    if account_addr:
+        accounts = [Web3.to_checksum_address(account_addr)]
+    else:
+        try:
+            loans = get_factory_contract(w3).functions.getLoansForOwner(
+                Web3.to_checksum_address(acct.address)).call()
+            accounts = [Web3.to_checksum_address(a) for a in loans]
+        except Exception:
+            accounts = []
+
+    if not accounts:
+        if as_json:
+            print(json.dumps({
+                "agent": _SELECTED_AGENT, "chain": "base", "protocol": "DegenPrime",
+                "wallet": acct.address, "prime_account": None,
+                "total_value_usd": None, "debt_usd": None, "rewards_usd": None,
+                "net_equity_usd": None, "block": w3.eth.block_number,
+                "ts": int(time.time()), "status": "no_account",
+            }, indent=2))
+        else:
+            print(f"Owner wallet: {acct.address}")
+            print("No Degen Account yet. Create one with: degenprime create-account --execute")
+        return
+
+    results = [get_account_equity(a) for a in accounts]
+
+    if as_json:
+        if len(results) == 1:
+            print(json.dumps(results[0], indent=2))
+        else:
+            print(json.dumps({
+                "note": (f"wallet owns {len(results)} Degen Accounts on Base; "
+                         "per-account equity below (default account is the first)"),
+                "accounts": results,
+            }, indent=2))
+        return
+
+    print(f"Owner wallet: {acct.address}")
+    if len(results) > 1:
+        print(f"  ({len(results)} Degen Accounts on Base — first is the default)")
+    for eq in results:
+        _print_equity_human(eq)
+
 def cmd_borrow(pool_name: str, amount: float, execute: bool = False):
     cfg = POOLS[pool_name]
     w3 = get_w3()
@@ -4766,6 +4917,16 @@ def _dispatch():
         cmd_summary(as_json="--json" in args)
     elif cmd == "defi":
         cmd_defi("--json" in args)
+    elif cmd == "equity":
+        account_addr = None
+        for i, a in enumerate(args):
+            if a == "--account" and i + 1 < len(args):
+                try:
+                    account_addr = Web3.to_checksum_address(args[i + 1])
+                except Exception:
+                    print(f"Invalid --account address: {args[i + 1]}")
+                    return
+        cmd_equity("--json" in args, account_addr)
     elif cmd == "fund":
         pool, amount = None, None
         execute = "--execute" in args

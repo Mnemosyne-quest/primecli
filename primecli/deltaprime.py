@@ -18,6 +18,7 @@ Usage:
   python3 deltaprime.py create-prime-account --fund-pool usdc --fund-amount 100 [--execute]
   python3 deltaprime.py prime-summary
   python3 deltaprime.py defi --json          (aggregate ALL positions as DeBank-style JSON; read-only)
+  python3 deltaprime.py equity [--json] [--account 0x..]   (net equity = total value - debt + unclaimed rewards; read-only)
   python3 deltaprime.py fund --pool usdc --amount 100 [--execute]
   python3 deltaprime.py borrow --pool usdc --amount 100 [--execute]
   python3 deltaprime.py repay --pool usdc --amount 100 [--execute]
@@ -2310,6 +2311,78 @@ def cmd_prime_summary():
     else:
         print(f"  Health/solvency:    RedStone fetch/call failed ({data.get('solvency_error', 'error')}); "
               "showing balances only")
+
+def get_account_equity(account_addr: str = None) -> dict:
+    """Net equity of a Prime Account: total_value_usd - debt_usd + rewards_usd.
+
+    Read-only (eth_call only): reuses gather_lending for the RedStone-gated
+    getTotalValue/getDebt reads and gather_sjoe for unclaimed sJOE rewards (paid in
+    USDC, so pending_raw is already USD). `account_addr` targets a specific Prime
+    Account; when None it resolves the one owned by the --as / --owner wallet.
+
+    Returns {agent, chain, protocol, wallet, prime_account, total_value_usd, debt_usd,
+    rewards_usd, net_equity_usd, block, ts, status}. On any read error: status="error",
+    an `error` field, and the numeric fields set to None."""
+    base = {
+        "agent": _SELECTED_AGENT, "chain": "avalanche", "protocol": "DeltaPrime",
+        "wallet": None, "prime_account": None,
+        "total_value_usd": None, "debt_usd": None, "rewards_usd": None,
+        "net_equity_usd": None, "block": None, "ts": int(time.time()), "status": "ok",
+    }
+    try:
+        w3 = get_w3()
+        acct = get_account()
+        base["wallet"] = acct.address
+        pa = account_addr or get_prime_account(w3, acct.address)
+        base["block"] = w3.eth.block_number
+        if not pa:
+            base["status"] = "no_account"
+            return base
+        pa = Web3.to_checksum_address(pa)
+        base["prime_account"] = pa
+        account = w3.eth.contract(address=pa, abi=PRIME_ACCOUNT_ABI)
+        lending = gather_lending(w3, account)
+        if "solvency_error" in lending or lending.get("total_value_usd") is None:
+            base["status"] = "error"
+            base["error"] = lending.get("solvency_error", "solvency read failed")
+            return base
+        total_value = lending["total_value_usd"]
+        debt = lending["debt_usd"]
+        sjoe = gather_sjoe(account, w3)
+        # sJOE rewards are paid in USDC (6 decimals) -> pending_raw is already USD.
+        rewards = sjoe["pending_raw"] / 10 ** SJOE_REWARD["decimals"]
+        base["total_value_usd"] = round(total_value, 2)
+        base["debt_usd"] = round(debt, 2)
+        base["rewards_usd"] = round(rewards, 2)
+        base["net_equity_usd"] = round(total_value - debt + rewards, 2)
+        return base
+    except Exception as e:
+        base["status"] = "error"
+        base["error"] = f"{type(e).__name__}: {e}"
+        return base
+
+def cmd_equity(as_json: bool = False, account_addr: str = None):
+    """Print net equity for the selected wallet's Prime Account (read-only)."""
+    eq = get_account_equity(account_addr)
+    if as_json:
+        print(json.dumps(eq, indent=2))
+        return
+    print(f"Owner wallet: {eq['wallet']}")
+    if eq["status"] == "no_account":
+        print("No Prime Account yet. Create one with: deltaprime.py create-prime-account --execute")
+        return
+    print(f"Prime Account: {eq['prime_account']}")
+    if eq["status"] == "error":
+        print(f"  Equity: unavailable ({eq.get('error', 'read failed')})")
+        return
+    tv, debt, rw, net = (eq["total_value_usd"], eq["debt_usd"],
+                         eq["rewards_usd"], eq["net_equity_usd"])
+    health = (100.0 if debt < 0.01 else round((tv - debt) / tv * 100, 1)) if tv else 0.0
+    print(f"  Total value:   ${tv:,.2f}")
+    print(f"  Debt:          ${debt:,.2f}")
+    print(f"  Rewards:       ${rw:,.2f}  (unclaimed sJOE, paid in USDC)")
+    print(f"  Net equity:    ${net:,.2f}  (total - debt + rewards)")
+    print(f"  Equity health: {health:.1f}%  (equity / total value)")
 
 def cmd_borrow(pool_name: str, amount: float, execute: bool = False):
     cfg = POOLS[pool_name]
@@ -5401,8 +5474,8 @@ def main():
         return
 
     cmd = args[0]
-    if _OWNER_ADDRESS and cmd not in {"defi", "lb-positions"}:
-        print("--owner is only supported for read-only commands: defi, lb-positions")
+    if _OWNER_ADDRESS and cmd not in {"defi", "lb-positions", "equity"}:
+        print("--owner is only supported for read-only commands: defi, lb-positions, equity")
         return
     if cmd == "pool-info":
         # First positional after `pool-info` is the pool name; --json is an opt-in flag
@@ -5484,6 +5557,16 @@ def main():
         cmd_prime_summary()
     elif cmd == "defi":
         cmd_defi("--json" in args)
+    elif cmd == "equity":
+        account_addr = None
+        for i, a in enumerate(args):
+            if a == "--account" and i + 1 < len(args):
+                try:
+                    account_addr = Web3.to_checksum_address(args[i + 1])
+                except Exception:
+                    print(f"Invalid --account address: {args[i + 1]}")
+                    return
+        cmd_equity("--json" in args, account_addr)
     elif cmd == "fund":
         pool, amount = None, None
         execute = "--execute" in args
