@@ -744,11 +744,17 @@ def _estimate_gas_limit(w3, tx_dict, fallback_gas: int, buffer_bps: int = 1250) 
     Solvency-gated swap paths append RedStone payloads and can vary materially by
     route. A fixed cap can pass simulation at a high gas allowance, then revert
     out-of-gas on broadcast. If the RPC cannot estimate, keep the old fixed cap.
+
+    fallback_gas is a fallback for when estimation FAILS, not a floor that overrides a
+    good estimate. Flooring at e.g. 4M over-reserved gas_limit*maxFeePerGas upfront,
+    so a low-gas-balance wallet hit "insufficient funds for gas" even when the tx
+    itself simulated fine. A successful estimate is authoritative; the OOG retry in
+    _sign_and_send (+50% on gasUsed>=gasLimit) covers any under-estimate.
     """
     try:
         call_tx = {k: tx_dict[k] for k in ("from", "to", "data", "value") if k in tx_dict}
         estimated = int(w3.eth.estimate_gas(call_tx))
-        return max(int(fallback_gas), (estimated * int(buffer_bps) + 999) // 1000)
+        return (estimated * int(buffer_bps) + 999) // 1000
     except Exception:
         return int(fallback_gas)
 

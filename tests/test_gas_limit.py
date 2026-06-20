@@ -1,7 +1,10 @@
 """Tests for _estimate_gas_limit and _sign_and_send helpers.
 
 Ethereum RPC estimation is mocked. The test verifies:
-- Estimation prefers RPC result over fallback
+- A successful estimate is authoritative: buffered estimate wins, even when it is
+  BELOW fallback_gas (fallback_gas is a fallback-on-failure, NOT a floor — flooring
+  at e.g. 4M over-reserved gas_limit*maxFeePerGas and tripped "insufficient funds for
+  gas" on low-balance wallets; the ZORA/USDC converge borrow symptom, 2026-06-20).
 - RPC failure falls back to the supplied fallback_gas
 - 25% buffer is applied correctly
 - OOG detection logic (stateless, pure Python)
@@ -57,14 +60,14 @@ class FakeW3:
 
 
 def test_estimate_gas_limit_prefers_eth_estimate():
+    """A successful estimate is authoritative — the buffered estimate wins even when
+    it is below fallback_gas. fallback_gas is NOT a floor; flooring over-reserved gas
+    (gas_limit*maxFeePerGas) and broke borrows on low-gas-balance wallets."""
     w3 = FakeW3(estimate_result=80000)
     tx = {"from": "0xaaa", "to": "0xbbb", "data": "0xdead"}
     result = dgp._estimate_gas_limit(w3, tx, fallback_gas=3000000, buffer_bps=1250)
-    # expected: 80000 * 1250 / 1000 = 100000, but max with fallback = max(3M, 100k)
-    # Actually the code does max(fallback, estimated * buffer / 1000)
-    # = max(3000000, 80000 * 1250 // 1000)
-    # = max(3000000, 100000) = 3000000
-    assert result == 3000000, f"Expected 3000000, got {result}"
+    # 80000 * 1250 // 1000 = 100000  (buffered estimate; fallback_gas no longer floors it)
+    assert result == 100000, f"Expected 100000, got {result}"
 
 
 def test_estimate_gas_limit_with_large_estimate():
