@@ -3700,6 +3700,22 @@ def gather_gmx(w3, account):
                 pos["usd"] = after_fees / 10**GM_TOKEN_DECIMALS * gm_usd
         except Exception as e:
             pos["error"] = type(e).__name__
+        # Two-sided GM markets carry a real long/short backing split; expose it as a
+        # best-effort composition for portfolio/dashboard consumers. GM+ is single-sided
+        # (no meaningful split) so it's skipped. Failures here never affect the position.
+        if not mkt["plus"]:
+            try:
+                underlyings = [mkt["long"], mkt["short"]]
+                price_payload = build_redstone_payload(underlyings)
+                p_long = _gmx_underlying_price_usd(w3, account, price_payload, mkt["long"])
+                p_short = _gmx_underlying_price_usd(w3, account, price_payload, mkt["short"])
+                long_frac, short_frac = _gmx_market_reserve_split(w3, mkt, p_long, p_short)
+                pos["composition"] = [
+                    {"symbol": mkt["long"], "pct": round(long_frac * 100, 1)},
+                    {"symbol": mkt["short"], "pct": round(short_frac * 100, 1)},
+                ]
+            except Exception:
+                pass
         positions.append(pos)
     return positions
 
@@ -5409,7 +5425,8 @@ def gather_defi() -> dict:
         gmx = gather_gmx(w3, account)
         if gmx:
             result["groups"].append({"type": "GMX V2 LP", "items": [
-                {"label": p["gm_feed"], "balance": p["balance"], "symbol": p["kind"], "usd": p.get("usd")}
+                {"label": p["gm_feed"], "balance": p["balance"], "symbol": p["kind"],
+                 "usd": p.get("usd"), "composition": p.get("composition")}
                 for p in gmx]})
 
         lb = gather_lb(w3, account)
