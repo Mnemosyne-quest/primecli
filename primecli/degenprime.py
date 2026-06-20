@@ -4254,6 +4254,14 @@ def _aero_use_all_available(
         pool_cfg["tickSpacing"], None, width_pct, pool_tick
     )
 
+    # Default the bottleneck so the "already within range ratio" branch (and any
+    # future early path) can't leave it unbound — the downstream sweep destination
+    # (dest_sym) reads it unconditionally. token1 is the canonical quote leg (USDC
+    # in these pools); when no swap is needed either side is equally valid.
+    # (Pre-existing UnboundLocalError otherwise: fires whenever the two pool tokens
+    # are already within TOL of the range ratio and there are no non-pool sweeps.)
+    bottleneck = "token1"
+
     with localcontext() as ctx:
         ctx.prec = 80
         q96 = Decimal(2) ** 96
@@ -4328,9 +4336,28 @@ def _aero_use_all_available(
                 print(f"    {sym}: {bal} raw (cannot resolve decimals)")
 
     dest_sym = sym0 if bottleneck == "token0" else sym1
-    print(f"\n  Pool tokens after sweeps + balance swap:")
-    print(f"    {sym0}: {total0_wei / 10**dec0:.6f}  {sym1}: {total1_wei / 10**dec1:.6f}")
-    print(f"    Target: swap surplus to {dest_sym}")
+    # The pool-token<->pool-token balancing swap is NOT executed here; the caller's
+    # precision-swap loop performs it against the live in-account balance. Surface the
+    # CURRENT pool-token holdings vs the TARGET ratio so a dry-run makes the required
+    # balancing swap visible (it previously printed only the target, which read as if
+    # the swap had already happened). The target ratio is derived purely from the
+    # on-chain pool tick (slot0), so this works for unpriced pool tokens (e.g. ZORA)
+    # exactly as it does for RedStone-priced ones.
+    _bal0_now = pool0_bal_wei
+    _bal1_now = pool1_bal_wei
+    print(f"\n  Pool-token balancing (computed from on-chain pool tick, no oracle):")
+    print(f"    current : {sym0} {_bal0_now / 10**dec0:.6f}  {sym1} {_bal1_now / 10**dec1:.6f}")
+    print(f"    target  : {sym0} {total0_wei / 10**dec0:.6f}  {sym1} {total1_wei / 10**dec1:.6f}")
+    _bswap0 = total0_wei - _bal0_now
+    _bswap1 = total1_wei - _bal1_now
+    if _bswap0 > 0 and _bswap1 < 0:
+        print(f"    swap    : sell {abs(_bswap1) / 10**dec1:.6f} {sym1} -> {sym0} "
+              f"(toward the range ratio)")
+    elif _bswap1 > 0 and _bswap0 < 0:
+        print(f"    swap    : sell {abs(_bswap0) / 10**dec0:.6f} {sym0} -> {sym1} "
+              f"(toward the range ratio)")
+    else:
+        print(f"    swap    : none (already within range ratio)")
 
     # 8. Execute swaps if requested
     if execute and sweeps:
@@ -4643,8 +4670,14 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
             break
 
         # Rough USD estimate — skip swaps worth less than $5 after the
-        # first pass (convergence tail).
-        _usd_est = _swap_human * _pool_price if _from_sym == sym0 else _swap_human
+        # first pass (convergence tail). _pool_price is the RAW slot0 ratio
+        # (token1-wei per token0-wei); convert to a human token0->token1 price with
+        # the decimal offset before using it as a ~USD proxy, otherwise pools whose
+        # legs have different decimals (e.g. ZORA[18]/USDC[6]) mis-scale the estimate
+        # by 10**(dec0-dec1) and the dust gate becomes meaningless. token1 (USDC here)
+        # is the ~$1 leg, so its human amount is already the USD proxy.
+        _human_price_0_in_1 = _pool_price * (10 ** (dec0 - dec1))
+        _usd_est = _swap_human * _human_price_0_in_1 if _from_sym == sym0 else _swap_human
         if _usd_est < 5.0 and _pass > 0:
             break
 
