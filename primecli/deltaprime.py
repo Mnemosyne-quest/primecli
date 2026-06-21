@@ -301,6 +301,7 @@ def _derive_private_key(seed_path, derivation_path):
 AGENTS = {
     # Raw key entries (from env files)
     "parakletos":   ("/root/.openclaw/.env",                "PARAKLETOS_EVM_PRIVATE_KEY"),
+    "core1":        ("/root/.openclaw/.env",                "BRUNO_CORE1_PRIVATE_KEY"),
     "paraklaudios": ("/root/paraklaudios/.credentials.env", "PARAKLAUDIOS_EVM_PRIVATE_KEY"),
 
     # HD seed-derived entries (from Parakletos's BIP39 seed)
