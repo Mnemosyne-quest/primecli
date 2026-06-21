@@ -3272,7 +3272,19 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     prices, build the ParaSwap calldata for the internal --to -> --from swap, and
     preview the 5% USD-diff cap. RedStone-gated on execute. Both assets must be
     DegenPrime POOL assets (the swap-debt path touches pool getBorrowed)."""
-    from_sym, to_sym = from_sym.upper(), to_sym.upper()
+    # Resolve --from/--to case-INSENSITIVELY to the canonical SWAP_ASSETS key. A bare
+    # `.upper()` broke mixed-case pool symbols (cbBTC→"CBBTC", cbDOGE, cbXRP): the
+    # uppercased form is absent from SWAP_ASSETS / REDSTONE_AVAILABLE_FEEDS (both keyed
+    # by the exact symbol "cbBTC"), so swap-debt INTO cbBTC was impossible even though it
+    # has a RedStone feed. Map to the canonical key here; unknown assets fall through to
+    # the uppercased form so the "Unknown asset" errors below still fire clearly.
+    def _canon_swap_sym(s):
+        s_up = str(s).upper()
+        for _k in SWAP_ASSETS:
+            if _k.upper() == s_up:
+                return _k
+        return s_up
+    from_sym, to_sym = _canon_swap_sym(from_sym), _canon_swap_sym(to_sym)
     if from_sym not in SWAP_ASSETS:
         print(f"Unknown --from (old debt) asset '{from_sym}'. Must be a pool asset: {', '.join(SWAP_ASSETS)}")
         return
