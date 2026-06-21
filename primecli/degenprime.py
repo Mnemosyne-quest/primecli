@@ -4702,8 +4702,9 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
             break
 
     # Re-read balances and mint
-    amt0 = _aero_in_account_balance(account, sym0)
-    amt1 = _aero_in_account_balance(account, sym1)
+    in_acct0 = _aero_in_account_balance(account, sym0)
+    in_acct1 = _aero_in_account_balance(account, sym1)
+    amt0, amt1 = in_acct0, in_acct1
     if amt0 == 0 and amt1 == 0:
         print("  Nothing in account after swaps.")
         return
@@ -4714,6 +4715,30 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
     if amt0 == 0 and amt1 == 0:
         print("  Nothing to deposit after fitting to range.")
         return
+
+    # Pre-mint self-borrow guard: when price is in-range, the fit derives a
+    # matching amount for whichever leg is missing from the pool ratio. If that
+    # required leg is essentially absent in-account (the balancing swap under-
+    # delivered on a thin pool), the mintAndStake facet would auto-borrow the
+    # shortfall in-flight, which DegenPrime rejects -> BorrowingNotAllowed()
+    # (selector 0x95a94dd3). Abort cleanly instead so the caller's unwind repays
+    # and the escalation reason is accurate. Mirrors the one-sided rounds-to-zero
+    # guard in _aero_fit_amounts_to_range. (Both legs already in-account fit to a
+    # min(), so fitted never exceeds in-account there -> this never fires for the
+    # normal path or the other farms.)
+    if pool_tick is not None and tick_lower < pool_tick < tick_upper:
+        for fitted, have, sym, dec in (
+            (amt0, in_acct0, sym0, dec0),
+            (amt1, in_acct1, sym1, dec1),
+        ):
+            if fitted > have + 1:  # +1 wei for display round-up margin
+                print(
+                    f"  Balancing swap underdelivered {sym}: mint needs "
+                    f"{fmt_token_amount(fitted, dec)} but only "
+                    f"{fmt_token_amount(have, dec)} is in-account. The mint would "
+                    f"self-borrow the shortfall (BorrowingNotAllowed) -- aborting."
+                )
+                return
 
     params = _aero_mint_params(pool_cfg, amt0, amt1, tick_lower, tick_upper,
                                pool_tick, slippage_pct)
