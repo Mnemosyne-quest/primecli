@@ -4,6 +4,20 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.10.1] - 2026-06-21
+
+### Fixed
+- **degenprime `swap-debt` case-insensitive asset resolution.** `cmd_swap_debt` uppercased
+  `--from`/`--to` before the `SWAP_ASSETS` / `REDSTONE_AVAILABLE_FEEDS` membership checks, so
+  mixed-case pool symbols (`cbBTC`, `cbDOGE`, `cbXRP`) were rejected as "Unknown asset" even
+  though they are valid pool assets with RedStone feeds. Symbols now resolve case-insensitively
+  to the canonical `SWAP_ASSETS` key. Enables swap-debt **into cbBTC** (the core1 3-asset debt
+  strategy).
+
+### Added
+- **deltaprime: `core1` wallet in `AGENTS`.** `--as core1` (BRUNO_CORE1_PRIVATE_KEY) now resolves
+  on Avalanche, matching degenprime/bridge.
+
 ## [0.10.0] - 2026-06-17
 
 ### Added

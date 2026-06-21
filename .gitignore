@@ -65,3 +65,10 @@ coverage.xml
 # OS
 .DS_Store
 Thumbs.db
+
+# debug/probe scratch (not part of the package)
+probe*.py
+*.bak
+*.bak-*
+diamond-probe-results.md
+increase-liquidity-fix.md
