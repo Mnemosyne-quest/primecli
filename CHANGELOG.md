@@ -4,6 +4,22 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.10.2] - 2026-06-23
+
+### Fixed
+- **Flow ledger logged the requested fund amount, not what actually moved on-chain.**
+  `_log_fund_flow` recorded the `amount` argument passed to `fund(asset, amount)` as the
+  external contribution. But an ERC20 `fund()` pulls only what the wallet holds: when a
+  leveraged position is opened the EOA holds dust and the rest is borrowed, so the contract
+  transferred far less than requested while the ledger booked the full request. This inflated
+  every downstream PnL basis — e.g. a Base position showed "since open −$349" when the real
+  figure was ≈ −$44 — and produced absurd effective-APR readings (the phantom flow gets netted
+  out of each trailing window). Both the fund and withdrawal-execute paths across all three
+  protocol CLIs (`degenprime`/`deltaprime`/`arbprime`) now log the **actual** ERC20
+  `Transfer(EOA↔account)` amount parsed from the tx receipt via the new
+  `_flowledger.transferred_amount` helper. Native funding (exact `msg.value`, can't be partial)
+  is unchanged. Going-forward fix only — existing ledgers need a one-time reconcile.
+
 ## [0.10.1] - 2026-06-21
 
 ### Fixed

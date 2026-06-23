@@ -1966,21 +1966,42 @@ def cmd_fund(pool_name: str, amount: float, execute: bool = False):
         receipt = _sign_and_send(w3, acct, fund_tx, f"Fund {amount} {symbol}", fallback_gas=3000000)
         ok = receipt["status"] == 1
         if ok:
-            _log_fund_flow(pa, symbol, amount, receipt)
+            _log_fund_flow(
+                pa, symbol, amount, receipt,
+                token_addr=(None if cfg["native"] else cfg["token"]),
+                from_addr=acct.address, decimals=cfg["decimals"],
+            )
         return ok
 
 
-def _log_fund_flow(account_addr: str, symbol: str, amount: float, receipt) -> None:
+def _log_fund_flow(account_addr: str, symbol: str, amount: float, receipt,
+                   token_addr: str = None, from_addr: str = None,
+                   decimals: int = None) -> None:
     """Append a 'deposit' flow record after a successful fund broadcast. asset is the
     funded bytes32 symbol (the wrapped-native symbol for native funding, e.g. 'ETH').
     usd_value uses the current spot price (≈ flow-time price); None when unpriced.
-    Wrapped so a logging failure can never fail the financial op."""
+    Wrapped so a logging failure can never fail the financial op.
+
+    Logs the ACTUAL ERC20 Transfer(EOA -> account) amount from the receipt, not the
+    requested `amount`: an ERC20 fund() can pull less than asked when the wallet is
+    short (leverage-opens fund mostly from borrow), and logging the request over-counts
+    contribution. Native funding moves the exact msg.value, so `amount` stands there
+    (token_addr is None)."""
     try:
+        actual = amount
+        if token_addr and from_addr and decimals is not None:
+            moved = _flowledger.transferred_amount(
+                receipt, token_addr, from_addr, account_addr, decimals)
+            if moved is not None:
+                if abs(moved - amount) > max(1e-6, abs(amount) * 1e-4):
+                    print(f"  NOTE fund pulled {moved} {symbol} of {amount} requested "
+                          f"(logging actual)", file=sys.stderr)
+                actual = moved
         px = token_price(symbol)
-        usd = round(amount * px, 8) if px else None
+        usd = round(actual * px, 8) if px else None
         rec = _flowledger.make_record(
             ts=int(time.time()), ftype="deposit", asset=symbol,
-            token_amount=amount, usd_value=usd,
+            token_amount=actual, usd_value=usd,
             tx=receipt["transactionHash"].hex(), block=receipt["blockNumber"],
             source="live-fund",
         )
@@ -3500,20 +3521,40 @@ def cmd_execute_withdrawal(pool_name: str, index: int = None, execute: bool = Fa
     ok = receipt["status"] == 1
     if ok:
         executed_amount = sum(intents[i][0] for i in ready) / 10 ** cfg["decimals"]
-        _log_withdraw_flow(pa, symbol, executed_amount, receipt)
+        _log_withdraw_flow(
+            pa, symbol, executed_amount, receipt,
+            token_addr=(None if cfg["native"] else cfg["token"]),
+            to_addr=acct.address, decimals=cfg["decimals"],
+        )
 
 
-def _log_withdraw_flow(account_addr: str, symbol: str, amount: float, receipt) -> None:
+def _log_withdraw_flow(account_addr: str, symbol: str, amount: float, receipt,
+                       token_addr: str = None, to_addr: str = None,
+                       decimals: int = None) -> None:
     """Append a 'withdraw' flow record after a successful executeWithdrawalIntent
     broadcast (funds left the account to the EOA). amount is the total executed across
     the matured intents. usd_value uses current spot price; None when unpriced. Wrapped
-    so a logging failure can never fail the financial op."""
+    so a logging failure can never fail the financial op.
+
+    Prefers the ACTUAL ERC20 Transfer(account -> EOA) amount from the receipt over the
+    committed `amount`, symmetric with the fund path: the executed amount is normally
+    exact, but parsing the receipt keeps the ledger honest if it ever diverges. Native
+    unwraps emit no ERC20 Transfer, so `amount` stands there (token_addr is None)."""
     try:
+        actual = amount
+        if token_addr and to_addr and decimals is not None:
+            moved = _flowledger.transferred_amount(
+                receipt, token_addr, account_addr, to_addr, decimals)
+            if moved is not None:
+                if abs(moved - amount) > max(1e-6, abs(amount) * 1e-4):
+                    print(f"  NOTE withdraw moved {moved} {symbol} of {amount} executed "
+                          f"(logging actual)", file=sys.stderr)
+                actual = moved
         px = token_price(symbol)
-        usd = round(amount * px, 8) if px else None
+        usd = round(actual * px, 8) if px else None
         rec = _flowledger.make_record(
             ts=int(time.time()), ftype="withdraw", asset=symbol,
-            token_amount=amount, usd_value=usd,
+            token_amount=actual, usd_value=usd,
             tx=receipt["transactionHash"].hex(), block=receipt["blockNumber"],
             source="live-withdraw",
         )

@@ -90,6 +90,66 @@ def append_flow(chain: str, account: str, record: dict, ledger_dir=None) -> bool
         return False
 
 
+# ERC20 Transfer(address,address,uint256) event topic (keccak of the signature).
+# Hardcoded so this module stays web3-free (it only does JSONL IO otherwise).
+_ERC20_TRANSFER_TOPIC = (
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+)
+
+
+def _to_hex(v) -> str:
+    """Normalise a web3 HexBytes / bytes / str to a 0x-prefixed lowercase hex string."""
+    h = v.hex() if hasattr(v, "hex") else str(v)
+    h = h.lower()
+    return h if h.startswith("0x") else "0x" + h
+
+
+def _norm_addr(v) -> str:
+    """Last-20-bytes address as 0x-prefixed lowercase (handles 32-byte padded topics
+    and 20-byte log addresses alike)."""
+    return "0x" + _to_hex(v)[2:][-40:]
+
+
+def transferred_amount(receipt, token_addr: str, from_addr: str, to_addr: str,
+                       decimals: int):
+    """Real ERC20 amount moved `from_addr` -> `to_addr` in `token_addr` within this
+    receipt, in human units (raw / 10**decimals). Sums all matching Transfer logs.
+
+    Returns None when the receipt carries NO matching Transfer log at all — the caller
+    then falls back to the requested amount (can't determine the truth). A matching
+    Transfer of value 0 returns 0.0 (the fund pulled nothing), NOT None.
+
+    This is the truth source for a fund flow: `fund(asset, amount)` can pull LESS than
+    `amount` when the wallet's balance/allowance is short — e.g. a leverage-open where
+    most of the position is borrowed, so the EOA only holds dust. Logging the requested
+    arg then over-counts contribution and corrupts every downstream PnL/ROI/APR. Parsing
+    the actual on-chain Transfer fixes that at the source.
+    """
+    try:
+        token = _norm_addr(token_addr)
+        frm = _norm_addr(from_addr)
+        to = _norm_addr(to_addr)
+        total_raw = 0
+        found = False
+        for log in receipt["logs"]:
+            if _norm_addr(log["address"]) != token:
+                continue
+            topics = log["topics"]
+            if len(topics) != 3 or _to_hex(topics[0]) != _ERC20_TRANSFER_TOPIC:
+                continue
+            if _norm_addr(topics[1]) != frm or _norm_addr(topics[2]) != to:
+                continue
+            total_raw += int(_to_hex(log["data"]), 16)
+            found = True
+        if not found:
+            return None
+        return total_raw / (10 ** decimals)
+    except Exception as e:  # noqa: BLE001 — never break the caller over a parse error
+        print(f"  WARN flowledger: transfer parse failed ({type(e).__name__}: {e})",
+              file=sys.stderr)
+        return None
+
+
 def make_record(*, ts: int, ftype: str, asset: str, token_amount: float,
                 usd_value, tx: str, block: int, source: str) -> dict:
     """Build a ledger record with exactly the keys pnl_backfill writes (minus the
