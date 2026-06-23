@@ -4247,15 +4247,17 @@ def _aero_use_all_available(
         print(f"  Error reading pool slot0: {e}")
         return False
 
-    # 4. Filter inventory > $5; fallback for pool tokens
+    # 4. Build the deploy set. Non-pool assets need a RedStone price >= $5 to be
+    # worth sweeping in. The pool's OWN two tokens always count if held — they go
+    # straight into the LP, priced by the pool tick, not RedStone. Without this, a
+    # pool token with no RedStone feed (e.g. ZORA, priced via BaseOracle TWAP) reads
+    # usd=0 and was silently dropped whenever the OTHER leg (USDC) was priced, so the
+    # held balance never got deployed. (Paraklaudios fix 2026-06-23.)
     valuable = {sym: bal for sym, (bal, dec, usd) in inventory.items()
                 if usd >= MIN_USD_VALUE}
-    if not valuable:
-        print("  No assets have RedStone prices above $5. Falling back to raw pool-token balances.")
-        for sym in (sym0, sym1):
-            if sym in inventory:
-                bal, dec, _ = inventory[sym]
-                valuable[sym] = bal
+    for sym in (sym0, sym1):
+        if sym in inventory and sym not in valuable:
+            valuable[sym] = inventory[sym][0]
     if not valuable:
         print("  No available assets to deploy.")
         return False
@@ -4395,8 +4397,12 @@ def _aero_use_all_available(
             ok = _swap_with_usdc_fallback(account, sym, dest_sym, amount_human,
                                           slippage_pct, execute=True)
             if not ok:
-                print(f"  Swap {sym} -> {dest_sym} failed (direct + USDC 2-hop). Aborting.")
-                return False
+                print(f"  Swap {sym} -> {dest_sym} failed (direct + USDC 2-hop). "
+                      f"Skipping — minting with current pool-token balances.")
+                # Don't abort just because a small sweep fails. The pool tokens
+                # (ZORA/USDC etc.) are still in the account and the mint can
+                # proceed without converting this non-pool asset. The leftover
+                # will be swept on the next tick.
 
     return (total0_wei, total1_wei, tick_lower, tick_upper, pool_tick)
 
@@ -4594,7 +4600,7 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
     )
     if not plan:
         print("  Swap execution finished but post-swap plan is empty. Aborting mint.")
-        return
+        sys.exit(2)
     total0_wei, total1_wei, tick_lower, tick_upper, pool_tick = plan
 
     # ── Precision balance sweep ──────────────────────────────────
@@ -4787,6 +4793,10 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
     }
     receipt = _sign_and_send(w3, acct, tx, "Add liquidity", timeout=300, fallback_gas=5000000)
     ok = receipt["status"] == 1
+    if not ok:
+        print("  ABORT: mint transaction reverted.")
+        sys.exit(2)
+    print("  ✓ Mint confirmed.")
 
 
 def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float = 1.0,
