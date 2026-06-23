@@ -910,7 +910,7 @@ def run_tick(
                 for s in supply_rows:
                     sym = s.get("symbol", "")
                     usd_val = s.get("usd", 0) or 0
-                    raw_amt = s.get("amount", s.get("balance", 0)) or 0
+                    raw_amt = float(s.get("amount", s.get("balance", 0)) or 0)
                     if sym.upper() == "USDC" or usd_val < 1 or raw_amt <= 0:
                         continue
                     swap_candidates.append((sym, usd_val, raw_amt))
@@ -1053,7 +1053,7 @@ def run_tick(
                         for s in supply_rows2:
                             sym = s.get("symbol", "")
                             usd_val = s.get("usd", 0) or 0
-                            raw_amt = s.get("amount", s.get("balance", 0)) or 0
+                            raw_amt = float(s.get("amount", s.get("balance", 0)) or 0)
                             if sym.upper() == "USDC" or usd_val < 1 or raw_amt <= 0:
                                 continue
                             swap_candidates2.append((sym, usd_val, raw_amt))

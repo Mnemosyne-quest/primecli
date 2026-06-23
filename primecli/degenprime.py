@@ -3138,7 +3138,17 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
     """Swap one in-account asset for another via the Degen Account on ParaSwap v6.
     Sells the account's in-account balance of --from for --to. Carries remainsSolvent,
     so the --execute path appends a RedStone signed-price payload to the calldata."""
-    from_sym, to_sym = from_sym.upper(), to_sym.upper()
+    # Canonicalize to the exact SWAP_ASSETS form (case-insensitive), matching swap-debt.
+    # Without this, a mixed-case pool symbol like cbBTC (passed as 'CBBTC'/'cbbtc') fails
+    # _swap_asset_meta even though it's valid. Unknown assets fall through uppercased so
+    # the "Unknown asset" errors below still fire clearly.
+    def _canon_swap_sym(s):
+        s_up = str(s).upper()
+        for _k in SWAP_ASSETS:
+            if _k.upper() == s_up:
+                return _k
+        return s_up
+    from_sym, to_sym = _canon_swap_sym(from_sym), _canon_swap_sym(to_sym)
     if from_sym == to_sym:
         print("--from and --to must differ.")
         return
