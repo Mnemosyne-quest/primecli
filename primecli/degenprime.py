@@ -1941,6 +1941,14 @@ def cmd_create_account(execute: bool = False, fund_pool: str = None, fund_amount
             time.sleep(2)
         if pa:
             print(f"  Degen Account: {pa}")
+            if funding:
+                # Seed deposit: createAndFundLoan does transferFrom(EOA, factory, amount)
+                # — the FULL amount or it reverts (can't be partial), so the requested
+                # amount is exact. Log it live so the PnL basis is captured without a
+                # later rescan. token_addr left None (the ERC20 Transfer routes
+                # EOA->factory->account, not directly EOA->account), so the exact
+                # requested amount is logged; the backfill dedupes on (tx, asset, type).
+                _log_fund_flow(pa, symbol, fund_amount, receipt)
         else:
             print("  Degen Account: created - getLoansForOwner not propagated yet, run 'my-positions' shortly.")
 

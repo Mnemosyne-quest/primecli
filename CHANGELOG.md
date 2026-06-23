@@ -4,6 +4,19 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.10.3] - 2026-06-23
+
+### Fixed
+- **create-and-fund never logged a live deposit flow.** `cmd_create_account` with funding
+  broadcasts `createAndFundLoan(asset, amount)` — the path that seeds a fresh position — but
+  only the standalone `fund` command appended to the flow ledger. A position opened via
+  create-and-fund therefore recorded no going-forward contribution until someone ran a manual
+  `pnl_backfill`, defeating the "no rescan needed" point of the live ledger. All three protocol
+  CLIs now append the seed deposit post-receipt. The factory pulls the full amount via
+  `transferFrom` (or reverts — it can't be partial), so the requested amount is exact here; the
+  backfill still dedupes on `(tx, asset, type)`, so there's no double-count. Found by the
+  post-fix audit of the 0.10.2 flow-logging change.
+
 ## [0.10.2] - 2026-06-23
 
 ### Fixed
