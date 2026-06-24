@@ -4,6 +4,24 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.10.4] - 2026-06-24
+
+### Fixed
+- **degenprime swap / swap-debt now re-quote ParaSwap on transient `SwapFailed()` reverts.**
+  Velora's `/prices` is non-deterministic per call and sometimes returns a route whose executor
+  is whitelisted-but-dead through the DegenPrime ParaSwapFacet, or an RFQ/maker leg that won't
+  fill for a contract caller — both revert with `SwapFailed()` (selector `0x81ceff30`), tripping
+  `degenprime swap`, `swap-debt`, and the autofarm converges that drive them. A fresh quote
+  usually returns a clean route. The old path gave up after one bad route and patched in a dead
+  legacy fallback executor, which only ever produced `InvalidExecutor()`. The fix, additive and
+  happy-path-neutral: `PARASWAP_EXECUTORS` is pruned to the single on-chain-verified-good v6.2
+  executor (`0x8faa0000…`; the other six all hard-revert — `SwapFailed()` or `InvalidExecutor()`)
+  and the useless `_PARASWAP_FALLBACK_EXECUTOR` is removed; a new `_paraswap_requote_until_clean`
+  re-quotes up to 5× and takes the first route that simulates clean for the caller's facet method
+  (`cmd_swap` and `cmd_swap_debt` both use it — a clean first quote behaves exactly as before);
+  and `_paraswap_price_route` now passes `excludeDEXS` to drop the RFQ/maker sources up front.
+  degenprime-only — the cross-file identity guard does not pin the ParaSwap path.
+
 ## [0.10.3] - 2026-06-23
 
 ### Fixed

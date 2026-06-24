@@ -397,17 +397,15 @@ AERODROME_POOLS = {
 PARASWAP_API = "https://apiv5.paraswap.io"
 PARASWAP_AUGUSTUS = "0x6A000F20005980200259B80c5102003040001068"
 PARASWAP_SUPPORTED_SELECTORS = {"0xe3ead59e", "0x876a02f6"}
-# Executors the facet whitelists. Lowercased. Starting set mirrors DeltaPrime's - the
-# v6 router is shared, so the same executors are plausible candidates. Real txs will
-# reveal missing ones with InvalidExecutor reverts; add as they show up.
+# Executors the facet actually accepts on Base, lowercased. Pruned 2026-06-24 after
+# on-chain verification: only the v6.2 API executor below works through the DegenPrime
+# ParaSwapFacet. The others Velora rotates into quotes hard-revert: 0x6a000f20 (Augustus)
+# and 0x6f053800 (Velora v1) -> SwapFailed(); 0x000010036c, 0x00c600b3, 0xa0f408a0,
+# 0xdef171fe -> InvalidExecutor(). So a route built around any of them is dead - the fix
+# is to re-quote (Velora returns a different route each call) rather than patch the
+# executor word. See _paraswap_requote_until_clean.
 PARASWAP_EXECUTORS = {
-    "0xdef171fe48cf0115b1d80b88dc8eab59176fee57",
-    "0x6a000f20005980200259b80c5102003040001068",
-    "0x000010036c0190e009a000d0fc3541100a07380a",
-    "0x00c600b30fb0400701010f4b080409018b9006e0",
-    "0xa0f408a000017007015e0f00320e470d00090a5b",
-    "0x8faa0000c10015610005ca010ee000d006e0e820",
-    "0x6f0538001f90d0a5f0000060d01d34c002030900",  # Velora v1
+    "0x8faa0000c10015610005ca010ee000d006e0e820",  # v6.2 swapExactAmountIn / UniV3 executor
 }
 
 # RedStone on-demand oracle config for DegenPrime on Base. Verified identical to
@@ -3078,13 +3076,17 @@ def _paraswap_price_route(src_token, src_dec, dest_token, dest_dec, amount_in_we
     """ParaSwap /prices on Base (network=8453, v6.2). Returns the priceRoute dict for a
     SELL of amount_in_wei src->dest. The priceRoute is passed verbatim to /transactions.
     excludeContractMethods is hard-coded to keep ParaSwap from picking a router method
-    the facet can't decode (multiSwap/megaSwap/protected* etc.)."""
+    the facet can't decode (multiSwap/megaSwap/protected* etc.). excludeDEXS drops the
+    RFQ/maker sources (AugustusRFQ, Hashflow, etc.) up front: those won't fill for a
+    contract caller and are the prime SwapFailed() culprits - cutting them at the quote
+    keeps the re-quote loop from churning through routes that can never simulate clean."""
     params = {
         "srcToken": src_token, "srcDecimals": src_dec,
         "destToken": dest_token, "destDecimals": dest_dec,
         "amount": str(amount_in_wei), "side": "SELL",
         "network": CHAIN_ID, "version": "6.2", "userAddress": user_addr,
         "excludeContractMethods": "multiSwap,megaSwap,protectedMultiSwap,protectedMegaSwap,protectedSimpleSwap,simpleSwap,swapExactAmountInOnCurveV1",
+        "excludeDEXS": "AugustusRFQ,ParaSwapLimitOrders,Hashflow,Bebop,Swaap,SwaapV2,DexalotRFQ,NativeV1,Clipper,Metric,MetricRFQ",
     }
     r = requests.get(f"{PARASWAP_API}/prices", params=params,
                      headers={"Accept": "application/json"}, timeout=20)
@@ -3157,10 +3159,52 @@ def _paraswap_decode_and_check(selector_hex, data_bytes, src_token, dest_token, 
     # UniV3 variant: selector + length sanity only.
     return None, src_token, dest_token, expected_from, None
 
-# Executor fallback - mirrors DeltaPrime's swap-debt path. If the ParaSwap API returns a
-# new executor not on the whitelist, patch in this one (the canonical legacy executor
-# whose calldata format is compatible with the current API output).
-_PARASWAP_FALLBACK_EXECUTOR = "0x000010036C0190E009a000d0fc3541100A07380A"
+# How many times to re-quote ParaSwap when the built route's facet simulation reverts.
+# Velora's /prices is non-deterministic per call: a SwapFailed() route (dead-but-
+# whitelisted executor, or an RFQ/maker leg that excludeDEXS missed) usually clears on a
+# fresh quote. We keep re-quoting and take the FIRST route that simulates clean for a
+# known-good executor. Patching the executor word in place no longer works (every
+# alternate executor reverts - see PARASWAP_EXECUTORS), so re-quoting is the only fix.
+_PARASWAP_REQUOTE_ATTEMPTS = 5
+
+def _paraswap_requote_until_clean(src_token, src_dec, dest_token, dest_dec, amount_in_wei,
+                                  slippage_pct, pa_cs, sim_fn):
+    """Quote -> build -> decode -> simulate, re-quoting up to _PARASWAP_REQUOTE_ATTEMPTS
+    times until the facet simulation passes, and return the first clean route.
+
+    `sim_fn(selector4, data_bytes) -> (ok: bool, err: str|None)` wraps the ParaSwap
+    calldata in the caller's facet method (paraSwapV6 / swapDebtParaSwap) and eth_call's
+    it. Returns a dict with the chosen route's artifacts (price_route, full, selector_hex,
+    data_bytes, quoted_out, min_out, executor), plus sim_ok/last_err describing the final
+    attempt. On all-fail it returns the LAST attempt's artifacts with sim_ok=False so the
+    caller can still print a preview and refuse to broadcast."""
+    last = None
+    for attempt in range(1, _PARASWAP_REQUOTE_ATTEMPTS + 1):
+        price_route = _paraswap_price_route(src_token, src_dec, dest_token, dest_dec,
+                                            amount_in_wei, pa_cs)
+        quoted_out = int(price_route["destAmount"])
+        tx_built = _paraswap_build_tx(price_route, src_token, src_dec, dest_token, dest_dec,
+                                      amount_in_wei, slippage_pct, pa_cs)
+        full = bytes.fromhex(tx_built["data"][2:])
+        selector_hex, data_bytes = "0x" + full[:4].hex(), full[4:]
+        executor, _src, _dest, _from_amt, min_out = _paraswap_decode_and_check(
+            selector_hex, data_bytes, src_token, dest_token, amount_in_wei, pa_cs)
+        sim_ok, sim_err = sim_fn(full[:4], data_bytes)
+        last = {
+            "price_route": price_route, "tx_built": tx_built, "full": full,
+            "selector_hex": selector_hex, "data_bytes": data_bytes,
+            "quoted_out": quoted_out, "min_out": min_out, "executor": executor,
+            "sim_ok": sim_ok, "last_err": sim_err,
+        }
+        if sim_ok:
+            if attempt > 1:
+                print(f"  ✓ Route simulates clean on re-quote attempt {attempt}/"
+                      f"{_PARASWAP_REQUOTE_ATTEMPTS} (executor {executor}).")
+            return last
+        print(f"  ✗ Route from quote attempt {attempt}/{_PARASWAP_REQUOTE_ATTEMPTS} "
+              f"(executor {executor}) reverted in simulation: {sim_err}")
+    print(f"  ✗ All {_PARASWAP_REQUOTE_ATTEMPTS} ParaSwap quotes reverted in simulation.")
+    return last
 
 def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.0,
              execute: bool = False):
@@ -3215,46 +3259,25 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
         print("Fund or borrow more of the asset into the account first.")
         return
 
-    price_route = _paraswap_price_route(from_cfg["token"], from_cfg["decimals"],
-                                        to_cfg["token"], to_cfg["decimals"], amount_in, pa_cs)
-    quoted_out = int(price_route["destAmount"])
-    tx_built = _paraswap_build_tx(price_route, from_cfg["token"], from_cfg["decimals"],
-                                  to_cfg["token"], to_cfg["decimals"], amount_in,
-                                  slippage_pct, pa_cs)
-    full = bytes.fromhex(tx_built["data"][2:])
-    selector_hex, data_bytes = "0x" + full[:4].hex(), full[4:]
-    _exec, _src, _dest, _from_amt, min_out = _paraswap_decode_and_check(
-        selector_hex, data_bytes, from_cfg["token"], to_cfg["token"], amount_in, pa_cs)
-    # Simulate-first executor handling (see cmd_swap_debt rationale): keep the API
-    # executor when the exact tx simulates clean; only fall back to the legacy
-    # executor if the unpatched calldata reverts.
+    # Simulate-first with a re-quote loop: Velora rotates executors/routes per quote, so
+    # a SwapFailed() route usually clears on a fresh quote. Keep re-quoting and take the
+    # first route that simulates clean (see _paraswap_requote_until_clean).
     feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
     payload = build_redstone_payload(feeds)
-    def _sim_paraswap(db):
-        base = account.encode_abi("paraSwapV6", args=[full[:4], db])
+    def _sim_paraswap(selector4, db):
+        base = account.encode_abi("paraSwapV6", args=[selector4, db])
         try:
             w3.eth.call({"from": acct.address, "to": pa_cs,
                          "data": base + payload.hex(), "gas": 8000000})
             return True, None
         except Exception as e:
             return False, str(e)
-    sim_ok, sim_err = _sim_paraswap(data_bytes)
-    if sim_ok:
-        if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
-            print(f"  ✓ Executor {_exec} not in the static whitelist, but the full tx "
-                  f"simulates clean — using the API calldata as-is.")
-    else:
-        print(f"  ✗ Simulation with API executor {_exec} reverted: {sim_err}")
-        patched = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:]) + data_bytes[32:]
-        sim_ok, err2 = _sim_paraswap(patched)
-        if sim_ok:
-            print(f"  ⚠ Falling back to legacy executor {_PARASWAP_FALLBACK_EXECUTOR} "
-                  f"(simulates clean).")
-            data_bytes = patched
-            _paraswap_decode_and_check(selector_hex, data_bytes, from_cfg["token"],
-                                       to_cfg["token"], amount_in, pa_cs)
-        else:
-            print(f"  ✗ Legacy-executor fallback also reverted: {err2}")
+    route = _paraswap_requote_until_clean(
+        from_cfg["token"], from_cfg["decimals"], to_cfg["token"], to_cfg["decimals"],
+        amount_in, slippage_pct, pa_cs, _sim_paraswap)
+    price_route, tx_built, full = route["price_route"], route["tx_built"], route["full"]
+    selector_hex, data_bytes = route["selector_hex"], route["data_bytes"]
+    quoted_out, min_out, sim_ok = route["quoted_out"], route["min_out"], route["sim_ok"]
 
     print(f"Swap {amount} {from_asset_sym} -> {to_asset_sym} on Degen Account {pa_cs}  (via ParaSwap/Velora)")
     print(f"  Router method: {price_route['contractMethod']} ({selector_hex})")
@@ -3270,7 +3293,8 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
         return
 
     if not sim_ok:
-        print("✗ Refusing to broadcast: simulation reverted for both executor variants.")
+        print(f"✗ Refusing to broadcast: every ParaSwap quote reverted in simulation "
+              f"({_PARASWAP_REQUOTE_ATTEMPTS} attempts). Try again shortly.")
         return
 
     # Rebuild the payload fresh for broadcast (the sim payload may be near the
@@ -3373,46 +3397,25 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     borrow_usd = price_to * borrow_amount / 10**to_cfg["decimals"] / 1e18
     diff_bps = (abs(repay_usd - borrow_usd) / max(repay_usd, borrow_usd)) * 10000 if max(repay_usd, borrow_usd) else 0
 
-    price_route = _paraswap_price_route(to_cfg["token"], to_cfg["decimals"],
-                                        from_cfg["token"], from_cfg["decimals"], borrow_amount, pa_cs)
-    quoted_out = int(price_route["destAmount"])
-    tx_built = _paraswap_build_tx(price_route, to_cfg["token"], to_cfg["decimals"],
-                                  from_cfg["token"], from_cfg["decimals"], borrow_amount,
-                                  slippage_pct, pa_cs)
-    full = bytes.fromhex(tx_built["data"][2:])
-    selector_hex, data_bytes = "0x" + full[:4].hex(), full[4:]
-    _exec, _src, _dest, _swap_from_amt, swap_min_out = _paraswap_decode_and_check(
-        selector_hex, data_bytes, to_cfg["token"], from_cfg["token"], borrow_amount, pa_cs)
-    # Simulate-first executor handling (protocol-level facet fix confirmed 2026-06-04;
-    # Velora rotates executors per quote): keep the API executor when the exact tx
-    # simulates clean; only fall back to the legacy executor if it reverts.
-    def _sim_swap_debt(db):
+    # Simulate-first with a re-quote loop (Velora rotates executors/routes per quote, and
+    # an RFQ/maker leg won't fill for a contract caller): re-quote until the swapDebt tx
+    # simulates clean, taking the first good route (see _paraswap_requote_until_clean).
+    def _sim_swap_debt(selector4, db):
         base = account.encode_abi("swapDebtParaSwap", args=[
             asset_b32(from_sym), asset_b32(to_sym), repay_amount, borrow_amount,
-            full[:4], db])
+            selector4, db])
         try:
             w3.eth.call({"from": acct.address, "to": pa_cs,
                          "data": base + payload.hex(), "gas": 8000000})
             return True, None
         except Exception as e:
             return False, str(e)
-    sim_ok, sim_err = _sim_swap_debt(data_bytes)
-    if sim_ok:
-        if _exec is not None and _exec.lower() not in PARASWAP_EXECUTORS:
-            print(f"  ✓ Executor {_exec} not in the static whitelist, but the full tx "
-                  f"simulates clean — using the API calldata as-is.")
-    else:
-        print(f"  ✗ Simulation with API executor {_exec} reverted: {sim_err}")
-        patched = bytes(12) + bytes.fromhex(_PARASWAP_FALLBACK_EXECUTOR[2:]) + data_bytes[32:]
-        sim_ok, err2 = _sim_swap_debt(patched)
-        if sim_ok:
-            print(f"  ⚠ Falling back to legacy executor {_PARASWAP_FALLBACK_EXECUTOR} "
-                  f"(simulates clean).")
-            data_bytes = patched
-            _paraswap_decode_and_check(selector_hex, data_bytes, to_cfg["token"],
-                                       from_cfg["token"], borrow_amount, pa_cs)
-        else:
-            print(f"  ✗ Legacy-executor fallback also reverted: {err2}")
+    route = _paraswap_requote_until_clean(
+        to_cfg["token"], to_cfg["decimals"], from_cfg["token"], from_cfg["decimals"],
+        borrow_amount, slippage_pct, pa_cs, _sim_swap_debt)
+    price_route, tx_built, full = route["price_route"], route["tx_built"], route["full"]
+    selector_hex, data_bytes = route["selector_hex"], route["data_bytes"]
+    quoted_out, swap_min_out, sim_ok = route["quoted_out"], route["min_out"], route["sim_ok"]
 
     print(f"Swap debt on Degen Account {pa}")
     print(f"  Refinance: {from_sym} debt -> {to_sym} debt")
@@ -3441,7 +3444,8 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         return
 
     if not sim_ok:
-        print("✗ Refusing to broadcast: simulation reverted for both executor variants.")
+        print(f"✗ Refusing to broadcast: every ParaSwap quote reverted in simulation "
+              f"({_PARASWAP_REQUOTE_ATTEMPTS} attempts). Try again shortly.")
         return
 
     base_calldata = account.encode_abi("swapDebtParaSwap", args=[
