@@ -395,6 +395,154 @@ def _gather_supply_rows(defi_data: dict) -> list:
     return rows
 
 
+def _gather_borrow_rows(defi_data: dict) -> list:
+    """Extract flat list of borrowed rows from defi data, covering both flat-borrowed and grouped."""
+    rows = []
+    groups = defi_data.get("groups", [])
+    if groups:
+        for g in groups:
+            rows.extend(g.get("borrowed", []))
+    else:
+        rows.extend(defi_data.get("borrowed", []))
+    return rows
+
+
+def _token_amount(row: dict) -> float:
+    """Best-effort token amount for a supplied/borrowed row.
+
+    In this tool's trimmed `defi --json`, the token amount lands in the `balance`
+    field (a STRING like "0.123456") while `amount` is often null/absent. Some
+    shapes carry a float `amount` instead, and synthetic LP rows carry a non-numeric
+    `balance` like "$1,234.00 (estimated ...)". Prefer a clean numeric `balance`,
+    fall back to a numeric `amount`, else 0.0 (never raises)."""
+    bal = row.get("balance")
+    if bal is not None:
+        try:
+            return float(bal)
+        except (TypeError, ValueError):
+            pass  # non-numeric (e.g. synthetic "$... (estimated)") — fall through
+    amt = row.get("amount")
+    if amt is not None:
+        try:
+            return float(amt)
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+# Lending-pool name for a supplied/borrowed asset symbol. The contracts label
+# wrapped-native as "ETH"/"WETH" but the repay/borrow pool is `weth`; everything
+# else lowercases to its pool name. Returns None for symbols that aren't a
+# borrowable pool (so we never try to repay a non-pool leg).
+_SYMBOL_TO_POOL = {
+    "ETH": "weth", "WETH": "weth", "WAVAX": "wavax", "AVAX": "wavax",
+    "USDC": "usdc", "CBBTC": "cbbtc", "WBTC": "wbtc", "BTCB": "btcb",
+    "AERO": "aero", "ARB": "arb", "BRETT": "brett", "KAITO": "kaito",
+    "CBDOGE": "cbdoge", "CBXRP": "cbxrp", "VIRTUAL": "virtual",
+}
+
+
+def _symbol_to_pool(symbol: str) -> str | None:
+    """Map an asset symbol to its lowercase lending-pool name, or None if not a pool."""
+    if not symbol:
+        return None
+    return _SYMBOL_TO_POOL.get(symbol.upper(), symbol.lower())
+
+
+def _plan_token_repays(
+    freed_rows: list,
+    borrowed_rows: list,
+    remaining_repay_usd: float,
+    usdc_symbol: str = "USDC",
+) -> tuple[list, float, float]:
+    """Pass-1 allocation: repay debt legs directly with matching freed tokens (NO swap).
+
+    Pure / side-effect-free so it can be unit-tested. For each borrowed leg whose
+    asset is also a freed supplied token, plan a direct repay of
+        min(freed_token_balance, outstanding_leg_token_balance, repay_need_in_that_asset)
+    in TOKEN units. Repaying a debt leg with that exact asset can never strand the
+    position (no price exposure), so we do it first and unconditionally.
+
+    Args:
+        freed_rows: supplied rows now holding the freed LP legs (symbol/balance/usd).
+        borrowed_rows: outstanding debt rows (symbol/balance/usd).
+        remaining_repay_usd: total USD of debt we still want to retire this tick.
+        usdc_symbol: stable symbol (repaid in pass 2 via swap, not here unless freed).
+
+    Returns:
+        (repays, remaining_after_usd, usdc_shortfall_usd) where
+          repays = [{"pool": str, "symbol": str, "amount": float, "usd": float}, ...]
+          remaining_after_usd = repay need still outstanding after pass-1 (USD)
+          usdc_shortfall_usd  = portion of that remainder owed on the USDC pool (drives the pass-2 swap)
+    """
+    # Index freed token balances by uppercased symbol.
+    freed_by_sym: dict[str, dict] = {}
+    for r in freed_rows:
+        sym = str(r.get("symbol", "")).upper()
+        if not sym:
+            continue
+        amt = _token_amount(r)
+        usd = r.get("usd", 0) or 0
+        if amt <= 0 or usd <= 0:
+            continue
+        # Per-token USD price for converting a USD repay-need into token units.
+        price = (usd / amt) if amt > 0 else 0.0
+        prev = freed_by_sym.get(sym)
+        if prev:
+            prev["amount"] += amt
+            prev["usd"] += usd
+            prev["price"] = (prev["usd"] / prev["amount"]) if prev["amount"] > 0 else price
+        else:
+            freed_by_sym[sym] = {"amount": amt, "usd": usd, "price": price}
+
+    repays: list = []
+    remaining = max(0.0, remaining_repay_usd)
+    usdc_shortfall = 0.0
+
+    for b in borrowed_rows:
+        if remaining < 1.0:
+            break
+        sym = str(b.get("symbol", "")).upper()
+        pool = _symbol_to_pool(sym)
+        if not pool:
+            continue
+        leg_usd = b.get("usd", 0) or 0
+        leg_tok = _token_amount(b)
+        if leg_usd <= 0 or leg_tok <= 0:
+            continue
+        freed = freed_by_sym.get(sym)
+        if not freed or freed["amount"] <= 0:
+            # No matching freed token — if this is USDC debt, it feeds the pass-2 swap.
+            if sym == usdc_symbol.upper():
+                usdc_shortfall += min(leg_usd, remaining)
+            continue
+        price = freed["price"] or (leg_usd / leg_tok if leg_tok > 0 else 0.0)
+        if price <= 0:
+            continue
+        # How many tokens does the remaining USD repay-need correspond to for this asset?
+        need_tok = remaining / price
+        repay_tok = min(freed["amount"], leg_tok, need_tok)
+        if repay_tok <= 0:
+            continue
+        repay_usd = repay_tok * price
+        if repay_usd < 0.50:
+            continue
+        repays.append({
+            "pool": pool, "symbol": sym,
+            "amount": round(repay_tok, 8), "usd": round(repay_usd, 2),
+        })
+        # Consume freed balance and shrink the remaining need.
+        freed["amount"] -= repay_tok
+        freed["usd"] = max(0.0, freed["usd"] - repay_usd)
+        remaining = max(0.0, remaining - repay_usd)
+        # If this leg was USDC, any still-unmet USDC remainder is a pass-2 swap target.
+        if sym == usdc_symbol.upper():
+            leftover_leg = leg_usd - repay_usd
+            if leftover_leg > 0:
+                usdc_shortfall += min(leftover_leg, remaining)
+
+    return repays, round(remaining, 2), round(usdc_shortfall, 2)
+
 
 def _delever_lp_positions(
     defi_data: dict,
@@ -403,6 +551,7 @@ def _delever_lp_positions(
     strategy: dict,
     state_dir: str,
     label: str,
+    dry_run: bool = False,
 ) -> dict:
     """Close LP positions to free assets for USDC debt repayment.
 
@@ -411,6 +560,11 @@ def _delever_lp_positions(
       - GMX V2 GM/GM+ (deltaprime): partial `gmx-withdraw`, freeing the shortfall value
       - Aerodrome CL (degenprime): full `aero-remove-liquidity` per NFT
       - TraderJoe LB (deltaprime): full `lb-remove` per pair
+
+    When dry_run=True this is 100% read-only: it broadcasts NOTHING (no `--execute`
+    subprocess of any kind) and instead returns an estimate of what it WOULD free,
+    e.g. {"ok": True, "dry_run": True, "freed": 123.45,
+          "detail": "would close Aerodrome tokenId 7 (~$123.45)"}.
 
     Returns a dict:
       {"ok": True, "freed": 123.45, "detail": "closed GMX avax-usdc"}  on success
@@ -443,6 +597,11 @@ def _delever_lp_positions(
                 gm_to_withdraw = min(gm_bal_float, need_ratio * gm_bal_float)
                 if gm_to_withdraw < 0.001:
                     continue
+
+                if dry_run:
+                    est = item_usd * (gm_to_withdraw / gm_bal_float) if gm_bal_float > 0 else 0.0
+                    detail = f"would withdraw {gm_to_withdraw:.4f} GM from {market_label} (~${est:.2f}, keeper-async)"
+                    return {"ok": True, "dry_run": True, "async": True, "freed": round(est, 2), "detail": detail}
 
                 # GMX withdraw is ASYNC (keeper-executed). Assets don't arrive
                 # on this tick. Record a pending marker and return async=True
@@ -491,6 +650,10 @@ def _delever_lp_positions(
                 if token_id is None:
                     continue
 
+                if dry_run:
+                    detail = f"would close Aerodrome tokenId {token_id} (~${item_usd:.2f})"
+                    return {"ok": True, "dry_run": True, "freed": round(item_usd, 2), "detail": detail}
+
                 try:
                     r = subprocess.run(
                         [sys.executable, tool_path, "aero-remove-liquidity",
@@ -538,6 +701,12 @@ def _delever_lp_positions(
                         pairs.add(guess)
 
             for pair in pairs:
+                if dry_run:
+                    # LB items don't carry a reliable per-pair usd; sum the group.
+                    grp_usd = sum((it.get("usd", 0) or 0) for it in items)
+                    detail = f"would close LB {pair} (~${grp_usd:.2f})"
+                    return {"ok": True, "dry_run": True, "freed": round(grp_usd, 2), "detail": detail}
+
                 try:
                     r = subprocess.run(
                         [sys.executable, tool_path, "lb-remove",
@@ -930,6 +1099,14 @@ def run_tick(
                     swap_source = swap_candidates[0][0]
                     swap_amt_usd = min(swap_candidates[0][1] * 0.95, need_usd)
 
+                if swap_source and swap_amt_usd >= 0.50 and dry_run:
+                    # Dry-run must broadcast NOTHING — report the swap+repay it WOULD do.
+                    result["action"] = (
+                        f"would swap ${swap_amt_usd:.2f} {swap_source} -> USDC, "
+                        f"then repay ${repay_amt:.2f} USDC"
+                    )
+                    return result
+
                 if swap_source and swap_amt_usd >= 0.50:
                     try:
                         sr = subprocess.run(
@@ -954,117 +1131,148 @@ def run_tick(
                         result["error"] = f"swap error: {e}"
                         return result
                 else:
-                    # No swappable raw assets — try closing LP positions
+                    # No swappable raw assets — try closing LP positions.
                     lp_shortfall = repay_amt - raw_usdc
                     lp_result = _delever_lp_positions(
                         defi_data, tool_path, lp_shortfall,
                         strategy, state_dir, label,
+                        dry_run=dry_run,
                     )
+                    # DRY-RUN: _delever_lp_positions broadcast NOTHING. Report what it
+                    # WOULD have closed/repaid and stop — never touch the chain.
+                    if dry_run:
+                        if lp_result.get("ok"):
+                            result["lp_close"] = lp_result.get("detail", "")
+                            result["lp_freed"] = lp_result.get("freed", 0.0)
+                            result["action"] = (
+                                f"would close LP + repay up to ${repay_amt:.2f} "
+                                f"({lp_result.get('detail', '')})"
+                            )
+                        else:
+                            result["action"] = (
+                                f"would escalate: no swappable assets and no LP to close "
+                                f"({lp_result.get('detail', '')})"
+                            )
+                        return result
+
                     if lp_result.get("ok"):
                         result["lp_close"] = lp_result["detail"]
                         result["lp_freed"] = lp_result.get("freed", 0.0)
-                        # GMX withdraw is ASYNC (keeper pending)
+                        # GMX withdraw is ASYNC (keeper pending) — assets aren't here yet.
                         if lp_result.get("async"):
                             result["action"] = f"delever ({lp_result['detail']})"
                             return result
+
                         # LP closed synchronously (Aerodrome/LB). The LP is now gone but the
-                        # debt is still outstanding. Repay the freed USDC IMMEDIATELY (partial
-                        # is fine — it's health-positive) BEFORE touching the volatile asset, so
-                        # a failed swap can't strand the position LP-closed + fully indebted +
-                        # exposed to a volatile asset. Only swap+repay the shortfall afterwards.
+                        # debt is still outstanding. A VIRTUAL/ETH or AERO/cbBTC LP frees the
+                        # VOLATILE legs (ETH, VIRTUAL, cbBTC, AERO), NOT USDC — so we de-lever
+                        # using ALL freed tokens, safest-first:
+                        #   Pass 1 — repay each debt leg with its own freed asset (NO swap, can't
+                        #            strand: repaying USDC-debt with USDC, ETH-debt with ETH, etc.).
+                        #   Pass 2 — swap the largest remaining freed volatile token -> USDC and
+                        #            repay the USDC shortfall (the ONLY swap, run AFTER debt is
+                        #            already partially reduced, so a swap failure isn't catastrophic).
                         try:
                             raw2 = subprocess.run(
                                 [sys.executable, tool_path, "defi", "--json"],
                                 capture_output=True, text=True, timeout=90,
                             )
                             if raw2.returncode == 0:
-                                defi2 = json.loads(raw2.stdout)
-                                defi_data = defi2
-                                raw_usdc = sum(
-                                    (s.get("usd", 0) or 0) if s.get("symbol", "").upper() == "USDC" else 0
-                                    for s in _gather_supply_rows(defi2)
-                                )
+                                defi_data = json.loads(raw2.stdout)
                         except Exception as e:
                             result["lp_swap_error"] = str(e)
 
-                        # If the LP close freed no usable USDC, the debt remains and there is
-                        # nothing to repay yet — escalate LOUDLY (LP gone, still indebted).
-                        if raw_usdc < 0.50:
+                        freed_rows = _gather_supply_rows(defi_data)
+                        borrowed_rows = _gather_borrow_rows(defi_data)
+                        total_debt_after = sum((b.get("usd", 0) or 0) for b in borrowed_rows)
+                        repay_target = min(repay_amt, total_debt_after)
+
+                        # ── Pass 1: direct token-matched repays (no swap) ───────────
+                        repay_plan, remaining_after, usdc_shortfall = _plan_token_repays(
+                            freed_rows, borrowed_rows, repay_target,
+                        )
+                        repaid_usd = 0.0
+                        repaid_notes = []
+                        pass1_failures = []
+                        for rp in repay_plan:
+                            try:
+                                rr = subprocess.run(
+                                    [sys.executable, tool_path, "repay",
+                                     "--pool", rp["pool"],
+                                     "--amount", f"{rp['amount']:.8f}", "--execute"],
+                                    capture_output=True, text=True, timeout=120,
+                                )
+                                if rr.returncode == 0:
+                                    repaid_usd += rp["usd"]
+                                    repaid_notes.append(f"${rp['usd']:.2f} {rp['symbol']}")
+                                else:
+                                    pass1_failures.append(f"{rp['symbol']}: {rr.stderr[:120]}")
+                            except Exception as e:
+                                pass1_failures.append(f"{rp['symbol']}: {e}")
+
+                        if repaid_notes:
+                            result["lp_repay"] = "repaid " + " + ".join(repaid_notes) + " (direct, freed from LP)"
+                        if pass1_failures:
+                            result["repay_failures"] = "; ".join(pass1_failures)
+
+                        # If NOTHING was freed and NOTHING could be repaid, the LP is gone and
+                        # the debt remains — genuine dead-end. Escalate LOUDLY.
+                        any_freed_value = any((r.get("usd", 0) or 0) > 0.50 for r in freed_rows)
+                        if repaid_usd < 0.50 and not any_freed_value:
                             write_escalation(state_dir, "delever-debt-remains-after-lp-close", {
                                 "reason": "delever_debt_remains_after_lp_close",
-                                "repay_needed": repay_amt, "raw_usdc": raw_usdc,
+                                "repay_needed": repay_amt, "repaid_usd": round(repaid_usd, 2),
                                 "lp_freed": lp_result.get("freed", 0.0),
                                 "lp_detail": lp_result.get("detail", ""),
+                                "pass1_failures": pass1_failures,
                                 "health_pct": pct, "label": label,
                             })
                             _notify(
                                 f"🚨 {label}: de-lever LP closed but debt remains "
-                                f"(${repay_amt:.2f} to repay, only ${raw_usdc:.2f} USDC freed). "
+                                f"(${repay_amt:.2f} to repay, nothing freed/repayable). "
                                 f"Health {pct}%. Manual unwind needed."
                             )
                             result["action"] = "escalate (debt remains after LP close)"
                             return result
 
-                        # Repay whatever USDC is available now (partial ok, health-positive).
-                        first_repay = min(repay_amt, raw_usdc)
-                        if dry_run:
-                            result["action"] = f"would repay ${first_repay:.2f} USDC (freed from LP)"
-                            return result
-                        repay_err = None
-                        try:
-                            r1 = subprocess.run(
-                                [sys.executable, tool_path, "repay", "--pool", "usdc",
-                                 "--amount", f"{first_repay:.2f}", "--execute"],
-                                capture_output=True, text=True, timeout=120,
-                            )
-                            if r1.returncode != 0:
-                                repay_err = r1.stderr
-                        except Exception as e:
-                            repay_err = str(e)
-                        if repay_err is not None:
-                            write_escalation(state_dir, "delever-debt-remains-after-lp-close", {
-                                "reason": "delever_repay_failed_after_lp_close",
-                                "repay_attempted": first_repay, "raw_usdc": raw_usdc,
-                                "stderr": str(repay_err)[:200], "health_pct": pct, "label": label,
-                            })
-                            _notify(
-                                f"🚨 {label}: de-lever repay of ${first_repay:.2f} FAILED "
-                                f"after LP close — debt remains. Health {pct}%. Manual unwind needed."
-                            )
-                            result["error"] = f"post-LP repay failed: {str(repay_err)[:200]}"
-                            result["action"] = "escalate (repay failed after LP close)"
-                            return result
-
+                        # Successful real de-lever (at least partial) — record cooldown.
                         cooldown_file.write_text(str(int(time.time())))
-                        result["lp_repay"] = f"repaid ${first_repay:.2f} (freed from LP close)"
 
-                        # Shortfall remaining after the freed-USDC repay.
-                        remaining = repay_amt - first_repay
-                        if remaining < 0.50:
-                            result["action"] = f"repaid ${first_repay:.2f} (LP de-lever)"
-                            _notify(f"🔄 Rebalance: {label} closed LP + repaid ${first_repay:.2f} USDC (health was {pct}%)")
+                        # If pass-1 covered the need (or there's no USDC-pool shortfall to
+                        # swap for), we're done.
+                        if remaining_after < 1.0 or usdc_shortfall < 0.50:
+                            result["action"] = f"repaid ${repaid_usd:.2f} (LP de-lever, token-matched)"
+                            _notify(
+                                f"🔄 Rebalance: {label} closed LP + repaid ${repaid_usd:.2f} "
+                                f"(token-matched, health was {pct}%)"
+                            )
                             return result
 
-                        # Still short — swap the freed volatile asset for the shortfall, then
-                        # repay the rest. Debt is already partially reduced, so a swap failure
-                        # here is no longer catastrophic (position is no longer fully exposed).
-                        supply_rows2 = _gather_supply_rows(defi_data)
+                        # ── Pass 2: swap largest remaining freed volatile -> USDC, repay USDC ─
+                        # Debt is already partially reduced, so a swap failure here is NOT
+                        # catastrophic (the existing safety property is preserved).
                         swap_candidates2 = []
-                        for s in supply_rows2:
-                            sym = s.get("symbol", "")
+                        for s in freed_rows:
+                            sym = str(s.get("symbol", ""))
                             usd_val = s.get("usd", 0) or 0
-                            raw_amt = float(s.get("amount", s.get("balance", 0)) or 0)
+                            raw_amt = _token_amount(s)
                             if sym.upper() == "USDC" or usd_val < 1 or raw_amt <= 0:
                                 continue
                             swap_candidates2.append((sym, usd_val, raw_amt))
                         swap_candidates2.sort(key=lambda x: x[1], reverse=True)
                         if not swap_candidates2:
-                            result["action"] = f"repaid ${first_repay:.2f}; ${remaining:.2f} shortfall (no swappable asset)"
+                            result["action"] = (
+                                f"repaid ${repaid_usd:.2f}; ${usdc_shortfall:.2f} USDC shortfall "
+                                f"(no swappable freed asset)"
+                            )
                             return result
                         src2 = swap_candidates2[0][0]
-                        amt2 = min(swap_candidates2[0][1] * 0.95, remaining)
+                        amt2 = min(swap_candidates2[0][1] * 0.95, usdc_shortfall)
                         if amt2 < 0.50:
-                            result["action"] = f"repaid ${first_repay:.2f}; ${remaining:.2f} shortfall (swap too small)"
+                            result["action"] = (
+                                f"repaid ${repaid_usd:.2f}; ${usdc_shortfall:.2f} USDC shortfall "
+                                f"(swap too small)"
+                            )
                             return result
                         try:
                             sr2 = subprocess.run(
@@ -1075,14 +1283,18 @@ def run_tick(
                                 capture_output=True, text=True, timeout=180,
                             )
                         except Exception as e:
-                            result["action"] = f"repaid ${first_repay:.2f}; shortfall swap error: {e}"
+                            result["action"] = f"repaid ${repaid_usd:.2f}; shortfall swap error: {e}"
                             return result
                         if sr2.returncode != 0:
                             result["warning"] = f"shortfall swap failed: {sr2.stderr[:200]}"
-                            result["action"] = f"repaid ${first_repay:.2f}; ${remaining:.2f} shortfall (swap failed)"
+                            result["action"] = (
+                                f"repaid ${repaid_usd:.2f}; ${usdc_shortfall:.2f} USDC shortfall "
+                                f"(swap failed)"
+                            )
                             return result
                         result["swap"] = f"swapped ${amt2:.2f} {src2} -> USDC"
-                        # Re-read USDC and repay the shortfall.
+                        # Re-read USDC and repay the USDC shortfall.
+                        usdc_now = 0.0
                         try:
                             raw3 = subprocess.run(
                                 [sys.executable, tool_path, "defi", "--json"],
@@ -1090,15 +1302,19 @@ def run_tick(
                             )
                             if raw3.returncode == 0:
                                 defi3 = json.loads(raw3.stdout)
-                                raw_usdc = sum(
-                                    (s.get("usd", 0) or 0) if s.get("symbol", "").upper() == "USDC" else 0
+                                usdc_now = sum(
+                                    (s.get("usd", 0) or 0)
                                     for s in _gather_supply_rows(defi3)
+                                    if str(s.get("symbol", "")).upper() == "USDC"
                                 )
                         except Exception as e:
                             result["lp_swap_error"] = str(e)
-                        second_repay = min(remaining, raw_usdc)
+                        second_repay = min(usdc_shortfall, usdc_now)
                         if second_repay < 0.50:
-                            result["action"] = f"repaid ${first_repay:.2f}; ${remaining:.2f} shortfall (no USDC after swap)"
+                            result["action"] = (
+                                f"repaid ${repaid_usd:.2f}; ${usdc_shortfall:.2f} USDC shortfall "
+                                f"(no USDC after swap)"
+                            )
                             return result
                         try:
                             r2 = subprocess.run(
@@ -1107,14 +1323,17 @@ def run_tick(
                                 capture_output=True, text=True, timeout=120,
                             )
                             if r2.returncode == 0:
-                                total_repaid = first_repay + second_repay
+                                total_repaid = repaid_usd + second_repay
                                 result["action"] = f"repaid ${total_repaid:.2f} (LP de-lever)"
-                                _notify(f"🔄 Rebalance: {label} closed LP + repaid ${total_repaid:.2f} USDC (health was {pct}%)")
+                                _notify(
+                                    f"🔄 Rebalance: {label} closed LP + repaid ${total_repaid:.2f} "
+                                    f"(health was {pct}%)"
+                                )
                             else:
                                 result["warning"] = f"shortfall repay failed: {r2.stderr[:200]}"
-                                result["action"] = f"repaid ${first_repay:.2f}; shortfall repay failed"
+                                result["action"] = f"repaid ${repaid_usd:.2f}; shortfall repay failed"
                         except Exception as e:
-                            result["action"] = f"repaid ${first_repay:.2f}; shortfall repay error: {e}"
+                            result["action"] = f"repaid ${repaid_usd:.2f}; shortfall repay error: {e}"
                         return result
                     else:
                         write_escalation(state_dir, "repay-no-usdc", {
