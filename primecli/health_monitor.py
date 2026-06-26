@@ -179,12 +179,39 @@ def compute_health(
     reported_health = defi_data.get("health_pct")
     if reported_health is not None:
         try:
-            health_pct = float(reported_health)
-            if 0 <= health_pct < 100 and debt_usd > 0:
-                max_debt = round(debt_usd / (1.0 - health_pct / 100.0), 2)
-                delta_debt = (max_debt * 0.5) - debt_usd
+            reported_pct = float(reported_health)
         except (TypeError, ValueError):
-            pass
+            reported_pct = None
+    else:
+        reported_pct = None
+
+    # ── Sanity guard against defi computation glitches ─────────────
+    # defi --json can transiently return health_pct=0 when RedStone DC
+    # resolution hiccups (RPC 429), even though health_ratio shows the
+    # position is clearly solvent (>1.05). When the reported number is
+    # suspiciously low (<10%) but the protocol says we're safe AND our
+    # own equity-based computation says something sane, trust ourselves.
+    _local_pct = health_pct
+    if reported_pct is not None and reported_pct < 10.0 and health_ratio > 1.05 and equity > 10:
+        if _local_pct is not None and _local_pct > 15.0:
+            # Keep the locally-computed value; log the discrepancy.
+            health_pct = _local_pct
+            print(
+                f"WARN: defi reported health={reported_pct:g}% but health_ratio={health_ratio} "
+                f"and local calc gives {_local_pct:g}% — using local value "
+                f"(transient DC-resolution glitch, not actual risk)",
+                file=sys.stderr,
+            )
+        else:
+            # Local calc also looks bad — trust defi, let escalation fire.
+            # Use the lower (more conservative) value of the two.
+            health_pct = min(reported_pct, _local_pct) if _local_pct is not None else reported_pct
+    else:
+        health_pct = reported_pct if reported_pct is not None else health_pct
+
+    if health_pct is not None and 0 <= health_pct < 100 and debt_usd > 0:
+        max_debt = round(debt_usd / (1.0 - health_pct / 100.0), 2)
+        delta_debt = (max_debt * 0.5) - debt_usd
 
     return {
         "health_pct": round(health_pct, 1),
@@ -336,6 +363,26 @@ def save_last_health(state_dir: str, pct: float):
     path = Path(state_dir) / "last-health-pct"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(pct))
+
+
+def load_last_equity(state_dir: str) -> float | None:
+    """Load last recorded equity (USD), used to sanity-check a health swing against an
+    implausible equity jump — a partial misprice can pass the unpriced gate yet inflate or
+    deflate equity, which would otherwise fire a spurious health_swing escalation."""
+    path = Path(state_dir) / "last-equity-usd"
+    if path.exists():
+        try:
+            return float(path.read_text().strip())
+        except (ValueError, OSError):
+            return None
+    return None
+
+
+def save_last_equity(state_dir: str, equity: float):
+    """Save current equity (USD) for swing-plausibility checks."""
+    path = Path(state_dir) / "last-equity-usd"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(equity))
 
 
 
@@ -926,20 +973,48 @@ def run_tick(
             result["action"] = "none (unfunded account)"
         return result
 
-    # 6. Health swing detection (always)
+    # 6. Health swing detection — only on a TRUSTWORTHY read.
+    # An unpriced read returns early above, but a PARTIAL misprice (one wrong feed) passes
+    # that gate while inflating/deflating equity, yielding a bogus health number. Acting on
+    # it fired a spurious health_swing escalation whose agent destructively CLOSED core1's
+    # AERO/cbBTC LP on a false 53%→93%→53% swing during a RedStone flap (2026-06-26). So
+    # suppress the escalation when the valuation is incomplete OR the equity jumped
+    # implausibly vs the previous reading (a real LP's equity does not multiply between
+    # 5-min ticks — that's a misprice or a deposit, neither of which is a liquidation risk).
+    # We still update the baselines each trustworthy/priced tick so a one-off anomaly can't
+    # permanently freeze them.
+    val_ok, _swing_val_reason = valuation_complete(defi_data)
     last_pct = load_last_health(state_dir)
-    if last_pct is not None and health["health_pct"] is not None:
-        diff = abs(health["health_pct"] - last_pct)
-        if diff > 10:
-            write_escalation(state_dir, "health-swing", {
-                "reason": "health_swing",
-                "from_pct": last_pct,
-                "to_pct": health["health_pct"],
-                "delta": diff,
-                "label": label,
-            })
-            result["escalation"] = "health_swing"
-    save_last_health(state_dir, health["health_pct"] or 0.0)
+    last_eq = load_last_equity(state_dir)
+    cur_pct = health["health_pct"]
+    cur_eq = health.get("equity")
+    eq_plausible = (
+        last_eq is not None and cur_eq is not None and last_eq > 0 and cur_eq > 0
+        and 0.5 <= (cur_eq / last_eq) <= 2.0
+    )
+    trustworthy = val_ok and (last_eq is None or eq_plausible)
+    if trustworthy:
+        if last_pct is not None and cur_pct is not None:
+            diff = abs(cur_pct - last_pct)
+            if diff > 10:
+                write_escalation(state_dir, "health-swing", {
+                    "reason": "health_swing",
+                    "from_pct": last_pct,
+                    "to_pct": cur_pct,
+                    "delta": diff,
+                    "label": label,
+                })
+                result["escalation"] = "health_swing"
+    else:
+        result["swing_guard"] = (
+            "incomplete_valuation" if not val_ok else "implausible_equity_jump"
+        )
+    # Track latest readings regardless (consecutive-tick basis), so a transient misprice
+    # can't permanently poison the baseline and a real deposit only skips a single tick.
+    if cur_pct is not None:
+        save_last_health(state_dir, cur_pct)
+    if cur_eq is not None:
+        save_last_equity(state_dir, cur_eq)
 
     # 7. Append to history
     entry = {
