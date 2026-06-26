@@ -572,18 +572,24 @@ def _plan_token_repays(
         if not pool:
             continue
         leg_usd = b.get("usd", 0) or 0
-        leg_tok = _token_amount(b)
-        if leg_usd <= 0 or leg_tok <= 0:
+        if leg_usd <= 0:
             continue
+        leg_tok = _token_amount(b)
         freed = freed_by_sym.get(sym)
         if not freed or freed["amount"] <= 0:
             # No matching freed token — if this is USDC debt, it feeds the pass-2 swap.
+            # USD value alone is enough here; a debt row may carry usd without a token
+            # amount (and must NOT be skipped, or the de-lever silently does nothing).
             if sym == usdc_symbol.upper():
                 usdc_shortfall += min(leg_usd, remaining)
             continue
         price = freed["price"] or (leg_usd / leg_tok if leg_tok > 0 else 0.0)
         if price <= 0:
             continue
+        # Outstanding leg in token units — derive it from USD when the debt row omits a
+        # token amount (price comes from the matching freed token).
+        if leg_tok <= 0:
+            leg_tok = leg_usd / price
         # How many tokens does the remaining USD repay-need correspond to for this asset?
         need_tok = remaining / price
         repay_tok = min(freed["amount"], leg_tok, need_tok)
@@ -1327,10 +1333,12 @@ def run_tick(
                         if pass1_failures:
                             result["repay_failures"] = "; ".join(pass1_failures)
 
-                        # If NOTHING was freed and NOTHING could be repaid, the LP is gone and
-                        # the debt remains — genuine dead-end. Escalate LOUDLY.
-                        any_freed_value = any((r.get("usd", 0) or 0) > 0.50 for r in freed_rows)
-                        if repaid_usd < 0.50 and not any_freed_value:
+                        # Repay-first safety: if pass-1 couldn't directly repay ANY debt (no
+                        # freed token token-matched a debt leg) yet debt still needs retiring,
+                        # escalate LOUDLY rather than fall through to a price-risky swap as the
+                        # SOLE de-lever action. A PARTIAL direct repay (repaid_usd >= $0.50)
+                        # instead proceeds to the pass-2 swap below for the remaining shortfall.
+                        if repaid_usd < 0.50 and remaining_after >= 1.0:
                             write_escalation(state_dir, "delever-debt-remains-after-lp-close", {
                                 "reason": "delever_debt_remains_after_lp_close",
                                 "repay_needed": repay_amt, "repaid_usd": round(repaid_usd, 2),

@@ -750,7 +750,9 @@ def test_delever_repays_freed_usdc_before_swap(tmp_path, monkeypatch):
     # The first repay used the freed amount ($40), not the full repay_amt ($62).
     first_repay_cmd = fake.cmds[first_repay]
     amt = first_repay_cmd[first_repay_cmd.index("--amount") + 1]
-    assert amt == "40.00", f"first repay should be the freed $40, got {amt}"
+    # Compare numerically — the repay amount is formatted to 8 dp (precision needed for
+    # small-decimal tokens like cbBTC), so the exact string ("40.00000000") is incidental.
+    assert float(amt) == 40.0, f"first repay should be the freed $40, got {amt}"
     assert result.get("lp_repay", "").startswith("repaid $40.00")
 
 
