@@ -798,3 +798,97 @@ def test_delever_escalates_loudly_when_debt_remains_after_lp_close(tmp_path, mon
     assert notifies, "expected a loud notify when debt remains after LP close"
     assert "repay" not in fake.calls, f"nothing to repay yet, calls={fake.calls}"
     assert "escalate" in result["action"], result["action"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Oracle-flap guards: a partial misprice (passes the unpriced gate but inflates/deflates
+# equity) must NOT fire a destructive escalation. Regression for 2026-06-26, when a false
+# health_swing closed core1's AERO/cbBTC LP.
+
+
+def _observer_strategy(tmp_path):
+    strat = tmp_path / "obs-strategy.json"
+    strat.write_text(json.dumps({"mode": "observer"}))
+    return str(strat)
+
+
+def _stoploss_strategy(tmp_path, drawdown_pct=20):
+    strat = tmp_path / "sl-strategy.json"
+    strat.write_text(json.dumps({
+        "mode": "rebalance", "target_range": [30, 70], "center": 50,
+        "cooldown_secs": 0, "stop_loss_drawdown_pct": drawdown_pct,
+    }))
+    return str(strat)
+
+
+def _priced(supplied_usd, debt_usd, health_pct, health_ratio=1.5):
+    """Fully-priced, solvent payload with explicit equity (supplied−debt) and a
+    tool-reported health_pct (>10 so the false-low guard stays inert)."""
+    return _grouped(
+        [{"symbol": "USDC", "usd": supplied_usd}],
+        [{"symbol": "USDC", "usd": debt_usd}],
+        health_ratio=health_ratio,
+        status="ok",
+        solvent=True,
+        health_pct=health_pct,
+    )
+
+
+def _tick(tmp_path, monkeypatch, payload, strat, sd, label="core1"):
+    calls: list[str] = []
+    _install_fake_subprocess(monkeypatch, payload, calls)
+    return hm.run_tick(tool_path="/fake/degenprime.py", strategy_path=strat,
+                       state_dir=sd, label=label, dry_run=False)
+
+
+def test_health_swing_suppressed_on_misprice_equity_jump(tmp_path, monkeypatch):
+    """A misprice that inflates equity (and health) must NOT fire health_swing — the
+    equity jumped implausibly vs the prior tick (the bug that closed core1's LP)."""
+    sd = str(tmp_path / "state")
+    strat = _observer_strategy(tmp_path)
+    # Tick 1: healthy, equity ~$300 (1700−1400), health 53%.
+    _tick(tmp_path, monkeypatch, _priced(1700, 1400, 53.0), strat, sd)
+    # Tick 2: MISPRICE — health 93%, equity inflated to ~$2000 (3400−1400 = 6.7x jump).
+    r2 = _tick(tmp_path, monkeypatch, _priced(3400, 1400, 93.0), strat, sd)
+    assert r2.get("escalation") != "health_swing", r2
+    assert r2.get("swing_guard") == "implausible_equity_jump", r2
+
+
+def test_health_swing_fires_on_real_swing_stable_equity(tmp_path, monkeypatch):
+    """A genuine health swing on STABLE equity still escalates."""
+    sd = str(tmp_path / "state")
+    strat = _observer_strategy(tmp_path)
+    _tick(tmp_path, monkeypatch, _priced(1700, 1400, 53.0), strat, sd)
+    # Tick 2: real drop to 38%, equity stable (~$300, same supplied/debt).
+    r2 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 38.0), strat, sd)
+    assert r2.get("escalation") == "health_swing", r2
+
+
+def test_stop_loss_requires_two_confirmations(tmp_path, monkeypatch):
+    """A genuine drawdown must hold for 2 consecutive trusted reads before a full close."""
+    sd = str(tmp_path / "state")
+    strat = _stoploss_strategy(tmp_path, 20)
+    # Tick 1: baseline equity ~$1000 (2400−1400), health 50% (in range).
+    _tick(tmp_path, monkeypatch, _priced(2400, 1400, 50.0), strat, sd)
+    # Tick 2: equity ~$700 (2100−1400) = 30% drawdown, plausible (0.7x) → pending, no close.
+    r2 = _tick(tmp_path, monkeypatch, _priced(2100, 1400, 40.0), strat, sd)
+    assert r2.get("escalation") != "stop_loss", r2
+    assert "pending confirmation" in r2.get("action", ""), r2
+    # Tick 3: drawdown persists → 2nd confirmation → full close.
+    r3 = _tick(tmp_path, monkeypatch, _priced(2100, 1400, 40.0), strat, sd)
+    assert r3.get("escalation") == "stop_loss", r3
+    assert r3.get("action") == "escalate_close", r3
+
+
+def test_stop_loss_defers_on_untrusted_deflation(tmp_path, monkeypatch):
+    """A single deflating-misprice tick (equity collapses implausibly) must NOT trigger a
+    stop-loss close — it's deferred as an untrusted read."""
+    sd = str(tmp_path / "state")
+    strat = _stoploss_strategy(tmp_path, 20)
+    # Tick 1: baseline equity ~$1000.
+    _tick(tmp_path, monkeypatch, _priced(2400, 1400, 50.0), strat, sd)
+    # Tick 2: MISPRICE deflation — equity ~$100 (1500−1400 = 0.1x) → 90% "drawdown" but
+    # implausible jump → deferred, not closed. health 15 (>10, keeps the false-low guard inert).
+    r2 = _tick(tmp_path, monkeypatch, _priced(1500, 1400, 15.0), strat, sd)
+    assert r2.get("escalation") != "stop_loss", r2
+    assert "deferred" in r2.get("action", ""), r2
