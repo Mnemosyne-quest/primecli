@@ -385,6 +385,24 @@ def save_last_equity(state_dir: str, equity: float):
     path.write_text(str(equity))
 
 
+def load_stop_loss_streak(state_dir: str) -> int:
+    """Consecutive trusted ticks the stop-loss drawdown has held. A full close requires
+    >=2 so a single-tick misprice that deflates equity can't trigger it."""
+    path = Path(state_dir) / "stop-loss-streak"
+    if path.exists():
+        try:
+            return int(path.read_text().strip())
+        except (ValueError, OSError):
+            return 0
+    return 0
+
+
+def save_stop_loss_streak(state_dir: str, n: int):
+    path = Path(state_dir) / "stop-loss-streak"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(n))
+
+
 
 def _usdc_borrow_feasible(tool_path: str, max_util: float = 90.0, max_apr: float = 15.0):
     """Check if borrowing USDC is feasible given pool conditions.
@@ -1070,20 +1088,39 @@ def run_tick(
             elif equity and baseline > 0:
                 drawdown = (1 - equity / baseline) * 100
                 if drawdown >= stop_loss_drawdown:
-                    write_escalation(state_dir, "stop-loss", {
-                        "reason": "stop_loss_equity_drawdown",
-                        "drawdown_pct": round(drawdown, 1),
-                        "threshold_pct": stop_loss_drawdown,
-                        "baseline_equity": baseline,
-                        "current_equity": equity,
-                        "debt": debt,
-                        "health_pct": pct,
-                        "label": label,
-                        "action": "full_close",
-                    })
-                    result["escalation"] = "stop_loss"
-                    result["action"] = "escalate_close"
-                    return result
+                    # Confirm over 2 consecutive TRUSTED reads before a full close. A single
+                    # misprice that deflates equity (passes the unpriced gate but reads
+                    # implausibly low) must never trigger a stop-loss close on its own — a
+                    # plain plausibility block would risk suppressing a real crash, so we
+                    # require persistence instead: a one-tick deflation reverts and resets
+                    # the streak; a genuine drawdown holds and closes within ~2 ticks.
+                    # (Bruno, 2026-06-26.) `trustworthy` comes from the swing-guard above.
+                    if trustworthy:
+                        sl_streak = load_stop_loss_streak(state_dir) + 1
+                        save_stop_loss_streak(state_dir, sl_streak)
+                        if sl_streak >= 2:
+                            write_escalation(state_dir, "stop-loss", {
+                                "reason": "stop_loss_equity_drawdown",
+                                "drawdown_pct": round(drawdown, 1),
+                                "threshold_pct": stop_loss_drawdown,
+                                "baseline_equity": baseline,
+                                "current_equity": equity,
+                                "debt": debt,
+                                "health_pct": pct,
+                                "label": label,
+                                "action": "full_close",
+                                "confirmations": sl_streak,
+                            })
+                            result["escalation"] = "stop_loss"
+                            result["action"] = "escalate_close"
+                            return result
+                        result["action"] = f"stop_loss pending confirmation ({sl_streak}/2)"
+                        return result
+                    else:
+                        result["action"] = "stop_loss deferred (untrusted read)"
+                        return result
+                else:
+                    save_stop_loss_streak(state_dir, 0)
 
 # ── Act ─────────────────────────────────────────────────────
         target_debt = max(health["max_debt"], 0) * (1 - center / 100.0)
