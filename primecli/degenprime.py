@@ -240,6 +240,11 @@ AERODROME_SEL_COLLECT = bytes.fromhex("887e4b7e")        # collectAerodromeFees
 # lives here, whitelisted); v3 is the newer "Gauges V3" deployment.
 AERODROME_NPM_V2 = "0x827922686190790b37229fd06084350E74485b72"  # == AERODROME_NPM
 AERODROME_NPM_V3 = "0xe1f8cd9AC4e4A65F54f38a5CdAfCA44f6dD68b53"
+# Slipstream CLFactory per deployment — getPool(token0, token1, tickSpacing). The
+# Gauges-V3 deployment has its own factory; the V2 factory returns the wrong (dead V2)
+# pool or zero for V3-only pairs, so pool resolution must pick the factory by version.
+AERODROME_CL_FACTORY_V2 = "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"
+AERODROME_CL_FACTORY_V3 = "0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef"
 # Single shared emitter for the 4 order lifecycle/execution events (since the
 # 2026-06-16 migration). Filter getLogs by topics=[topic0, padded(primeAccount)].
 REBALANCE_EVENT_EMITTER = "0x74a1b3715DD3dcB565c7483551b4C67F8FF3E3dc"
@@ -386,6 +391,26 @@ AERODROME_POOLS = {
                          "token1": "0x4200000000000000000000000000000000000006",
                          "tickSpacing": 1, "symbol0": "ezETH", "symbol1": "ETH",
                          "decimals0": 18, "decimals1": 18, "gauge_alive": True},
+    # ── Aerodrome Gauges-V3 pools (slipstreamVersion=1) ──────────────────────
+    # Newer Slipstream deployment (NPM 0xe1f8…8b53, CLFactory 0xf8f2…61Ef). Both
+    # whitelisted on the DegenPrime AerodromeFacet. `pool` is the on-chain-verified
+    # CL pool address (resolution short-circuits to it; the V2 factory's getPool
+    # returns the wrong/zero pool for these pairs). Keys are -v3 suffixed so they
+    # never collide with the V2 entries above.
+    "virtual-weth-50-v3": {"token0": "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b",  # VIRTUAL
+                           "token1": "0x4200000000000000000000000000000000000006",  # WETH
+                           "tickSpacing": 50, "symbol0": "VIRTUAL", "symbol1": "ETH",
+                           "decimals0": 18, "decimals1": 18, "gauge_alive": True,
+                           "slipstreamVersion": 1,
+                           "pool": "0x9520E1a3BFd86DA6c1E9e5Ee4B9c2F11c413358F",
+                           "gauge": "0xF0B0F3d39BaA91FcE3e97A08E30975CE1F365F31"},
+    "weth-euroc-100-v3": {"token0": "0x4200000000000000000000000000000000000006",  # WETH
+                          "token1": "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42",  # EURC (dec 6)
+                          "tickSpacing": 100, "symbol0": "ETH", "symbol1": "EURC",
+                          "decimals0": 18, "decimals1": 6, "gauge_alive": True,
+                          "slipstreamVersion": 1,
+                          "pool": "0xaa5fE7dCC07DCB8B7AFCd1B93874e7Cb1e0Ab50b",
+                          "gauge": "0x9D025C59D53fA74a4eAcd62a709faC2dfffBC150"},
 }
 
 # ParaSwap v6 / Velora aggregator on Base. The Degen Account's ParaSwapFacet.paraSwapV6
@@ -2208,8 +2233,9 @@ def _aero_gauge_earned(w3, degen_account: 'Web3.eth.Contract', token_id: int) ->
     NPM (the gauge holds the NFT while staked).
     """
     try:
-        npm = w3.eth.contract(address=Web3.to_checksum_address(AERODROME_NPM),
-                              abi=AERODROME_NPM_ABI)
+        npm, _ver, _pos = _aero_npm_for_token(w3, token_id)
+        if npm is None:
+            return 0.0
         gauge_addr = npm.functions.ownerOf(token_id).call()
         if gauge_addr == "0x0000000000000000000000000000000000000000":
             return 0.0
@@ -2253,15 +2279,13 @@ def _aero_position_legs(w3, account):
         return []
     if not ids:
         return []
-    npm = w3.eth.contract(address=Web3.to_checksum_address(AERODROME_NPM),
-                          abi=AERODROME_NPM_ABI)
     slot0_abi = json.loads(SLOT0_ABI)
     q96 = Decimal(2) ** 96
     legs = []
     for tid in ids:
-        try:
-            p = npm.functions.positions(tid).call()
-        except Exception:
+        # Resolve V2/V3 per tokenId — the two NPMs are independent ERC-721s.
+        _npm, ver, p = _aero_npm_for_token(w3, tid)
+        if p is None:
             continue
         # positions(): nonce, operator, token0, token1, tickSpacing, tickLower,
         #              tickUpper, liquidity, ...
@@ -2280,7 +2304,8 @@ def _aero_position_legs(w3, account):
         sqrt_p = None
         try:
             pool_addr = _aero_pool_address({"token0": token0, "token1": token1,
-                                            "tickSpacing": tick_spacing})
+                                            "tickSpacing": tick_spacing,
+                                            "slipstreamVersion": 1 if ver == "v3" else 0})
             pool_c = w3.eth.contract(address=Web3.to_checksum_address(pool_addr),
                                      abi=slot0_abi)
             sqrt_p = Decimal(pool_c.functions.slot0().call()[0])
@@ -3879,12 +3904,10 @@ def _aero_read_position(w3, token_id: int):
     e.g. [0, -3984902] for the live tokenId 71997868). NPM.positions(tokenId) returns
     the real struct regardless of who holds the NFT — token0/token1, tickLower,
     tickUpper, and liquidity. Returns (token0, token1, tickLower, tickUpper, liquidity)
-    or None if the read fails."""
-    try:
-        npm = w3.eth.contract(address=Web3.to_checksum_address(AERODROME_NPM),
-                              abi=AERODROME_NPM_ABI)
-        p = npm.functions.positions(token_id).call()
-    except Exception:
+    or None if the read fails. Resolves the owning deployment (V2 or V3 NPM) per
+    tokenId so V3 positions read correctly."""
+    _npm, _ver, p = _aero_npm_for_token(w3, token_id)
+    if p is None:
         return None
     # positions() layout: nonce, operator, token0, token1, tickSpacing,
     #                      tickLower, tickUpper, liquidity, ...
@@ -3951,10 +3974,19 @@ def _resolve_token_decimals(w3, addr: str):
 
 # Helper: get Aerodrome CL pool address from the factory's getPool (authoritative).
 def _aero_pool_address(pool_cfg: dict) -> str:
-    """Resolve the pool address via the factory's getPool()."""
+    """Resolve the Slipstream pool address. If the registry entry bakes a verified
+    `pool` address, return it directly — the V2 factory's getPool returns the wrong
+    (dead V2) or zero pool for V3-only pairs. Otherwise call the version-appropriate
+    CLFactory's getPool() (V3 / slipstreamVersion=1 has its own factory)."""
+    baked = pool_cfg.get("pool")
+    if baked:
+        return Web3.to_checksum_address(baked)
     try:
         w3_local = Web3(Web3.HTTPProvider(BASE_RPC))
-        factory = Web3.to_checksum_address("0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A")
+        factory_addr = (AERODROME_CL_FACTORY_V3
+                        if pool_cfg.get("slipstreamVersion", 0) == 1
+                        else AERODROME_CL_FACTORY_V2)
+        factory = Web3.to_checksum_address(factory_addr)
         import json
         f_abi = json.loads('[{"inputs":[{"name":"","type":"address"},{"name":"","type":"address"},{"name":"","type":"int24"}],"name":"getPool","outputs":[{"name":"","type":"address"}],"stateMutability":"view","type":"function"}]')
         factory_c = w3_local.eth.contract(address=factory, abi=f_abi)
@@ -3977,11 +4009,11 @@ SLOT0_ABI = json.dumps([{"inputs":[],"name":"slot0","outputs":[
 # on-chain mint 0x1723377a... (ZORA/USDC, Base, 2026-06-14):
 #   token0, token1, tickLower, tickUpper, tickSpacing,
 #   amount0Desired(wei), amount1Desired(wei), amount0Min(wei), amount1Min(wei),
-#   uint256 const=300, int24 currentTick, 0, 0, 0
+#   uint256 const=300, int24 currentTick, uint8 slipstreamVersion, 0, 0
 # Both amounts are NATIVE/wei units; there is NO recipient or unix-deadline
-# field, tickSpacing IS part of the args, and the last tick field is the live
-# pool tick (not sqrtPriceX96). The three trailing zero words are
-# sqrtPriceX96=0 / borrow-if-needed bools = false (all zero either way).
+# field, tickSpacing IS part of the args, and the second tick field is the live
+# pool tick (not sqrtPriceX96). word11 (struct field 12) is slipstreamVersion
+# (V2=0, V3=1); the two trailing zero words are sqrtPriceX96=0 / bool false.
 def _aero_in_account_balance(account, symbol: str) -> int:
     """In-account spendable balance (base units) of `symbol` on the Degen Account.
 
@@ -4063,7 +4095,11 @@ def _aero_mint_params(pool_cfg: dict, amount0_wei: int, amount1_wei: int,
         amount1_min,          # amount1Min (wei)
         300,                  # word9 constant (frontend passes 300)
         int(current_tick),    # word10: live pool tick
-        0, 0, 0,              # word11-13: zero (sqrtPriceX96=0 / bools false)
+        # word11 == struct field 12: uint8 slipstreamVersion (V2=0, V3=1). Encoded as a
+        # full 32-byte uint256 word below — byte-identical to uint8 for values 0/1, so the
+        # flat static layout is unchanged; only this word's value flips.
+        int(pool_cfg.get("slipstreamVersion", 0)),
+        0, 0,                 # word12-13: zero (sqrtPriceX96=0 / bool false)
     )
 
 # Helper: compute tick range around a desired centre price.
@@ -5222,21 +5258,23 @@ def cmd_aero_claim_rewards(execute: bool = False):
         print("  No staked Aerodrome positions.")
         return
 
-    npm = w3.eth.contract(address=Web3.to_checksum_address(AERODROME_NPM),
-                          abi=AERODROME_NPM_ABI)
     claimed_any = False
     for tid in ids:
         print(f"\nToken {tid}:")
-        try:
-            p = npm.functions.positions(tid).call()
+        # Resolve V2/V3 per tokenId — the two NPMs are independent ERC-721s.
+        npm, _ver, p = _aero_npm_for_token(w3, tid)
+        if p is not None:
             sym0 = _resolve_token_symbol(w3, p[2])
             sym1 = _resolve_token_symbol(w3, p[3])
-        except Exception:
+        else:
             sym0, sym1 = "?", "?"
         unclaimed = _aero_gauge_earned(w3, account, tid)
         print(f"  {sym0}/{sym1}: {unclaimed:.4f} AERO unclaimed")
         if unclaimed <= 0:
             print("  No rewards to claim.")
+            continue
+        if npm is None:
+            print("  Cannot resolve NFT deployment; skipping.")
             continue
         try:
             gauge_addr = npm.functions.ownerOf(tid).call()
@@ -5306,11 +5344,11 @@ def cmd_aero_collect_fees(token_id: int, execute: bool = False):
     sym1 = _resolve_token_symbol(w3, token1)
     print(f"Position {token_id}: {sym0}/{sym1}  liquidity={liq}")
 
-    # Also try to read uncollected fees from the NPM directly
+    # Also try to read uncollected fees from the owning NPM (V2 or V3) directly
     try:
-        npm = w3.eth.contract(address=Web3.to_checksum_address(AERODROME_NPM),
-                              abi=AERODROME_NPM_ABI)
-        npm_pos = npm.functions.positions(token_id).call()
+        _npm, _ver, npm_pos = _aero_npm_for_token(w3, token_id)
+        if npm_pos is None:
+            raise ValueError("tokenId not found on either Aerodrome deployment")
         owed0 = npm_pos[10]  # tokensOwed0
         owed1 = npm_pos[11]  # tokensOwed1
         if owed0 > 0 or owed1 > 0:
@@ -5352,19 +5390,31 @@ def cmd_aero_collect_fees(token_id: int, execute: bool = False):
 
 # ─── Aerodrome Auto-Rebalancer (AerodromeRebalancerFacet) ─────────────────────
 
-def _aero_resolve_npm(w3, token_id: int):
-    """Resolve which Aerodrome deployment owns a tokenId by trying positions() on
-    each NPM (v2 first — our whitelisted cbbtc-200 lives there — then v3). The
-    non-owning deployment reverts. Returns (deployment, position_struct) where
-    deployment is 'v2'/'v3' and the struct is the raw positions() tuple, or
-    (None, None) if neither deployment knows the tokenId (burned/unknown)."""
+def _aero_npm_for_token(w3, token_id: int):
+    """Resolve which Aerodrome deployment knows a tokenId, trying the V2 NPM first
+    (our whitelisted V2 positions live there) then V3. The non-owning deployment
+    reverts. Returns (npm_contract, deployment, positions_struct) with deployment
+    'v2'/'v3', or (None, None, None) if neither deployment knows the tokenId
+    (burned/unknown). The V2 and V3 NPMs are independent ERC-721s, so the same numeric
+    tokenId can exist on both — callers must use the returned contract for every
+    follow-on call (positions/ownerOf) and key any per-token state by (deployment,
+    tokenId), never the bare number."""
     for ver, addr in (("v2", AERODROME_NPM_V2), ("v3", AERODROME_NPM_V3)):
         try:
             npm = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=AERODROME_NPM_ABI)
-            return ver, npm.functions.positions(token_id).call()
+            return npm, ver, npm.functions.positions(token_id).call()
         except Exception:
             continue
-    return None, None
+    return None, None, None
+
+
+def _aero_resolve_npm(w3, token_id: int):
+    """Resolve which Aerodrome deployment owns a tokenId. Returns (deployment,
+    position_struct) where deployment is 'v2'/'v3' and the struct is the raw positions()
+    tuple, or (None, None) if neither deployment knows the tokenId (burned/unknown).
+    Thin wrapper over _aero_npm_for_token for callers that don't need the contract."""
+    _npm, ver, pos = _aero_npm_for_token(w3, token_id)
+    return ver, pos
 
 
 def _bps_band_from_width(width_pct: float) -> tuple:
