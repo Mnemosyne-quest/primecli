@@ -1287,7 +1287,15 @@ def _resolve_debt_coverages(w3, symbols: list, tier_code: int = 0) -> dict:
         '{"inputs":[{"name":"t","type":"uint8"},{"name":"a","type":"address"}],"name":"tieredDebtCoverage",'
         '"outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}]')
     tm = w3.eth.contract(address=Web3.to_checksum_address(TOKEN_MANAGER), abi=tm_abi)
-    addr_legs = [(TOKEN_MANAGER, bytes.fromhex(tm.encode_abi("getAssetAddress", args=[asset_b32(s), True])[2:]))
+    # Resolve the address through the account's bytes32 alias, not the raw display
+    # symbol: DegenPrime's TokenManager stores EURC as "EUROC", so getAssetAddress
+    # for "EURC" returns the zero address → dc=0 → a leveraged ETH/EURC LP read as
+    # 0% health even while solvent (health_ratio 1.29). The single-symbol resolver
+    # (_asset_meta) already normalizes via _account_asset_symbol; this batched path
+    # did not. Keep the output keyed by the original symbol so callers' lookups
+    # (which use the display symbol) still hit. (Bruno, 2026-06-27.)
+    addr_legs = [(TOKEN_MANAGER, bytes.fromhex(
+        tm.encode_abi("getAssetAddress", args=[asset_b32(_account_asset_symbol(s)), True])[2:]))
                  for s in missing]
     addr_res = multicall(w3, addr_legs)
     addrs = {}
