@@ -27,8 +27,9 @@ Usage:
   degenprime execute-withdrawal --pool usdc [--index N] [--execute]
   degenprime cancel-withdrawal --pool usdc --index N [--execute]
   degenprime aerodrome-positions
-  degenprime aero-add-liquidity --pool weth-usdc-100 --amount-weth 0.05 --amount-usdc 100 [--slippage 1] [--execute]
-  degenprime aero-add-liquidity --pool weth-usdc-100 --use-all-available [--width 2] [--slippage 1] [--execute]
+  degenprime aero-add-liquidity --pool weth-usdc-100 --amount-token0 0.05 --amount-token1 100 [--slippage 1] [--execute]
+  degenprime aero-add-liquidity --pool virtual-weth-50-v3 --amount-token0 100 --amount-token1 0.05 [--slippage 1] [--execute]
+  degenprime aero-add-liquidity --pool weth-euroc-100-v3 --use-all-available [--width 2] [--slippage 1] [--execute]
   degenprime aero-increase-liquidity --pool weth-usdc-100 --token-id N --amount-token0 X --amount-token1 Y [--slippage 1] [--execute]
   degenprime aero-remove-liquidity --token-id N [--token-id M ...] [--execute]   (full close only)
   degenprime aero-collect-fees --token-id N [--execute]
@@ -125,7 +126,7 @@ position (a NEW tokenId) when price drifts past the trigger. Subcommands:
             primitive; not solvency-gated (no RedStone).
 """
 
-import json, os, sys, time, base64
+import json, os, sys, time, random, base64
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from pathlib import Path
 import requests
@@ -162,7 +163,14 @@ except ImportError:
 # and has been the most reliable free option for this tool's traffic pattern (lots of
 # small reads in quick succession for `pool-info all` / `my-positions` / `summary`).
 # Override with the DEGENPRIME_RPC env var for paid Alchemy/QuickNode/Infura endpoints.
-BASE_RPC = os.environ.get("DEGENPRIME_RPC", "https://base.publicnode.com")
+BASE_RPC = os.environ.get("DEGENPRIME_RPC", "https://base-rpc.publicnode.com")
+# Secondary RPCs tried when the primary returns 429/5xx. Expanded list so the
+# burst of overlapping cron processes spread across more endpoints instead of
+# pounding the same 2 into 429. No in-flight retry within a single call.
+_BASE_RPC_FALLBACKS = [
+    "https://base.drpc.org",
+    "https://base.meowrpc.com",
+]
 EXPLORER = "https://basescan.org"
 CHAIN_ID = 8453
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
@@ -490,12 +498,39 @@ _asset_meta_cache = {}
 _W3 = None
 
 def get_w3():
-    """Process-local Base RPC client. Base has no POA middleware - it's a standard EVM
-    chain; middleware injection is not needed (and would error on Base block headers)."""
+    """Process-local Base RPC client with built-in fallback + exponential backoff.
+    Base has no POA middleware - it's a standard EVM chain; middleware injection is
+    not needed (and would error on Base block headers).
+
+    Tries the primary RPC first (BASE_RPC / DEGENPRIME_RPC env). On 429/5xx, rotates
+    through _BASE_RPC_FALLBACKS with exponential backoff + jitter so multiple
+    concurrent processes don't thundering-herd the same fallback endpoint.
+    The first working RPC is cached for the process lifetime."""
     global _W3
-    if _W3 is None:
-        _W3 = Web3(Web3.HTTPProvider(BASE_RPC))
-    return _W3
+    if _W3 is not None:
+        return _W3
+    candidates = [BASE_RPC] + [u for u in _BASE_RPC_FALLBACKS if u != BASE_RPC]
+    last_exc = None
+    for attempt, url in enumerate(candidates * 2):  # At most 2 rounds through the list
+        try:
+            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
+            # Quick health check — eth_chainId is cheaper for providers than block_number
+            w3.eth.chain_id
+            _W3 = w3
+            return _W3
+        except Exception as e:
+            last_exc = e
+            msg = str(e)
+            if any(code in msg for code in ("429", "500", "502", "503", "Connection", "Timeout")):
+                # Exponential backoff with jitter: 0.5s, 1s, 2s, 4s, 8s, capped at 16s
+                delay = min(2 ** (attempt // len(candidates)) * 0.5, 16.0)
+                delay += random.uniform(0, delay * 0.3)  # 30% jitter
+                time.sleep(delay)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"All {len(candidates)} Base RPCs failed, last: {last_exc}")
 
 def _tx_gas_price(w3) -> int:
     """Estimated per-gas cost for balance checks (gas buffer pre-flights). Returns 2x the
@@ -1068,6 +1103,12 @@ def get_prime_account(w3, owner: str) -> str:
 def asset_b32(symbol: str) -> bytes:
     return symbol.encode().ljust(32, b"\x00")
 
+def _account_asset_symbol(symbol: str) -> str:
+    """Map display symbols to the bytes32 symbols DegenPrime stores on accounts."""
+    if str(symbol).upper() == "EURC":
+        return "EUROC"
+    return symbol
+
 def fmt_token_amount(raw: int, decimals: int) -> str:
     """Human token amount that never misleadingly rounds a dust balance UP.
 
@@ -1110,6 +1151,7 @@ def _asset_meta(w3, symbol: str):
     Used for in-account assets that aren't lending pool symbols (memecoin collateral
     like AIXBT, TOSHI, etc.). Cached - reads are pure but the TokenManager call is one
     eth_call + an ERC20.decimals() per asset."""
+    symbol = _account_asset_symbol(symbol)
     if symbol in _asset_meta_cache:
         return _asset_meta_cache[symbol]
     # Pool symbols hit the static map - no on-chain read needed.
@@ -3087,6 +3129,7 @@ def _swap_asset_meta(w3, symbol: str):
     """Resolve a swap-side symbol to {token, decimals}. Falls back to TokenManager for
     non-pool collateral (memecoins). Returns None if the asset is unknown.
     Lookup is case-insensitive (keys like cbBTC match CBBTC)."""
+    symbol = _account_asset_symbol(symbol)
     if symbol in SWAP_ASSETS:
         return SWAP_ASSETS[symbol]
     # Case-insensitive fallback for mixed-case symbols like cbBTC.
@@ -4003,7 +4046,7 @@ def _aero_pool_address(pool_cfg: dict) -> str:
     if baked:
         return Web3.to_checksum_address(baked)
     try:
-        w3_local = Web3(Web3.HTTPProvider(BASE_RPC))
+        w3_local = get_w3()
         factory_addr = (AERODROME_CL_FACTORY_V3
                         if pool_cfg.get("slipstreamVersion", 0) == 1
                         else AERODROME_CL_FACTORY_V2)
@@ -4042,12 +4085,13 @@ def _aero_in_account_balance(account, symbol: str) -> int:
     same balance getBalance(bytes32) reports (verified equal to ERC20.balanceOf on
     the account 2026-06-14). Subtract any pending withdrawal-intent lock so we never
     treat reserved funds as available. Returns 0 if the view reverts."""
+    account_symbol = _account_asset_symbol(symbol)
     try:
-        bal = account.functions.getBalance(asset_b32(symbol)).call()
+        bal = account.functions.getBalance(asset_b32(account_symbol)).call()
     except Exception:
         return 0
     try:
-        locked = account.functions.getTotalIntentAmount(asset_b32(symbol)).call()
+        locked = account.functions.getTotalIntentAmount(asset_b32(account_symbol)).call()
     except Exception:
         locked = 0
     return bal - locked if bal > locked else 0
@@ -4309,14 +4353,15 @@ def _aero_use_all_available(
     all_candidates = set(REDSTONE_AVAILABLE_FEEDS) | {sym0, sym1}
     inventory = {}
     for sym in sorted(all_candidates):
+        account_sym = _account_asset_symbol(sym)
         try:
-            bal = account.functions.getBalance(asset_b32(sym)).call()
+            bal = account.functions.getBalance(asset_b32(account_sym)).call()
         except Exception:
             bal = 0
         if bal <= 0:
             continue
         try:
-            locked = account.functions.getTotalIntentAmount(asset_b32(sym)).call()
+            locked = account.functions.getTotalIntentAmount(asset_b32(account_sym)).call()
         except Exception:
             locked = 0
         avail = bal - locked if bal > locked else 0
@@ -4534,9 +4579,11 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
     """Add concentrated liquidity to an Aerodrome Slipstream pool through the
     Degen Account's AerodromeFacet. Uses in-account token0/token1 balances.
 
-    --pool selects a whitelisted CL pool (e.g. weth-usdc-100).
-    --amount-weth / --amount-usdc (or --amount-token0 / --amount-token1) specify
-    the desired liquidity amounts in token units. At least one side must be >0.
+    --pool selects a whitelisted CL pool (e.g. weth-usdc-100,
+    virtual-weth-50-v3, weth-euroc-100-v3).
+    --amount-token0 / --amount-token1 specify the desired liquidity amounts in
+    the pool's token0/token1 units. Legacy --amount-weth / --amount-usdc aliases
+    are accepted only for WETH/USDC-shaped pools. At least one side must be >0.
     --slippage sets the min-amount floor (default 1%).
     --width sets the range +/-width% around the current price (default 2%).
 
@@ -4956,6 +5003,16 @@ def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float 
         print(f"Cannot match position #{token_id} to a known pool.")
         sys.exit(2)
     pool_cfg = AERODROME_POOLS[pool_key]
+
+    # ⚠️  Aerodrome V3 gauge anti-sniping (10-second cooldown). The
+    # batchRemoveStakedLiquidityAerodrome (Step 1) unstaked from the gauge at
+    # block.timestamp. V3 gauges reject a new stake within 10 seconds of a
+    # withdraw by the same address. Sleep 14s to ensure the cooldown has elapsed
+    # before the mint+stake in Step 3, even when the sweep step has no swaps.
+    if pool_cfg.get("slipstreamVersion", 0) >= 1 and execute:
+        print(f"  V3 gauge anti-sniping: waiting 14s before re-staking...")
+        import time
+        time.sleep(14)
 
     print(f"\nStep 2: Sweeping idle assets >$5 to pool {pool_key}...")
     _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg, execute=execute)
@@ -5552,7 +5609,7 @@ def _aero_rebalance_events(account: str, from_block=None, to_block="latest"):
     CHUNK_FLOOR = 2_000
     t0_to_name = {t.lower().removeprefix("0x"): n for n, t in REBALANCE_TOPIC0.items()}
     all_topic0 = list(REBALANCE_TOPIC0.values())
-    scan_w3 = Web3(Web3.HTTPProvider(BASE_RPC, request_kwargs={"timeout": 20}))
+    scan_w3 = get_w3()
     out = []
     start = from_block
     chunk = CHUNK
@@ -5838,14 +5895,15 @@ def _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg=None, execu
     candidates = set(REDSTONE_AVAILABLE_FEEDS) | {sym0, sym1}
     inventory = {}
     for sym in sorted(candidates):
+        account_sym = _account_asset_symbol(sym)
         try:
-            bal = account.functions.getBalance(asset_b32(sym)).call()
+            bal = account.functions.getBalance(asset_b32(account_sym)).call()
         except Exception:
             bal = 0
         if bal <= 0:
             continue
         try:
-            locked = account.functions.getTotalIntentAmount(asset_b32(sym)).call()
+            locked = account.functions.getTotalIntentAmount(asset_b32(account_sym)).call()
         except Exception:
             locked = 0
         avail = bal - locked if bal > locked else 0
@@ -5972,6 +6030,10 @@ def cmd_aero_rebalance_create(token_id: int, width_pct: float, mode: str = "outs
             if pool_key:
                 print(f"  Auto-sweeping idle assets to pool: {pool_key}...")
                 _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, execute=execute)
+                if pool_key.endswith("-v3"):
+                    print(f"  (Note: {pool_key} is a Gauges-V3 pool with a 10-second")
+                    print(f"  anti-sniping cooldown. The protocol's executor should handle")
+                    print(f"  this; off-chain rebuilds via `aero-rebuild` also respect it.")
 
     try:
         params, preview = _build_rebalance_order_params(
@@ -6261,11 +6323,12 @@ def _dispatch():
             if a == "--width" and i + 1 < len(args): width = float(args[i + 1])
         use_all = "--use-all-available" in args
         if not pool_key:
-            print("Usage: degenprime aero-add-liquidity --pool weth-usdc-100 --amount-weth 0.05 --amount-usdc 100 [--slippage 1] [--width 2] [--execute]")
+            print("Usage: degenprime aero-add-liquidity --pool <pool-key> --amount-token0 X --amount-token1 Y [--slippage 1] [--width 2] [--execute]")
+            print("Example V3: degenprime aero-add-liquidity --pool virtual-weth-50-v3 --amount-token0 100 --amount-token1 0.05")
             return
         if not use_all and (amt0 is None and amt1 is None):
-            print("Specify --amount-* values or add --use-all-available to auto-detect.")
-            print("Usage: degenprime aero-add-liquidity --pool weth-usdc-100 [--use-all-available] [--slippage 1] [--width 2] [--execute]")
+            print("Specify --amount-token0 / --amount-token1 values or add --use-all-available to auto-detect.")
+            print("Usage: degenprime aero-add-liquidity --pool <pool-key> [--use-all-available] [--slippage 1] [--width 2] [--execute]")
             return
         if use_all:
             cmd_aero_add_liquidity(pool_key, slippage_pct=slippage, execute=execute, width_pct=width, use_all_available=True)

@@ -262,3 +262,25 @@ def test_match_pool_cfg_pair_only_unchanged_for_unique_pair():
     # Legacy 2-arg call still works for callers/tests that don't pass tickSpacing/version.
     cfg = dp.AERODROME_POOLS["aero-cbbtc-200"]
     assert dp._aero_match_pool_cfg(cfg["token0"], cfg["token1"]) is cfg
+
+
+# ─────────────────────────── FIX 3: EURC display vs EUROC account symbol ─────
+
+def test_eurc_display_symbol_reads_euroc_account_balance():
+    calls = []
+
+    class _AccountFns:
+        def getBalance(self, sym_b32):
+            calls.append(("balance", sym_b32.rstrip(b"\x00").decode()))
+            return _Call(lambda: 123, ())
+
+        def getTotalIntentAmount(self, sym_b32):
+            calls.append(("intent", sym_b32.rstrip(b"\x00").decode()))
+            return _Call(lambda: 0, ())
+
+    class _Account:
+        functions = _AccountFns()
+
+    assert dp._account_asset_symbol("EURC") == "EUROC"
+    assert dp._aero_in_account_balance(_Account(), "EURC") == 123
+    assert calls == [("balance", "EUROC"), ("intent", "EUROC")]

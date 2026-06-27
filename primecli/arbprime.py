@@ -201,7 +201,7 @@ Only depositPrime (inside prime-activate --amount) is solvency-gated -> RedStone
 prime-* write is onlyOwner and needs no payload. All prime-* views are oracle-free. Preview by default; --execute broadcasts.
 """
 
-import json, os, sys, time, re, base64, struct
+import json, os, sys, time, re, random, base64, struct
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 import requests
@@ -238,6 +238,10 @@ except ImportError:
 
 # Arbitrum One RPC. Override with ARBPRIME_RPC for a paid Alchemy/Infura endpoint.
 ARBITRUM_RPC = os.environ.get("ARBPRIME_RPC", "https://arb1.arbitrum.io/rpc")
+# Secondary RPCs tried when the primary returns 429/5xx. Expanded list for resilience.
+_ARBITRUM_RPC_FALLBACKS = [
+    "https://arbitrum.publicnode.com",
+]
 EXPLORER = "https://arbiscan.io"  # display/links only — never used for ABI fetch
 CHAIN_ID = 42161
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
@@ -701,12 +705,33 @@ def multicall(w3, calls):
 _W3 = None
 
 def get_w3():
-    """Process-local Arbitrum RPC client. Arbitrum is a standard rollup (like Base) — no
-    POA middleware needed (and injecting it would error on Arbitrum block headers)."""
+    """Process-local Arbitrum RPC client with built-in fallback + exponential backoff.
+    Arbitrum is a standard rollup (like Base) — no POA middleware needed."""
     global _W3
-    if _W3 is None:
-        _W3 = Web3(Web3.HTTPProvider(ARBITRUM_RPC))
-    return _W3
+    if _W3 is not None:
+        return _W3
+    candidates = [ARBITRUM_RPC] + [u for u in _ARBITRUM_RPC_FALLBACKS if u != ARBITRUM_RPC]
+    last_exc = None
+    for attempt, url in enumerate(candidates * 2):  # At most 2 rounds through the list
+        try:
+            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
+            # eth_chainId is cheaper than block_number for health checks
+            w3.eth.chain_id
+            _W3 = w3
+            return _W3
+        except Exception as e:
+            last_exc = e
+            msg = str(e)
+            if any(code in msg for code in ("429", "500", "502", "503", "Connection", "Timeout")):
+                # Exponential backoff with jitter: 0.5s, 1s, 2s, 4s, 8s, capped at 16s
+                delay = min(2 ** (attempt // len(candidates)) * 0.5, 16.0)
+                delay += random.uniform(0, delay * 0.3)
+                time.sleep(delay)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"All {len(candidates)} Arbitrum RPCs failed, last: {last_exc}")
 
 def _tx_gas_price(w3) -> int:
     """Estimated per-gas cost for balance checks (gas buffer pre-flights). Returns 2x the

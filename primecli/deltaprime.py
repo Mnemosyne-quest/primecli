@@ -209,7 +209,7 @@ Only depositPrime (inside prime-activate --amount) is solvency-gated -> RedStone
 prime-* write is onlyOwner and needs no payload. All prime-* views are oracle-free. Preview by default; --execute broadcasts.
 """
 
-import json, os, sys, time, re, base64, struct
+import json, os, sys, time, re, random, base64, struct
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 import requests
@@ -246,6 +246,12 @@ except ImportError:
     def check_version(*a, **kw): pass
 
 AVALANCHE_RPC = os.environ.get("DELTAPRIME_RPC", "https://api.avax.network/ext/bc/C/rpc")
+# Secondary RPCs tried when the primary returns 429/5xx. Expanded list spreads
+# concurrent cron process load across more free endpoints.
+_AVALANCHE_RPC_FALLBACKS = [
+    "https://avalanche.publicnode.com",
+    "https://avalanche.drpc.org",
+]
 EXPLORER = "https://snowtrace.io"
 CHAIN_ID = 43114
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
@@ -699,15 +705,40 @@ _impl_cache = {}
 # HTTPProvider — wasteful on multi-pool reads (cmd_pool_info("all"), gather_defi).
 _W3 = None
 
+def _make_avax_w3(rpc_url: str):
+    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    return w3
+
+
 def get_w3():
-    """Process-local Web3 client. Avalanche C-chain needs the POA middleware injected
-    once; subsequent callers share the same provider + middleware stack."""
+    """Process-local Web3 client with built-in fallback + exponential backoff on 429/5xx.
+    Avalanche C-chain needs the POA middleware injected once."""
     global _W3
-    if _W3 is None:
-        w3 = Web3(Web3.HTTPProvider(AVALANCHE_RPC))
-        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-        _W3 = w3
-    return _W3
+    if _W3 is not None:
+        return _W3
+    candidates = [AVALANCHE_RPC] + [u for u in _AVALANCHE_RPC_FALLBACKS if u != AVALANCHE_RPC]
+    last_exc = None
+    for attempt, url in enumerate(candidates * 2):  # At most 2 rounds through the list
+        try:
+            w3 = _make_avax_w3(url)
+            # eth_chainId is cheaper than block_number for health checks
+            w3.eth.chain_id
+            _W3 = w3
+            return _W3
+        except Exception as e:
+            last_exc = e
+            msg = str(e)
+            if any(code in msg for code in ("429", "500", "502", "503", "Connection", "Timeout")):
+                # Exponential backoff with jitter: 0.5s, 1s, 2s, 4s, 8s, capped at 16s
+                delay = min(2 ** (attempt // len(candidates)) * 0.5, 16.0)
+                delay += random.uniform(0, delay * 0.3)
+                time.sleep(delay)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"All {len(candidates)} Avalanche RPCs failed, last: {last_exc}")
 
 def _tx_gas_price(w3) -> int:
     """Estimated per-gas cost for balance checks (gas buffer pre-flights). Returns 2x the
