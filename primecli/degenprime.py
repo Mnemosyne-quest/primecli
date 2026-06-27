@@ -5951,9 +5951,12 @@ def _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg=None, execu
         return
 
     # Determine which non-pool assets to sweep
+    # Normalize via _account_asset_symbol so symbol aliases (EURC/EUROC) don't
+    # register the same underlying token as both pool-token and sweep-target.
+    _pool_norm = {_account_asset_symbol(sym0), _account_asset_symbol(sym1)}
     sweeps = {}
     for sym, bal_wei in valuable.items():
-        if sym not in (sym0, sym1):
+        if _account_asset_symbol(sym) not in _pool_norm:
             sweeps[sym] = bal_wei
 
     if not sweeps:
