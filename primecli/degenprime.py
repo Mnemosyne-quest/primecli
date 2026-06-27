@@ -2233,7 +2233,7 @@ def _aero_gauge_earned(w3, degen_account: 'Web3.eth.Contract', token_id: int) ->
     NPM (the gauge holds the NFT while staked).
     """
     try:
-        npm, _ver, _pos = _aero_npm_for_token(w3, token_id)
+        npm, _ver, _pos = _aero_npm_for_token(w3, token_id, degen_account.address)
         if npm is None:
             return 0.0
         gauge_addr = npm.functions.ownerOf(token_id).call()
@@ -2283,8 +2283,9 @@ def _aero_position_legs(w3, account):
     q96 = Decimal(2) ** 96
     legs = []
     for tid in ids:
-        # Resolve V2/V3 per tokenId — the two NPMs are independent ERC-721s.
-        _npm, ver, p = _aero_npm_for_token(w3, tid)
+        # Resolve V2/V3 per tokenId — the two NPMs are independent ERC-721s. Pass the
+        # prime account so an id live on both deployments resolves to the one it owns.
+        _npm, ver, p = _aero_npm_for_token(w3, tid, account.address)
         if p is None:
             continue
         # positions(): nonce, operator, token0, token1, tickSpacing, tickLower,
@@ -3763,12 +3764,25 @@ def cmd_cancel_withdrawal(pool_name: str, index: int, execute: bool = False):
 
 # ─── Aerodrome (Slipstream CL) ──────────────────────────────────────────────
 
-def _aero_match_pool_cfg(token0, token1):
-    """Find the AERODROME_POOLS cfg for a position's token pair (order-insensitive)."""
+def _aero_match_pool_cfg(token0, token1, tick_spacing=None, version=None):
+    """Find the AERODROME_POOLS cfg for a position's token pair (order-insensitive).
+
+    When `tick_spacing` and `version` ('v2'/'v3') are supplied, also match on tickSpacing
+    and deployment so a position resolves to its OWN cfg — and thus its own (baked) pool
+    address. Without them the first pair hit wins, which collides for the new V3 pairs
+    (virtual-weth, weth-euroc, both also present as earlier V2 entries — weth-euroc-100's
+    V2 pool is dead) and for the multi-tickSpacing V2 pairs. Passing None for either keeps
+    the legacy first-pair-match behavior."""
     pair = {token0.lower(), token1.lower()}
+    want_v3 = version == "v3"
     for cfg in AERODROME_POOLS.values():
-        if {cfg["token0"].lower(), cfg["token1"].lower()} == pair:
-            return cfg
+        if {cfg["token0"].lower(), cfg["token1"].lower()} != pair:
+            continue
+        if tick_spacing is not None and cfg["tickSpacing"] != tick_spacing:
+            continue
+        if version is not None and (cfg.get("slipstreamVersion", 0) == 1) != want_v3:
+            continue
+        return cfg
     return None
 
 
@@ -3848,13 +3862,19 @@ def cmd_aerodrome_positions(json_out=False):
     # for those. NPM.positions() returns the real struct for any holder.
     out = []
     for tid in ids:
-        pos = _aero_read_position(w3, tid)
-        if pos is None:
+        # Resolve the owning deployment (ownership-aware) and read the full struct so
+        # tickSpacing + version are in scope — needed to pick the position's OWN pool
+        # cfg below (a bare token-pair match returns the dead V2 pool for weth-euroc-v3).
+        _npm, ver, p = _aero_npm_for_token(w3, tid, pa)
+        if p is None:
             if not json_out:
                 print(f"    [{tid}] position read failed")
             out.append({"token_id": tid, "error": "position read failed"})
             continue
-        token0, token1, tick_lower, tick_upper, liq = pos
+        # positions(): nonce, operator, token0, token1, tickSpacing, tickLower,
+        #              tickUpper, liquidity, ...
+        token0, token1, tick_spacing = p[2], p[3], p[4]
+        tick_lower, tick_upper, liq = p[5], p[6], p[7]
         sym0 = _resolve_token_symbol(w3, token0)
         sym1 = _resolve_token_symbol(w3, token1)
         # Human price = token1 per token0 = 1.0001**tick * 10**(dec0 - dec1).
@@ -3866,7 +3886,7 @@ def cmd_aerodrome_positions(json_out=False):
             price_lower = 1.0001 ** tick_lower * scale
             price_upper = 1.0001 ** tick_upper * scale
 
-        pool_cfg = _aero_match_pool_cfg(token0, token1)
+        pool_cfg = _aero_match_pool_cfg(token0, token1, tick_spacing, ver)
         rng = _aero_range_metrics(w3, pool_cfg, tick_lower, tick_upper) if pool_cfg else None
 
         entry = {
@@ -3895,7 +3915,7 @@ def cmd_aerodrome_positions(json_out=False):
     else:
         print("  Manage on Aerodrome UI: https://aerodrome.finance/positions")
 
-def _aero_read_position(w3, token_id: int):
+def _aero_read_position(w3, token_id: int, pa: str = None):
     """Authoritative read of an Aerodrome Slipstream position via NPM.positions().
 
     getPositionCompositionSimplified is wrong for STAKED positions: once an NFT is
@@ -3905,8 +3925,9 @@ def _aero_read_position(w3, token_id: int):
     the real struct regardless of who holds the NFT — token0/token1, tickLower,
     tickUpper, and liquidity. Returns (token0, token1, tickLower, tickUpper, liquidity)
     or None if the read fails. Resolves the owning deployment (V2 or V3 NPM) per
-    tokenId so V3 positions read correctly."""
-    _npm, _ver, p = _aero_npm_for_token(w3, token_id)
+    tokenId so V3 positions read correctly; pass `pa` so an id live on both deployments
+    resolves to the one the prime account owns rather than a stranger's struct."""
+    _npm, _ver, p = _aero_npm_for_token(w3, token_id, pa)
     if p is None:
         return None
     # positions() layout: nonce, operator, token0, token1, tickSpacing,
@@ -4921,7 +4942,7 @@ def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float 
         print("  Would remove position (preview). Run with --execute to proceed.")
 
     # Find the pool from the position
-    pos = _aero_read_position(w3, token_id)
+    pos = _aero_read_position(w3, token_id, pa)
     if pos is None:
         print(f"Could not read position #{token_id}.")
         sys.exit(2)
@@ -4975,7 +4996,7 @@ def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
         sys.exit(2)
     pool_cfg = AERODROME_POOLS[pool_key]
 
-    pos = _aero_read_position(w3, token_id)
+    pos = _aero_read_position(w3, token_id, pa)
     if pos is None:
         print(f"Could not read Aerodrome tokenId {token_id}.")
         sys.exit(2)
@@ -5188,7 +5209,7 @@ def cmd_aero_remove_liquidity(token_ids, percentage: float = 100.0,
     # Show what each position holds before closing (NPM.positions() is correct for
     # staked NFTs, which the simplified facet view reports as 0 liquidity).
     for tid in token_ids:
-        pos = _aero_read_position(w3, tid)
+        pos = _aero_read_position(w3, tid, pa)
         if pos is None:
             print(f"  Position {tid}: cannot read (may not exist).")
             continue
@@ -5261,8 +5282,9 @@ def cmd_aero_claim_rewards(execute: bool = False):
     claimed_any = False
     for tid in ids:
         print(f"\nToken {tid}:")
-        # Resolve V2/V3 per tokenId — the two NPMs are independent ERC-721s.
-        npm, _ver, p = _aero_npm_for_token(w3, tid)
+        # Resolve V2/V3 per tokenId — the two NPMs are independent ERC-721s. Pass the
+        # prime account so an id live on both deployments resolves to the one it owns.
+        npm, _ver, p = _aero_npm_for_token(w3, tid, pa)
         if p is not None:
             sym0 = _resolve_token_symbol(w3, p[2])
             sym1 = _resolve_token_symbol(w3, p[3])
@@ -5335,7 +5357,7 @@ def cmd_aero_collect_fees(token_id: int, execute: bool = False):
 
     # Read position for display via NPM.positions() — correct for staked NFTs (the
     # simplified facet view reports liquidity=0 once the gauge owns the NFT).
-    pos = _aero_read_position(w3, token_id)
+    pos = _aero_read_position(w3, token_id, pa)
     if pos is None:
         print(f"  Cannot read position {token_id}.")
         return
@@ -5346,7 +5368,7 @@ def cmd_aero_collect_fees(token_id: int, execute: bool = False):
 
     # Also try to read uncollected fees from the owning NPM (V2 or V3) directly
     try:
-        _npm, _ver, npm_pos = _aero_npm_for_token(w3, token_id)
+        _npm, _ver, npm_pos = _aero_npm_for_token(w3, token_id, pa)
         if npm_pos is None:
             raise ValueError("tokenId not found on either Aerodrome deployment")
         owed0 = npm_pos[10]  # tokensOwed0
@@ -5390,30 +5412,74 @@ def cmd_aero_collect_fees(token_id: int, execute: bool = False):
 
 # ─── Aerodrome Auto-Rebalancer (AerodromeRebalancerFacet) ─────────────────────
 
-def _aero_npm_for_token(w3, token_id: int):
-    """Resolve which Aerodrome deployment knows a tokenId, trying the V2 NPM first
-    (our whitelisted V2 positions live there) then V3. The non-owning deployment
-    reverts. Returns (npm_contract, deployment, positions_struct) with deployment
-    'v2'/'v3', or (None, None, None) if neither deployment knows the tokenId
-    (burned/unknown). The V2 and V3 NPMs are independent ERC-721s, so the same numeric
-    tokenId can exist on both — callers must use the returned contract for every
-    follow-on call (positions/ownerOf) and key any per-token state by (deployment,
-    tokenId), never the bare number."""
+# Aerodrome Slipstream CL gauge: stakedContains(depositor, tokenId) -> bool. A staked
+# position's NFT is held by the gauge (NPM.ownerOf returns the gauge, not the account),
+# so this is how we confirm a staked tokenId belongs to a given prime account.
+_AERO_GAUGE_STAKED_ABI = json.loads(
+    '[{"inputs":[{"name":"depositor","type":"address"},{"name":"tokenId","type":"uint256"}],'
+    '"name":"stakedContains","outputs":[{"name":"","type":"bool"}],'
+    '"stateMutability":"view","type":"function"}]')
+
+
+def _aero_pa_owns_token(w3, npm, token_id: int, pa: str) -> bool:
+    """True iff prime account `pa` owns `token_id` on this NPM deployment — holding the
+    NFT directly (ownerOf == pa) or via its Aerodrome gauge while staked
+    (gauge.stakedContains(pa, id), since the staked NFT is held by the gauge). Used to
+    disambiguate a tokenId that is live on BOTH the V2 and V3 NPMs. Read errors fail
+    closed (return False) so a flaky RPC never mis-assigns ownership."""
+    try:
+        pa_cs = Web3.to_checksum_address(pa)
+        owner = Web3.to_checksum_address(npm.functions.ownerOf(token_id).call())
+    except Exception:
+        return False
+    if owner == pa_cs:
+        return True
+    try:
+        gauge = w3.eth.contract(address=owner, abi=_AERO_GAUGE_STAKED_ABI)
+        return bool(gauge.functions.stakedContains(pa_cs, token_id).call())
+    except Exception:
+        return False
+
+
+def _aero_npm_for_token(w3, token_id: int, pa: str = None):
+    """Resolve which Aerodrome deployment knows a tokenId. Returns
+    (npm_contract, deployment, positions_struct) with deployment 'v2'/'v3', or
+    (None, None, None) if neither deployment knows the tokenId (burned/unknown).
+
+    The V2 and V3 NPMs are independent ERC-721s with OVERLAPPING tokenId ranges, and
+    positions(id) succeeds for ANY live id regardless of owner — so a bare numeric
+    tokenId can resolve on BOTH deployments and a fixed-probe-order resolver can hand
+    back a STRANGER's struct from the wrong deployment. When `pa` (the prime account that
+    owns the id) is supplied AND both deployments have the id live, pick the deployment
+    where the position actually belongs to `pa` (held directly, or staked in pa's gauge).
+    When only one deployment has the id (the common case) or `pa` is omitted, return the
+    first live deployment (V2 first) with no extra calls. Callers must use the returned
+    contract for every follow-on call (positions/ownerOf) and key any per-token state by
+    (deployment, tokenId), never the bare number."""
+    live = []
     for ver, addr in (("v2", AERODROME_NPM_V2), ("v3", AERODROME_NPM_V3)):
         try:
             npm = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=AERODROME_NPM_ABI)
-            return npm, ver, npm.functions.positions(token_id).call()
+            live.append((ver, npm, npm.functions.positions(token_id).call()))
         except Exception:
             continue
-    return None, None, None
+    if not live:
+        return None, None, None
+    if len(live) > 1 and pa is not None:
+        for ver, npm, pos in live:
+            if _aero_pa_owns_token(w3, npm, token_id, pa):
+                return npm, ver, pos
+    ver, npm, pos = live[0]
+    return npm, ver, pos
 
 
-def _aero_resolve_npm(w3, token_id: int):
+def _aero_resolve_npm(w3, token_id: int, pa: str = None):
     """Resolve which Aerodrome deployment owns a tokenId. Returns (deployment,
     position_struct) where deployment is 'v2'/'v3' and the struct is the raw positions()
     tuple, or (None, None) if neither deployment knows the tokenId (burned/unknown).
-    Thin wrapper over _aero_npm_for_token for callers that don't need the contract."""
-    _npm, ver, pos = _aero_npm_for_token(w3, token_id)
+    Thin wrapper over _aero_npm_for_token for callers that don't need the contract; pass
+    `pa` to enable ownership-aware disambiguation when the id is live on both deployments."""
+    _npm, ver, pos = _aero_npm_for_token(w3, token_id, pa)
     return ver, pos
 
 
@@ -5592,7 +5658,7 @@ def cmd_aero_rebalance_status(token_id: int = None, check: bool = False,
     decoded = []
     for tid, order in orders:
         d = _order_to_dict(tid, order)
-        ver, pos = _aero_resolve_npm(w3, tid)
+        ver, pos = _aero_resolve_npm(w3, tid, pa)
         if pos is not None:
             sym0 = _resolve_token_symbol(w3, pos[2])
             sym1 = _resolve_token_symbol(w3, pos[3])
@@ -5894,7 +5960,7 @@ def cmd_aero_rebalance_create(token_id: int, width_pct: float, mode: str = "outs
     if pa:
         pa_cs = Web3.to_checksum_address(pa)
         account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
-        pos = _aero_read_position(w3, token_id)
+        pos = _aero_read_position(w3, token_id, pa)
         if pos:
             pos_t0, pos_t1, _, _, _ = pos
             pos_t0, pos_t1 = pos_t0.lower(), pos_t1.lower()
