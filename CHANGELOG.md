@@ -4,6 +4,30 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.11.0] - 2026-06-27
+
+### Added
+- **DegenPrime Aerodrome V3 (Gauges-V3 / Slipstream-3) pool support.** Added the two
+  DegenPrime-whitelisted V3 pools — `virtual-weth-50-v3` (VIRTUAL/ETH, tickSpacing 50,
+  V3-only) and `weth-euroc-100-v3` (WETH/EURC, tickSpacing 100, live gauge; the older V2
+  weth-euroc gauge is dead). New `slipstreamVersion` registry field (default `0` = V2) plus
+  `AERODROME_CL_FACTORY_V2/V3` constants. Mint sets the facet's `slipstreamVersion` param
+  (byte-identical static ABI encode — only the version word changes); `_aero_pool_address`
+  resolves via the registry's baked pool address / factory-by-version; per-tokenId reads
+  route through a new version-aware `_aero_npm_for_token` resolver (the V2 and V3
+  NonfungiblePositionManagers are independent ERC-721s). increase/remove/collect dispatch by
+  the facet's stored on-chain version, so no client write-arg change. Verified: on-chain
+  mint `eth_call` simulation accepted by the DegenPrime facet; existing V2 pools unaffected.
+
+### Fixed
+- **V3 position display correctness.** `_aero_npm_for_token` is now ownership-aware: when the
+  same numeric tokenId is live on both the V2 and V3 NPMs, it returns the deployment the
+  prime account actually owns (`ownerOf == pa`, or `gauge.stakedContains(pa, tid)` when
+  staked) instead of a v2-first guess that could surface a stranger's position. And
+  `_aero_match_pool_cfg` now matches on (pair, tickSpacing, version), so a V3 position
+  resolves its own pool rather than a same-pair V2 entry (this also fixes a latent
+  multi-tickSpacing V2 mis-resolution). Display-only — no fund or broadcast path was affected.
+
 ## [0.10.4] - 2026-06-24
 
 ### Fixed
