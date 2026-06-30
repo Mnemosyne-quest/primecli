@@ -622,6 +622,7 @@ def _delever_lp_positions(
     strategy: dict,
     state_dir: str,
     label: str,
+    health_pct: float | None = None,
     dry_run: bool = False,
 ) -> dict:
     """Close LP positions to free assets for USDC debt repayment.
@@ -698,7 +699,7 @@ def _delever_lp_positions(
                         }))
                         detail = f"GMX {market_label}: withdraw {gm_to_withdraw:.4f} GM submitted (keeper pending)"
                         result = {"ok": True, "async": True, "freed": 0.0, "detail": detail}
-                        _notify(f"\U0001f504 De-lever: {label} {detail}")
+                        _notify(f"🔄 ⚠️ De-lever on {label}: health low — withdrawing GMX position to free collateral. {detail}")
                     else:
                         err = r.stderr[:300]
                         result = {"ok": False, "error": f"gmx-withdraw failed: {err}"}
@@ -734,7 +735,7 @@ def _delever_lp_positions(
                     if r.returncode == 0:
                         detail = f"closed Aerodrome tokenId {token_id}"
                         result = {"ok": True, "freed": item_usd, "detail": detail}
-                        _notify(f"\U0001f504 De-lever: {label} closed Aerodrome tokenId {token_id}")
+                        _notify(f"🔄 ⚠️ De-lever on {label}: health was {health_pct}% — closing Aerodrome LP position #{token_id} (${item_usd:.2f} worth of collateral)")
                     else:
                         err = r.stderr[:300]
                         result = {"ok": False, "error": f"aero-remove-liquidity failed: {err}"}
@@ -787,7 +788,7 @@ def _delever_lp_positions(
                     if r.returncode == 0:
                         detail = f"closed LB {pair}"
                         result = {"ok": True, "freed": 0.0, "detail": detail}
-                        _notify(f"\U0001f504 De-lever: {label} closed LB {pair}")
+                        _notify(f"🔄 ⚠️ De-lever on {label}: health was {health_pct}% — closing TraderJoe LB position ({pair})")
                     else:
                         err = r.stderr[:300]
                         result = {"ok": False, "error": f"lb-remove failed: {err}"}
@@ -862,7 +863,7 @@ def _check_pending_gmx_delever(state_dir: str, defi_data: dict, label: str) -> d
         lvl = "partial" if gm_now > 0 else "full"
         detail = f"{market}: GM {gm_before:.2f} -> {gm_now:.2f} ({lvl} close)"
         marker_path.unlink(missing_ok=True)
-        _notify(f"\u2705 GMX de-lever {label}: {detail}")
+        _notify(f"✅ GMX de-lever on {label}: withdraw complete — {detail}")
         return {"settled": True, "detail": detail}
 
     if age > _GMX_PENDING_MAX_AGE:
@@ -1254,7 +1255,7 @@ def run_tick(
                     lp_result = _delever_lp_positions(
                         defi_data, tool_path, lp_shortfall,
                         strategy, state_dir, label,
-                        dry_run=dry_run,
+                        health_pct=pct, dry_run=dry_run,
                     )
                     # DRY-RUN: _delever_lp_positions broadcast NOTHING. Report what it
                     # WOULD have closed/repaid and stop — never touch the chain.
@@ -1348,9 +1349,9 @@ def run_tick(
                                 "health_pct": pct, "label": label,
                             })
                             _notify(
-                                f"🚨 {label}: de-lever LP closed but debt remains "
-                                f"(${repay_amt:.2f} to repay, nothing freed/repayable). "
-                                f"Health {pct}%. Manual unwind needed."
+                                f"🚨 {label}: LP position closed but CANNOT repay debt — "
+                                f"no freed tokens matched any existing debt leg. "
+                                f"Still owe ${repay_amt:.2f}, health at {pct}%. Manual intervention needed."
                             )
                             result["action"] = "escalate (debt remains after LP close)"
                             return result
@@ -1363,8 +1364,9 @@ def run_tick(
                         if remaining_after < 1.0 or usdc_shortfall < 0.50:
                             result["action"] = f"repaid ${repaid_usd:.2f} (LP de-lever, token-matched)"
                             _notify(
-                                f"🔄 Rebalance: {label} closed LP + repaid ${repaid_usd:.2f} "
-                                f"(token-matched, health was {pct}%)"
+                                f"🔄 ✅ Rebalance {label}: closed LP and repaid ${repaid_usd:.2f} "
+                                f"from freed tokens directly (no swap needed — "
+                                f"freed USDC matched debt USDC). Health was {pct}%."
                             )
                             return result
 
@@ -1446,8 +1448,9 @@ def run_tick(
                                 total_repaid = repaid_usd + second_repay
                                 result["action"] = f"repaid ${total_repaid:.2f} (LP de-lever)"
                                 _notify(
-                                    f"🔄 Rebalance: {label} closed LP + repaid ${total_repaid:.2f} "
-                                    f"(health was {pct}%)"
+                                    f"🔄 ✅ Rebalance {label}: closed LP, swapped freed tokens to "
+                                    f"USDC, and repaid ${total_repaid:.2f} total. "
+                                    f"Health was {pct}%."
                                 )
                             else:
                                 result["warning"] = f"shortfall repay failed: {r2.stderr[:200]}"
@@ -1478,7 +1481,7 @@ def run_tick(
                 if r.returncode == 0:
                     cooldown_file.write_text(str(int(time.time())))
                     result["action"] = f"repaid ${repay_amt:.2f}"
-                    _notify(f"🔄 Rebalance: {label} repaid ${repay_amt:.2f} USDC (health was {pct}%)")
+                    _notify(f"🔄 ✅ {label}: repaid ${repay_amt:.2f} USDC directly from raw balance (health was {pct}% — no swap needed)")
                 else:
                     result["error"] = f"repay failed: {r.stderr[:200]}"
             except Exception as e:
@@ -1565,14 +1568,14 @@ def run_tick(
                     )
                     if sr.returncode == 0:
                         result["action"] = f"borrowed ${borrow_amt:.2f}, swapped to {swap_target}"
-                        _notify(f"🔄 Rebalance: {label} borrowed ${borrow_amt:.2f} USDC → swapped to {swap_target} (health was {pct}%)")
+                        _notify(f"🔄 ⬆️ {label}: leveraging up — borrowed ${borrow_amt:.2f} USDC and swapped to {swap_target} (health was {pct}%, adding leverage for yield)")
                     else:
                         result["warning"] = f"swap to {swap_target} failed after borrow: {sr.stderr[:200]}"
                 except Exception as e:
                     result["error"] = f"borrow+swap error: {e}"
             else:
                 result["action"] = f"borrowed ${borrow_amt:.2f} USDC (defisims autofarm deploys)"
-                _notify(f"🔄 Rebalance: {label} borrowed ${borrow_amt:.2f} USDC (health was {pct}%) → defisims deploys")
+                _notify(f"🔄 ⬆️ {label}: leveraging up — borrowed ${borrow_amt:.2f} USDC (health was {pct}%, defisims autofarm will deploy into LP)")
 
             cooldown_file.write_text(str(int(time.time())))
     return result
