@@ -4,6 +4,19 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.11.2] - 2026-07-02
+
+### Changed
+- **`degenprime` ParaSwap quote requests now allowlist route types instead of
+  blocklisting them.** `_paraswap_price_route` sent `excludeContractMethods` naming the
+  specific router methods `AerodromeFacet`/`SwapDebtFacet` can't decode. Switched to
+  `includeContractMethods=swapExactAmountIn,swapExactAmountInOnUniswapV3` (matching
+  `PARASWAP_SUPPORTED_SELECTORS`) so a ParaSwap route type added in the future is
+  excluded by construction rather than needing a new blocklist entry to keep up. No
+  behavior change today (the local `_paraswap_decode_and_check` decode-and-refuse
+  gate already caught anything unsupported before broadcast) — this only tightens the
+  quote request itself, matching the DegenPrime team's own integration guidance.
+
 ## [0.11.1] - 2026-07-02
 
 ### Fixed

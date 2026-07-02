@@ -3152,17 +3152,19 @@ def _swap_asset_meta(w3, symbol: str):
 def _paraswap_price_route(src_token, src_dec, dest_token, dest_dec, amount_in_wei, user_addr):
     """ParaSwap /prices on Base (network=8453, v6.2). Returns the priceRoute dict for a
     SELL of amount_in_wei src->dest. The priceRoute is passed verbatim to /transactions.
-    excludeContractMethods is hard-coded to keep ParaSwap from picking a router method
-    the facet can't decode (multiSwap/megaSwap/protected* etc.). excludeDEXS drops the
-    RFQ/maker sources (AugustusRFQ, Hashflow, etc.) up front: those won't fill for a
-    contract caller and are the prime SwapFailed() culprits - cutting them at the quote
-    keeps the re-quote loop from churning through routes that can never simulate clean."""
+    includeContractMethods pins the API to exactly the two router methods the facet can
+    decode (PARASWAP_SUPPORTED_SELECTORS) - an allowlist, not a blocklist, so a future
+    ParaSwap route type the facet still can't decode is excluded by construction instead
+    of needing a matching blocklist entry. excludeDEXS drops the RFQ/maker sources
+    (AugustusRFQ, Hashflow, etc.) up front: those won't fill for a contract caller and
+    are the prime SwapFailed() culprits - cutting them at the quote keeps the re-quote
+    loop from churning through routes that can never simulate clean."""
     params = {
         "srcToken": src_token, "srcDecimals": src_dec,
         "destToken": dest_token, "destDecimals": dest_dec,
         "amount": str(amount_in_wei), "side": "SELL",
         "network": CHAIN_ID, "version": "6.2", "userAddress": user_addr,
-        "excludeContractMethods": "multiSwap,megaSwap,protectedMultiSwap,protectedMegaSwap,protectedSimpleSwap,simpleSwap,swapExactAmountInOnCurveV1",
+        "includeContractMethods": "swapExactAmountIn,swapExactAmountInOnUniswapV3",
         "excludeDEXS": "AugustusRFQ,ParaSwapLimitOrders,Hashflow,Bebop,Swaap,SwaapV2,DexalotRFQ,NativeV1,Clipper,Metric,MetricRFQ",
     }
     r = requests.get(f"{PARASWAP_API}/prices", params=params,

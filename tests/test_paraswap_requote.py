@@ -141,3 +141,27 @@ def test_price_route_excludes_rfq_dexs(monkeypatch):
     excluded = captured["params"]["excludeDEXS"]
     assert "AugustusRFQ" in excluded
     assert "ParaSwapLimitOrders" in excluded
+
+
+def test_price_route_pins_include_contract_methods(monkeypatch):
+    """`_paraswap_price_route` must allowlist via includeContractMethods (not
+    blocklist via excludeContractMethods) so a future ParaSwap route type the facet
+    still can't decode is excluded by construction, matching PARASWAP_SUPPORTED_SELECTORS
+    (swapExactAmountIn / swapExactAmountInOnUniswapV3)."""
+    captured = {}
+
+    class _Resp:
+        @staticmethod
+        def json():
+            return {"priceRoute": {"destAmount": "1"}}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        captured["params"] = params
+        return _Resp()
+
+    monkeypatch.setattr(dp.requests, "get", fake_get)
+    dp._paraswap_price_route(SRC, 18, DEST, 6, AMOUNT, PA)
+    params = captured["params"]
+    assert "excludeContractMethods" not in params
+    included = set(params["includeContractMethods"].split(","))
+    assert included == {"swapExactAmountIn", "swapExactAmountInOnUniswapV3"}

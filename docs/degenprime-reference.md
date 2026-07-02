@@ -192,7 +192,7 @@ The facet decodes exactly two router methods:
 - `swapExactAmountIn` (selector `0xe3ead59e`) — generic executor route.
 - `swapExactAmountInOnUniswapV3` (selector `0x876a02f6`) — Uniswap V3 direct route.
 
-If the ParaSwap API returns any other method (`multiSwap`, `megaSwap`, `protectedSimpleSwap`, etc.), the build refuses. The tool passes `excludeContractMethods` to the API to keep it on a decodable route. The facet enforces a hard 5% slippage cap (RedStone-priced) on top of the `--slippage` flag. Executor whitelist applies as on DeltaPrime; the tool patches to a known-good fallback executor if ParaSwap returns one that isn't on the list.
+If the ParaSwap API returns any other method (`multiSwap`, `megaSwap`, `protectedSimpleSwap`, etc.), the build refuses. The tool passes `includeContractMethods=swapExactAmountIn,swapExactAmountInOnUniswapV3` to the API to pin it to exactly the two decodable routes (an allowlist, so a future ParaSwap route type is excluded by construction rather than needing a matching blocklist entry). The facet enforces a hard 5% slippage cap (RedStone-priced) on top of the `--slippage` flag. Executor whitelist applies as on DeltaPrime; the tool patches to a known-good fallback executor if ParaSwap returns one that isn't on the list.
 
 ### 6.4 Factory function shape
 
@@ -258,7 +258,7 @@ These are the non-obvious bits. They are the reason naïve approaches fail.
 
 3. **RedStone gating + partial feed coverage.** Functions that compute USD value or check solvency revert `0xe7764c9e` on a bare `eth_call`; the signed-price payload must be appended. The payload covers only the 13 feed-available symbols; the SolvencyFacet sources the rest from BaseOracle internally. The tool's `degen_account_price_feeds()` filters owned + debt assets to feed-available symbols.
 
-4. **ParaSwap router method whitelist.** Only `swapExactAmountIn` (`0xe3ead59e`) and `swapExactAmountInOnUniswapV3` (`0x876a02f6`) decode. The tool passes `excludeContractMethods` to keep ParaSwap on a decodable route; if a different method comes back, the build refuses with a clear error rather than letting the on-chain call revert.
+4. **ParaSwap router method whitelist.** Only `swapExactAmountIn` (`0xe3ead59e`) and `swapExactAmountInOnUniswapV3` (`0x876a02f6`) decode. The tool passes `includeContractMethods` (an allowlist of exactly those two) to keep ParaSwap on a decodable route; if a different method comes back anyway, the build refuses with a clear error rather than letting the on-chain call revert.
 
 5. **ParaSwap executor whitelist.** The facet validates the executor address embedded in the calldata. The tool maintains a starting whitelist (lower-cased) and patches to a known-good fallback executor (`0x000010036C0190E009a000d0fc3541100A07380A`) if ParaSwap returns one that isn't on the list. Real reverts surface missing executors with `InvalidExecutor`; add them as they show up.
 
