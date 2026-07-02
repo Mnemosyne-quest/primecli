@@ -4,6 +4,32 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.11.1] - 2026-07-02
+
+### Fixed
+- **`aero-add-liquidity --use-all-available` swept a pool token away under its
+  account-symbol alias (EURC/EUROC).** `_aero_use_all_available`'s sweep-separation
+  loop compared raw account symbols against the pool config's `symbol0`/`symbol1`
+  directly. When a pool's `symbol1` is `EURC` but the account (and its RedStone feed)
+  stores the same underlying as `EUROC`, both keys carry the identical on-chain
+  balance, and `"EUROC" == "EURC"` is False — so the `EUROC` entry fell into the
+  non-pool "sweep" bucket even though `EURC` was simultaneously counted as the pool
+  leg. On `--execute` the tool would then swap the account's entire real EURC holding
+  into the pool's bottleneck token before minting (a ~$820 EURC->ETH swap on the live
+  `weth-euroc-100-v3` position, caught in preview before broadcast). Fixed by
+  normalizing both sides through `_account_asset_symbol` before the comparison,
+  factored into a small `_aero_separate_pool_and_sweeps` helper with a regression test.
+  Same alias-dedup class as ba9ae34 / 4572343; the downstream precision-balance sweep
+  was already safe (it reads via `_aero_in_account_balance`, which normalizes).
+
+### Changed
+- **`degenprime swap-debt` now warns when `--amount` exceeds the outstanding debt.**
+  `--amount` is denominated in the `--from` token's native units (not USD) and was
+  silently capped to `min(requested, debt)`, so requesting more than the debt quietly
+  refinanced the entire position with no notice. It now prints an explicit one-line
+  warning that names the unit denomination and the cap. `cmd_repay` already surfaces
+  its cap in both preview and execute paths and is unchanged.
+
 ## [0.11.0] - 2026-06-27
 
 ### Added

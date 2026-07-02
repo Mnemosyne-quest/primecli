@@ -284,3 +284,43 @@ def test_eurc_display_symbol_reads_euroc_account_balance():
     assert dp._account_asset_symbol("EURC") == "EUROC"
     assert dp._aero_in_account_balance(_Account(), "EURC") == 123
     assert calls == [("balance", "EUROC"), ("intent", "EUROC")]
+
+
+# ─────────────── FIX 4: EURC/EUROC sweep-separation dedup (_use_all_available) ─
+# _aero_use_all_available split its inventory into the two pool-token balances vs
+# the non-pool "sweep" assets with a raw string compare (sym == symbol1). For an
+# ETH/EURC pool the account holds the EURC leg under its EUROC alias, so
+# "EUROC" != "EURC" dropped that real pool-token balance into the sweep bucket —
+# which --execute would then swap away before minting, while it was ALSO counted as
+# the pool leg. The fix normalizes both sides via _account_asset_symbol.
+
+def test_separate_pool_and_sweeps_dedups_eurc_alias():
+    # symbol1 == "EURC", but the same balance is also keyed under the account alias
+    # "EUROC". Neither may land in sweeps, and the pool leg is counted exactly once.
+    bal = 820_000_000  # ~820 EURC (6 decimals)
+    valuable = {"ETH": 5 * 10**17, "EURC": bal, "EUROC": bal, "USDC": 50_000_000}
+    pool0, pool1, sweeps = dp._aero_separate_pool_and_sweeps(valuable, "ETH", "EURC")
+    assert "EURC" not in sweeps
+    assert "EUROC" not in sweeps
+    assert pool0 == 5 * 10**17
+    assert pool1 == bal                        # counted once, not doubled
+    assert sweeps == {"USDC": 50_000_000}      # only the genuine foreign asset sweeps
+
+
+def test_separate_pool_and_sweeps_pool_token_only_under_alias():
+    # Even when the EURC leg is present ONLY under its EUROC account alias, it is
+    # attributed to the pool leg, never swept.
+    bal = 100_000_000
+    pool0, pool1, sweeps = dp._aero_separate_pool_and_sweeps(
+        {"ETH": 10**18, "EUROC": bal}, "ETH", "EURC")
+    assert pool1 == bal
+    assert sweeps == {}
+
+
+def test_separate_pool_and_sweeps_no_alias_normal_split():
+    # No alias involved: genuine non-pool assets sweep, pool tokens don't.
+    valuable = {"WETH": 10**18, "USDC": 2_000_000, "AERO": 999, "cbBTC": 7}
+    pool0, pool1, sweeps = dp._aero_separate_pool_and_sweeps(valuable, "WETH", "USDC")
+    assert pool0 == 10**18
+    assert pool1 == 2_000_000
+    assert sweeps == {"AERO": 999, "cbBTC": 7}

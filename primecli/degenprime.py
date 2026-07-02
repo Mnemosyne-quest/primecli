@@ -3457,7 +3457,12 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     if borrowed == 0:
         print(f"Degen Account has no {from_sym} debt to refinance.")
         return
-    repay_amount = min(to_wei_units(amount, from_cfg["decimals"]), borrowed)
+    requested_wei = to_wei_units(amount, from_cfg["decimals"])
+    repay_amount = min(requested_wei, borrowed)
+    if requested_wei > borrowed:
+        print(f"  Warning: requested {amount} {from_sym} exceeds the "
+              f"{borrowed / 10**from_cfg['decimals']:.6f} {from_sym} debt "
+              f"(--amount is in {from_sym} units, not USD) — capping to the full debt.")
 
     feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
     payload = build_redstone_payload(feeds)
@@ -4336,6 +4341,32 @@ def _swap_with_usdc_fallback(account, from_sym, to_sym, amount_human,
     return True
 
 
+def _aero_separate_pool_and_sweeps(valuable: dict, sym0: str, sym1: str):
+    """Split a {symbol: balance_wei} inventory into the two pool-token balances
+    and the non-pool "sweep" assets, returning (pool0_bal_wei, pool1_bal_wei,
+    sweeps).
+
+    Comparison is on NORMALIZED account symbols (_account_asset_symbol), so an
+    account alias of a pool token — EURC held/queried as EUROC — is attributed to
+    its pool leg instead of the sweep bucket. A raw string compare ("EUROC" ==
+    "EURC") dropped the real pool-token balance into `sweeps`, which --execute
+    would then swap away before the mint even though it was also counted as the
+    pool leg. Same alias dedup _aero_rebuild_sweep already applies (ba9ae34)."""
+    norm0, norm1 = _account_asset_symbol(sym0), _account_asset_symbol(sym1)
+    pool0_bal_wei = 0
+    pool1_bal_wei = 0
+    sweeps = {}
+    for sym, bal_wei in valuable.items():
+        norm = _account_asset_symbol(sym)
+        if norm == norm0:
+            pool0_bal_wei = bal_wei
+        elif norm == norm1:
+            pool1_bal_wei = bal_wei
+        else:
+            sweeps[sym] = bal_wei
+    return pool0_bal_wei, pool1_bal_wei, sweeps
+
+
 def _aero_use_all_available(
     w3, acct, account, pa_cs, pool_cfg,
     width_pct=2.0, slippage_pct=1.0, execute=False,
@@ -4435,17 +4466,11 @@ def _aero_use_all_available(
         print("  No available assets to deploy.")
         return False
 
-    # 5. Identify non-pool assets (to sweep) and pool-token balances
-    sweeps = {}
-    pool0_bal_wei = valuable.get(sym0, 0)
-    pool1_bal_wei = valuable.get(sym1, 0)
-    for sym, bal_wei in valuable.items():
-        if sym == sym0:
-            pool0_bal_wei = bal_wei
-        elif sym == sym1:
-            pool1_bal_wei = bal_wei
-        else:
-            sweeps[sym] = bal_wei
+    # 5. Identify non-pool assets (to sweep) and pool-token balances. Alias-aware
+    # (EURC/EUROC) so the same underlying is never both a pool leg and a sweep
+    # target — see _aero_separate_pool_and_sweeps.
+    pool0_bal_wei, pool1_bal_wei, sweeps = _aero_separate_pool_and_sweeps(
+        valuable, sym0, sym1)
 
     # 6. Compute optimal allocation for pool tokens
     tick_lower, tick_upper = _aero_tick_range(
