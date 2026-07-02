@@ -21,6 +21,19 @@ All notable changes to `primecli` are documented here. The format follows
   factored into a small `_aero_separate_pool_and_sweeps` helper with a regression test.
   Same alias-dedup class as ba9ae34 / 4572343; the downstream precision-balance sweep
   was already safe (it reads via `_aero_in_account_balance`, which normalizes).
+- **Restored cross-file byte-identity for `_resolve_debt_coverages` (the anti-drift
+  guard was red on `main`).** `4572343` wrapped the symbol in `_account_asset_symbol`
+  inside `degenprime.py`'s batched debtCoverage resolver only, leaving
+  `deltaprime.py`/`arbprime.py` with the un-normalized `asset_b32(s)` call and no
+  `_account_asset_symbol` helper at all — so `test_cross_file_identity`'s
+  supply-chain-drift guard failed on `_resolve_debt_coverages` (241/242 since that
+  commit; nobody hit it because no release ran in between). Mirrored the same wrap into
+  both siblings and added a chain-appropriate `_account_asset_symbol` to each. The
+  helper is the identity today on Avalanche and Arbitrum: neither passes a display-vs-
+  account symbol mismatch to the resolver (Avalanche configures the euro coin as
+  `EUROC` directly; Arbitrum has no euro asset), so no real alias table was warranted —
+  but the wrap keeps all three resolvers identical, preserving the guard rather than
+  carving the function out of it.
 
 ### Changed
 - **`degenprime swap-debt` now warns when `--amount` exceeds the outstanding debt.**

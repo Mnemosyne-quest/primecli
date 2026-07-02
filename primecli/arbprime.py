@@ -1199,6 +1199,15 @@ def get_prime_account(w3, owner: str) -> str:
 def asset_b32(symbol: str) -> bytes:
     return symbol.encode().ljust(32, b"\x00")
 
+def _account_asset_symbol(symbol: str) -> str:
+    """Map a display/pool symbol to the bytes32 symbol the account stores on-chain.
+    Identity on Arbitrum today — every pool/token config already uses the canonical
+    account symbol and Arbitrum lists no aliased assets (no EURC/EUROC here). Kept so
+    _resolve_debt_coverages stays byte-identical with the degenprime copy, where Base
+    pool configs use "EURC" and must be normalized to the account's "EUROC" before
+    getAssetAddress can resolve it."""
+    return symbol
+
 def pool_to_asset_symbol(pool_name: str) -> str:
     """Pool key -> on-chain bytes32 asset symbol (the contracts use 'ETH', not 'WETH';
     'BTC', not 'WBTC')."""
@@ -2272,7 +2281,10 @@ def _resolve_debt_coverages(w3, symbols: list, tier_code: int = 0) -> dict:
         '{"inputs":[{"name":"t","type":"uint8"},{"name":"a","type":"address"}],"name":"tieredDebtCoverage",'
         '"outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}]')
     tm = w3.eth.contract(address=Web3.to_checksum_address(TOKEN_MANAGER), abi=tm_abi)
-    addr_legs = [(TOKEN_MANAGER, bytes.fromhex(tm.encode_abi("getAssetAddress", args=[asset_b32(s), True])[2:]))
+    # Resolve through the account's bytes32 alias (identity on this chain; see
+    # _account_asset_symbol) so this batched resolver stays byte-identical with the
+    # degenprime copy, where Base configs use "EURC" for the account symbol "EUROC".
+    addr_legs = [(TOKEN_MANAGER, bytes.fromhex(tm.encode_abi("getAssetAddress", args=[asset_b32(_account_asset_symbol(s)), True])[2:]))
                  for s in missing]
     addr_res = multicall(w3, addr_legs)
     addrs = {}
