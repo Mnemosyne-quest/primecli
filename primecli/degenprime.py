@@ -2275,6 +2275,56 @@ def _gather_account_state(w3, account, pool_deposits: list):
     return pa_eth, supplied, borrowed, solvency
 
 
+def _aero_resolve_positions_batched(w3, token_ids, pa):
+    """Resolve {tokenId: (npm_contract, deployment, positions_struct)} for a list of staked
+    Aerodrome tokenIds, batching the positions() probes on the V2 and V3 NPMs into ONE
+    Multicall3 round-trip (previously 2 sequential eth_calls per id inside
+    _aero_npm_for_token). aggregate3 allowFailure=True mirrors that resolver's try/except:
+    a positions() revert means the id is not live on that deployment. For an id live on BOTH
+    deployments (overlapping id ranges) the security-sensitive "which deployment does pa
+    actually own" disambiguation is delegated unchanged to per-id _aero_npm_for_token. Dead
+    ids are omitted. Each (contract, deployment, struct) returned is identical to what
+    _aero_npm_for_token(w3, id, pa) would return."""
+    if not token_ids:
+        return {}
+    npms = {
+        "v2": w3.eth.contract(address=Web3.to_checksum_address(AERODROME_NPM_V2), abi=AERODROME_NPM_ABI),
+        "v3": w3.eth.contract(address=Web3.to_checksum_address(AERODROME_NPM_V3), abi=AERODROME_NPM_ABI),
+    }
+    pos_out_types = [o["type"] for o in next(
+        f for f in AERODROME_NPM_ABI if f.get("name") == "positions")["outputs"]]
+    order = ("v2", "v3")
+    legs = []
+    for tid in token_ids:
+        for ver in order:
+            legs.append((npms[ver].address,
+                         bytes.fromhex(npms[ver].encode_abi("positions", args=[tid])[2:])))
+    try:
+        results = multicall(w3, legs)
+    except Exception:
+        results = [(False, b"")] * len(legs)
+    resolved = {}
+    for i, tid in enumerate(token_ids):
+        live = []
+        for j, ver in enumerate(order):
+            ok, rd = results[2 * i + j]
+            if ok and rd:
+                try:
+                    live.append((ver, w3.codec.decode(pos_out_types, rd)))
+                except Exception:
+                    continue
+        if not live:
+            continue
+        if len(live) > 1 and pa is not None:
+            npm, ver, pos = _aero_npm_for_token(w3, tid, pa)
+            if npm is not None:
+                resolved[tid] = (npm, ver, pos)
+        else:
+            ver, pos = live[0]
+            resolved[tid] = (npms[ver], ver, pos)
+    return resolved
+
+
 def _aero_gauge_earned(w3, degen_account: 'Web3.eth.Contract', token_id: int) -> float:
     """Query unclaimed AERO rewards from the Aerodrome gauge for a staked LP.
 
@@ -2331,11 +2381,16 @@ def _aero_position_legs(w3, account):
         return []
     slot0_abi = json.loads(SLOT0_ABI)
     q96 = Decimal(2) ** 96
+    # Resolve V2/V3 per tokenId in ONE batched positions() round-trip (was 2 sequential
+    # eth_calls per id). _aero_resolve_positions_batched returns exactly what per-id
+    # _aero_npm_for_token would, ownership disambiguation for both-live ids included.
+    resolved = _aero_resolve_positions_batched(w3, ids, account.address)
     legs = []
     for tid in ids:
-        # Resolve V2/V3 per tokenId — the two NPMs are independent ERC-721s. Pass the
-        # prime account so an id live on both deployments resolves to the one it owns.
-        _npm, ver, p = _aero_npm_for_token(w3, tid, account.address)
+        entry = resolved.get(tid)
+        if entry is None:
+            continue
+        _npm, ver, p = entry
         if p is None:
             continue
         # positions(): nonce, operator, token0, token1, tickSpacing, tickLower,
@@ -2817,9 +2872,38 @@ def _aero_unclaimed_usd(w3, account, solvency_prices: dict) -> float:
         token_ids = []
     if not token_ids:
         return 0.0
+    # Batch the gauge-reward reads: resolve each staked NFT's NPM (one batched positions()
+    # round-trip), then batch ownerOf() to find each gauge, then batch earned() across all
+    # gauges — was ~4 sequential eth_calls per id via _aero_gauge_earned. Fail-closed per
+    # position exactly like _aero_gauge_earned: any failed leg contributes 0 AERO.
     total_aero = 0.0
-    for tid in token_ids:
-        total_aero += _aero_gauge_earned(w3, account, tid)
+    resolved = _aero_resolve_positions_batched(w3, token_ids, account.address)
+    staked = [(tid, resolved[tid][0]) for tid in token_ids if tid in resolved]
+    if staked:
+        owner_legs = [(npm.address, bytes.fromhex(npm.encode_abi("ownerOf", args=[tid])[2:]))
+                      for tid, npm in staked]
+        try:
+            owner_res = multicall(w3, owner_legs)
+        except Exception:
+            owner_res = [(False, b"")] * len(owner_legs)
+        _gauge_abi = json.loads('[{"inputs":[{"name":"","type":"address"},{"name":"","type":"uint256"}],"name":"earned","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]')
+        earned_legs = []
+        for (tid, _npm), (ok, rd) in zip(staked, owner_res):
+            if not (ok and rd):
+                continue
+            gauge_addr = w3.codec.decode(["address"], rd)[0]
+            if not gauge_addr or int(gauge_addr, 16) == 0:
+                continue
+            gc = w3.eth.contract(address=Web3.to_checksum_address(gauge_addr), abi=_gauge_abi)
+            earned_legs.append((Web3.to_checksum_address(gauge_addr),
+                                bytes.fromhex(gc.encode_abi("earned", args=[account.address, tid])[2:])))
+        try:
+            earned_res = multicall(w3, earned_legs)
+        except Exception:
+            earned_res = [(False, b"")] * len(earned_legs)
+        for ok, rd in earned_res:
+            if ok and rd:
+                total_aero += w3.codec.decode(["uint256"], rd)[0] / 10 ** 18
     if total_aero <= 0:
         return 0.0
     aero_price = (solvency_prices or {}).get("AERO")
@@ -3636,12 +3720,24 @@ def cmd_withdrawal_intents():
         return
 
     any_pending = False
+    # Batch the per-asset getAvailableBalance + getTotalIntentAmount + getUserIntents reads
+    # (was 3 sequential eth_calls per owned asset) into one Multicall3 round-trip.
+    pa_cs = account.address
+    legs = []
     for a in owned:
+        legs.append((pa_cs, bytes.fromhex(account.encode_abi("getAvailableBalance", args=[a])[2:])))
+        legs.append((pa_cs, bytes.fromhex(account.encode_abi("getTotalIntentAmount", args=[a])[2:])))
+        legs.append((pa_cs, bytes.fromhex(account.encode_abi("getUserIntents", args=[a])[2:])))
+    results = multicall(w3, legs)
+    for i, a in enumerate(owned):
         sym = a.rstrip(b"\x00").decode(errors="replace")
         dec = _asset_decimals(w3, sym)
-        available = account.functions.getAvailableBalance(a).call()
-        total_intent = account.functions.getTotalIntentAmount(a).call()
-        intents = account.functions.getUserIntents(a).call()
+        av_ok, av_rd = results[3 * i]
+        ti_ok, ti_rd = results[3 * i + 1]
+        ui_ok, ui_rd = results[3 * i + 2]
+        available = w3.codec.decode(["uint256"], av_rd)[0] if av_ok and av_rd else 0
+        total_intent = w3.codec.decode(["uint256"], ti_rd)[0] if ti_ok and ti_rd else 0
+        intents = w3.codec.decode(["(uint256,uint256,uint256,bool,bool,bool)[]"], ui_rd)[0] if ui_ok and ui_rd else []
         print(f"  {sym}: available {available / 10**dec:,.6f}, "
               f"pending intents {total_intent / 10**dec:,.6f}")
         for idx, (amt, actionable_at, expires_at, is_pending, is_actionable, is_expired) in enumerate(intents):
@@ -4369,6 +4465,48 @@ def _aero_separate_pool_and_sweeps(valuable: dict, sym0: str, sym1: str):
     return pool0_bal_wei, pool1_bal_wei, sweeps
 
 
+def _aero_inventory_available(w3, account, pool_cfg):
+    """Inventory every REDSTONE-fed asset + both pool tokens held in the Degen Account, net
+    of locked (withdrawal-intent) amounts. Batches the per-symbol getBalance +
+    getTotalIntentAmount reads into ONE Multicall3 round-trip (was 2 sequential eth_calls per
+    symbol — the documented cause of Base-converge RPC 429s). aggregate3 allowFailure=True
+    preserves the old per-call tolerance: a reverting/failed leg reads 0, exactly as the
+    previous per-call try/except did. Returns {sym: [avail_wei, decimals, 0.0]} for symbols
+    with a positive available balance and resolvable decimals (empty dict if none)."""
+    sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
+    candidates = sorted(set(REDSTONE_AVAILABLE_FEEDS) | {sym0, sym1})
+    legs = []
+    for sym in candidates:
+        ab = asset_b32(_account_asset_symbol(sym))
+        legs.append((account.address, bytes.fromhex(account.encode_abi("getBalance", args=[ab])[2:])))
+        legs.append((account.address, bytes.fromhex(account.encode_abi("getTotalIntentAmount", args=[ab])[2:])))
+    try:
+        results = multicall(w3, legs)
+    except Exception:
+        results = [(False, b"")] * len(legs)
+    inventory = {}
+    for i, sym in enumerate(candidates):
+        b_ok, b_rd = results[2 * i]
+        l_ok, l_rd = results[2 * i + 1]
+        bal = w3.codec.decode(["uint256"], b_rd)[0] if b_ok and b_rd else 0
+        if bal <= 0:
+            continue
+        locked = w3.codec.decode(["uint256"], l_rd)[0] if l_ok and l_rd else 0
+        avail = bal - locked if bal > locked else 0
+        if avail <= 0:
+            continue
+        dec = pool_cfg["decimals0"] if sym == sym0 else (
+              pool_cfg["decimals1"] if sym == sym1 else None)
+        if dec is None:
+            meta = _swap_asset_meta(w3, sym)
+            if meta:
+                dec = meta.get("decimals")
+        if dec is None:
+            continue
+        inventory[sym] = [avail, dec, 0.0]
+    return inventory
+
+
 def _aero_use_all_available(
     w3, acct, account, pa_cs, pool_cfg,
     width_pct=2.0, slippage_pct=1.0, execute=False,
@@ -4390,34 +4528,9 @@ def _aero_use_all_available(
     dec0, dec1 = pool_cfg["decimals0"], pool_cfg["decimals1"]
     MIN_USD_VALUE = 5.0
 
-    # 1. Inventory: check RedStone-fed assets + both pool tokens for balance
-    all_candidates = set(REDSTONE_AVAILABLE_FEEDS) | {sym0, sym1}
-    inventory = {}
-    for sym in sorted(all_candidates):
-        account_sym = _account_asset_symbol(sym)
-        try:
-            bal = account.functions.getBalance(asset_b32(account_sym)).call()
-        except Exception:
-            bal = 0
-        if bal <= 0:
-            continue
-        try:
-            locked = account.functions.getTotalIntentAmount(asset_b32(account_sym)).call()
-        except Exception:
-            locked = 0
-        avail = bal - locked if bal > locked else 0
-        if avail <= 0:
-            continue
-        dec = pool_cfg["decimals0"] if sym == sym0 else (
-              pool_cfg["decimals1"] if sym == sym1 else None)
-        if dec is None:
-            meta = _swap_asset_meta(w3, sym)
-            if meta:
-                dec = meta.get("decimals")
-        if dec is None:
-            continue
-        inventory[sym] = [avail, dec, 0.0]
-
+    # 1. Inventory: check RedStone-fed assets + both pool tokens for balance, batched into
+    # one Multicall3 round-trip (see _aero_inventory_available).
+    inventory = _aero_inventory_available(w3, account, pool_cfg)
     if not inventory:
         print("  No in-account assets found with non-zero balance.")
         return False
@@ -5926,34 +6039,9 @@ def _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg=None, execu
     sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
     MIN_USD_VALUE = 5.0
 
-    # Inventory RedStone-priced assets
-    candidates = set(REDSTONE_AVAILABLE_FEEDS) | {sym0, sym1}
-    inventory = {}
-    for sym in sorted(candidates):
-        account_sym = _account_asset_symbol(sym)
-        try:
-            bal = account.functions.getBalance(asset_b32(account_sym)).call()
-        except Exception:
-            bal = 0
-        if bal <= 0:
-            continue
-        try:
-            locked = account.functions.getTotalIntentAmount(asset_b32(account_sym)).call()
-        except Exception:
-            locked = 0
-        avail = bal - locked if bal > locked else 0
-        if avail <= 0:
-            continue
-        dec = pool_cfg["decimals0"] if sym == sym0 else (
-              pool_cfg["decimals1"] if sym == sym1 else None)
-        if dec is None:
-            meta = _swap_asset_meta(w3, sym)
-            if meta:
-                dec = meta.get("decimals")
-        if dec is None:
-            continue
-        inventory[sym] = [avail, dec, 0.0]
-
+    # Inventory RedStone-priced assets + both pool tokens, batched into one Multicall3
+    # round-trip (see _aero_inventory_available).
+    inventory = _aero_inventory_available(w3, account, pool_cfg)
     if not inventory:
         return
 

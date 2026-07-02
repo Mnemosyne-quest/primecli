@@ -1726,11 +1726,24 @@ def cmd_withdrawal_requests():
     acct = get_account()
     print(f"Wallet: {acct.address}")
     any_pending = False
-    for pool_name, cfg in POOLS.items():
-        contract = w3.eth.contract(address=Web3.to_checksum_address(cfg["proxy"]), abi=POOL_ABI)
-        balance = contract.functions.balanceOf(acct.address).call()
-        total_intent = contract.functions.getTotalIntentAmount(acct.address).call()
-        intents = contract.functions.getUserIntents(acct.address).call()
+    # Batch the per-pool balanceOf + getTotalIntentAmount + getUserIntents reads (was 3
+    # sequential eth_calls per pool) into one Multicall3 round-trip.
+    pool_meta = list(POOLS.items())
+    legs = []
+    for _pool_name, cfg in pool_meta:
+        proxy_cs = Web3.to_checksum_address(cfg["proxy"])
+        contract = w3.eth.contract(address=proxy_cs, abi=POOL_ABI)
+        legs.append((proxy_cs, bytes.fromhex(contract.encode_abi("balanceOf", args=[acct.address])[2:])))
+        legs.append((proxy_cs, bytes.fromhex(contract.encode_abi("getTotalIntentAmount", args=[acct.address])[2:])))
+        legs.append((proxy_cs, bytes.fromhex(contract.encode_abi("getUserIntents", args=[acct.address])[2:])))
+    results = multicall(w3, legs)
+    for i, (pool_name, cfg) in enumerate(pool_meta):
+        b_ok, b_rd = results[3 * i]
+        t_ok, t_rd = results[3 * i + 1]
+        u_ok, u_rd = results[3 * i + 2]
+        balance = w3.codec.decode(["uint256"], b_rd)[0] if b_ok and b_rd else 0
+        total_intent = w3.codec.decode(["uint256"], t_rd)[0] if t_ok and t_rd else 0
+        intents = w3.codec.decode(["(uint256,uint256,uint256,bool,bool,bool)[]"], u_rd)[0] if u_ok and u_rd else []
         if balance == 0 and not intents:
             continue
         dec = cfg["decimals"]
@@ -3492,12 +3505,24 @@ def cmd_withdrawal_intents():
         return
 
     any_pending = False
+    # Batch the per-asset getAvailableBalance + getTotalIntentAmount + getUserIntents reads
+    # (was 3 sequential eth_calls per owned asset) into one Multicall3 round-trip.
+    pa_cs = account.address
+    legs = []
     for a in owned:
+        legs.append((pa_cs, bytes.fromhex(account.encode_abi("getAvailableBalance", args=[a])[2:])))
+        legs.append((pa_cs, bytes.fromhex(account.encode_abi("getTotalIntentAmount", args=[a])[2:])))
+        legs.append((pa_cs, bytes.fromhex(account.encode_abi("getUserIntents", args=[a])[2:])))
+    results = multicall(w3, legs)
+    for i, a in enumerate(owned):
         sym = a.rstrip(b"\x00").decode(errors="replace")
         dec = _asset_decimals(sym)
-        available = account.functions.getAvailableBalance(a).call()
-        total_intent = account.functions.getTotalIntentAmount(a).call()
-        intents = account.functions.getUserIntents(a).call()
+        av_ok, av_rd = results[3 * i]
+        ti_ok, ti_rd = results[3 * i + 1]
+        ui_ok, ui_rd = results[3 * i + 2]
+        available = w3.codec.decode(["uint256"], av_rd)[0] if av_ok and av_rd else 0
+        total_intent = w3.codec.decode(["uint256"], ti_rd)[0] if ti_ok and ti_rd else 0
+        intents = w3.codec.decode(["(uint256,uint256,uint256,bool,bool,bool)[]"], ui_rd)[0] if ui_ok and ui_rd else []
         print(f"  {sym}: available {available / 10**dec:,.6f}, "
               f"pending intents {total_intent / 10**dec:,.6f}")
         for idx, (amt, actionable_at, expires_at, is_pending, is_actionable, is_expired) in enumerate(intents):
@@ -4473,13 +4498,33 @@ def cmd_lb_remove(pair_key: str, slippage_pct: float = 1.0, execute: bool = Fals
         return
 
     pair_c = _lb_pair_contract(w3, pair_cs)
-    active_id = pair_c.functions.getActiveId().call()
+    # Batch getActiveId + per-bin (balanceOf + totalSupply + getBin) into one Multicall3
+    # round-trip (was 1 + 3N sequential eth_calls). This is a WRITE path — the decoded
+    # amounts feed removeLiquidity and the slippage floors — so a failed read aborts rather
+    # than silently defaulting to 0 (matches the prior abort-on-error behaviour).
+    legs = [(pair_cs, bytes.fromhex(pair_c.encode_abi("getActiveId", args=[])[2:]))]
+    for binid in ids:
+        legs.append((pair_cs, bytes.fromhex(pair_c.encode_abi("balanceOf", args=[pa_cs, binid])[2:])))
+        legs.append((pair_cs, bytes.fromhex(pair_c.encode_abi("totalSupply", args=[binid])[2:])))
+        legs.append((pair_cs, bytes.fromhex(pair_c.encode_abi("getBin", args=[binid])[2:])))
+    results = multicall(w3, legs)
+    a_ok, a_rd = results[0]
+    if not (a_ok and a_rd):
+        print("  Could not read the LB pair's active bin — refusing to remove.")
+        return
+    active_id = w3.codec.decode(["uint24"], a_rd)[0]
     amounts = []
     est_x = est_y = 0.0
-    for binid in ids:
-        bal = pair_c.functions.balanceOf(pa_cs, binid).call()
-        ts = pair_c.functions.totalSupply(binid).call()
-        rx, ry = pair_c.functions.getBin(binid).call()
+    for k, binid in enumerate(ids):
+        b_ok, b_rd = results[1 + 3 * k]
+        t_ok, t_rd = results[1 + 3 * k + 1]
+        g_ok, g_rd = results[1 + 3 * k + 2]
+        if not (b_ok and b_rd and t_ok and t_rd and g_ok and g_rd):
+            print(f"  Could not read bin {binid} on [{pair_key}] — refusing to remove (incomplete data).")
+            return
+        bal = w3.codec.decode(["uint256"], b_rd)[0]
+        ts = w3.codec.decode(["uint256"], t_rd)[0]
+        rx, ry = w3.codec.decode(["uint128", "uint128"], g_rd)
         amounts.append(bal)
         share = (bal / ts) if ts else 0
         est_x += rx * share / 10**x_cfg["decimals"]

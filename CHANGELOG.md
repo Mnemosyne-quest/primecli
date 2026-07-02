@@ -4,6 +4,24 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [Unreleased]
+
+### Changed
+- **Batched several sequential-`eth_call` read loops into single Multicall3
+  round-trips to cut RPC call volume** (the DegenPrime Aerodrome inventory scan
+  is the documented cause of Base-converge RPC 429s). Pure read-path change: the
+  values fetched and every downstream decision are unchanged; only the fetch is
+  batched, via the existing `multicall()` (`aggregate3` allowFailure) helper so
+  one reverting leg never kills a batch, and each function's per-item tolerance
+  is preserved. Affected: `degenprime._aero_use_all_available` /
+  `_aero_rebuild_sweep` (shared new `_aero_inventory_available`, ~2N→1),
+  `deltaprime.cmd_withdrawal_requests` (3·11→1), `cmd_withdrawal_intents` on
+  delta/degen/arb (3N→1 each), `cmd_lb_remove` on delta/arb (1+3N→1, the write
+  path still aborts on a failed read), and the Aerodrome NFT-decode reads in
+  `degenprime._aero_position_legs` / `_aero_unclaimed_usd` (shared new
+  `_aero_resolve_positions_batched` batches the V2/V3 `positions()` probes;
+  both-live ownership disambiguation stays delegated to `_aero_npm_for_token`).
+
 ## [0.11.2] - 2026-07-02
 
 ### Changed
