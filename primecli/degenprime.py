@@ -1492,12 +1492,21 @@ def build_redstone_payload(symbols: list) -> bytes:
     payload += REDSTONE_MARKER
     return payload
 
-def degen_account_price_feeds(account) -> list:
+def degen_account_price_feeds(account, w3=None) -> list:
     """RedStone feed symbols a solvency check on this account needs: ETH (Base's native
     base-asset reference, the BaseOracle anchor), every owned asset that has a RedStone
     feed, and every debt-registry asset that has one. Symbols without a RedStone feed
     are skipped - the SolvencyFacet sources them on-chain from BaseOracle TWAP and the
-    payload doesn't need to cover them. Deduped, ETH first."""
+    payload doesn't need to cover them. Deduped, ETH first.
+
+    Staked Aerodrome LP legs need the same treatment: getAllOwnedAssets() and
+    getDebts() never see tokens locked inside a staked LP NFT (per
+    _aero_position_legs's own docstring), so an account whose ONLY exposure to a
+    RedStone-priced asset is via a staked LP (no raw balance, no debt in it) would
+    otherwise never request that feed - and every solvency-gated call
+    (getTotalValue/getHealthRatio/isSolvent/repay/shouldRebalance) reverts for lack
+    of a price instead of pricing the position correctly. Pass w3 to also enumerate
+    those legs; omit it to keep the old (narrower) behavior."""
     feeds = ["ETH"]
     for a in account.functions.getAllOwnedAssets().call():
         sym = a.rstrip(b"\x00").decode(errors="replace")
@@ -1507,6 +1516,18 @@ def degen_account_price_feeds(account) -> list:
         sym = name.rstrip(b"\x00").decode(errors="replace")
         if sym and sym in REDSTONE_AVAILABLE_FEEDS:
             feeds.append(sym)
+    if w3 is not None:
+        for lg in _aero_position_legs(w3, account):
+            for raw_sym in (lg.get("sym0"), lg.get("sym1")):
+                if not raw_sym:
+                    continue
+                # LP legs are read straight off the ERC20 (_resolve_token_symbol),
+                # which returns the real on-chain symbol (e.g. "EURC"). DegenPrime's
+                # TokenManager - and RedStone's feed - use the aliased name ("EUROC"),
+                # same alias _account_asset_symbol already applies for raw holdings.
+                sym = _account_asset_symbol(raw_sym)
+                if sym in REDSTONE_AVAILABLE_FEEDS:
+                    feeds.append(sym)
     return list(dict.fromkeys(feeds))
 
 def redstone_view_call(w3, account, fn_name: str, payload: bytes, args: list = None):
@@ -2221,7 +2242,7 @@ def _gather_account_state(w3, account, pool_deposits: list):
     # but correct: the SolvencyFacet parses the payload from the calldata tail per leg.
     solvency = {"total": None, "debt": None, "ratio": None, "solvent": None, "error": None, "prices": {}}
     try:
-        feeds = degen_account_price_feeds(account)
+        feeds = degen_account_price_feeds(account, w3=w3)
         # Pool-deposit assets need their feeds in the payload too, else getPrices reverts
         # on any deposit symbol whose feed the Degen Account doesn't already carry.
         for _dr in pool_deposits:
@@ -2229,8 +2250,12 @@ def _gather_account_state(w3, account, pool_deposits: list):
                 feeds.append(_dr["symbol"])
         payload = build_redstone_payload(feeds)
         payload_hex = payload.hex()
-        price_syms = [s for s in dict.fromkeys(r["symbol"] for r in supplied + borrowed + pool_deposits)
-                      if s and s in REDSTONE_AVAILABLE_FEEDS]
+        # Reuse `feeds` (already ETH + owned + debts + pool_deposits + staked LP legs,
+        # alias-corrected, filtered to REDSTONE_AVAILABLE_FEEDS) instead of re-deriving
+        # from supplied/borrowed/pool_deposits alone - that narrower set is exactly what
+        # left LP-locked-only assets (e.g. EURC/EUROC) unpriced for the display/health
+        # computation below even after the solvency payload itself carried the feed.
+        price_syms = list(dict.fromkeys(feeds))
         solv_legs = [
             ("getTotalValue", ["uint256"], account.encode_abi("getTotalValue", args=[])),
             ("getDebt", ["uint256"], account.encode_abi("getDebt", args=[])),
@@ -2403,8 +2428,12 @@ def _aero_position_legs(w3, account):
         dec1 = _resolve_token_decimals(w3, token1)
         if dec0 is None or dec1 is None:
             continue
-        sym0 = _resolve_token_symbol(w3, token0)
-        sym1 = _resolve_token_symbol(w3, token1)
+        # Aliased (_account_asset_symbol) so a leg's symbol matches how DegenPrime's
+        # TokenManager / RedStone feeds name it (e.g. "EURC" on-chain -> "EUROC"),
+        # not the raw ERC20 symbol - callers price these legs against REDSTONE_
+        # AVAILABLE_FEEDS / solvency["prices"], both keyed by the aliased name.
+        sym0 = _account_asset_symbol(_resolve_token_symbol(w3, token0))
+        sym1 = _account_asset_symbol(_resolve_token_symbol(w3, token1))
         # Current sqrtPriceX96 from the pool's slot0 (exact); fall back to the
         # geometric mean of the range bounds if the pool read fails.
         sqrt_p = None
@@ -3144,7 +3173,7 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
         print(f"  Capped requested {amount} {symbol} to {amount_wei / 10**cfg['decimals']:.6f} "
               f"({'; '.join(cap_notes)}).")
     # repay's internal _isSolvent uses proxyDelegateCalldata -> needs RedStone payload
-    feeds = degen_account_price_feeds(account)
+    feeds = degen_account_price_feeds(account, w3=w3)
     if symbol not in feeds and symbol in REDSTONE_AVAILABLE_FEEDS:
         feeds.append(symbol)
     payload = build_redstone_payload(feeds)
@@ -5874,7 +5903,7 @@ def cmd_aero_rebalance_status(token_id: int = None, check: bool = False,
             d["position"] = None
         if check:
             try:
-                payload = build_redstone_payload(degen_account_price_feeds(account))
+                payload = build_redstone_payload(degen_account_price_feeds(account, w3=w3))
                 d["shouldRebalance"] = bool(redstone_view_call(
                     w3, account, "shouldRebalance", payload, args=[tid])[0])
             except Exception as e:
