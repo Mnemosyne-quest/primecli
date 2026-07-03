@@ -6,6 +6,25 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-07-03
+
+### Fixed
+- **`degenprime swap` retried a stuck ParaSwap route at a fixed slippage forever
+  instead of widening it.** `_paraswap_requote_until_clean` re-quotes on failure, which
+  only helps when ParaSwap rotates executors/routes - it does nothing when ParaSwap's
+  own off-chain quote is itself rich vs the pool's live price. Confirmed via
+  `debug_traceCall` (`base.drpc.org`) on a WETH/EURC Aerodrome Slipstream swap: the pool
+  swap succeeded every time, but ParaSwap's Augustus router reverted with
+  `InsufficientReturnAmount()` (surfacing through the facet as the generic
+  `SwapFailed()`, `0x81ceff30`) because its quote sat ~3.2% above the pool's own
+  `slot0()` price. New `_paraswap_swap_with_escalation` wraps the requote loop: starts
+  at the caller's requested slippage (no change when that clears), and on a repeated
+  `SwapFailed()` steps slippage up by 1.5pp, capped at 4.5% (under the facet's own hard
+  5% ceiling). Only escalates on that exact failure signature - a different revert
+  returns immediately. `cmd_swap`'s preview now shows the slippage that actually cleared
+  and flags when escalation happened, so the broadcast decision isn't made on stale
+  display data.
+
 ## [0.11.3] - 2026-07-03
 
 ### Fixed
