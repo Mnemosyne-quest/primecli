@@ -431,16 +431,35 @@ def _usdc_borrow_feasible(tool_path: str, max_util: float = 90.0, max_apr: float
     return True, ""
 
 
-def write_escalation(state_dir: str, reason: str, payload: dict):
-    """Write escalation marker for the escalation handler to pick up."""
+def write_escalation(state_dir: str, reason: str, payload: dict, cooldown_secs: int = 1200) -> bool:
+    """Write escalation marker for the escalation handler to pick up.
+
+    Debounced per (state_dir, reason): if the last escalation of this reason fired
+    within cooldown_secs, this is a no-op (returns False, no escalate.json written,
+    no fresh isolated agent spawned). Without this, a genuine multi-tick swing (e.g.
+    the health readings during an in-progress autofarm converge) re-triggers the
+    generic close-everything/repay-USDC-only/redeploy playbook on every 5-min tick —
+    confirmed 2026-07-03: 4 health-swing agents spawned for parakletos-4 in 15 minutes
+    during a converge, racing each other and the autofarm cron, which flattened the
+    position's intended 50/50 USDC/ETH debt split down to ~all-USDC. The cooldown
+    marker file already existed for this but was never read anywhere until now.
+    """
+    cooldown_dir = Path(state_dir) / "last-escalation"
+    cooldown_dir.mkdir(parents=True, exist_ok=True)
+    marker = cooldown_dir / reason
+    if marker.exists():
+        try:
+            last = int(marker.read_text().strip())
+            if time.time() - last < cooldown_secs:
+                return False
+        except (ValueError, OSError):
+            pass
     path = Path(state_dir) / "escalate.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(payload, f)
-    # Also write a cooldown marker
-    cooldown_dir = Path(state_dir) / "last-escalation"
-    cooldown_dir.mkdir(parents=True, exist_ok=True)
-    (cooldown_dir / reason).write_text(str(int(time.time())))
+    marker.write_text(str(int(time.time())))
+    return True
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1022,14 +1041,14 @@ def run_tick(
         if last_pct is not None and cur_pct is not None:
             diff = abs(cur_pct - last_pct)
             if diff > 10:
-                write_escalation(state_dir, "health-swing", {
+                escalated = write_escalation(state_dir, "health-swing", {
                     "reason": "health_swing",
                     "from_pct": last_pct,
                     "to_pct": cur_pct,
                     "delta": diff,
                     "label": label,
                 })
-                result["escalation"] = "health_swing"
+                result["escalation"] = "health_swing" if escalated else "health_swing (cooldown, suppressed)"
     else:
         result["swing_guard"] = (
             "incomplete_valuation" if not val_ok else "implausible_equity_jump"
