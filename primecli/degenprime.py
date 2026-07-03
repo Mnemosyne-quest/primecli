@@ -4305,7 +4305,16 @@ def _aero_cap_to_balance(account, pool_cfg: dict, amt0_wei: int, amt1_wei: int) 
 def _aero_simulate_mint(w3, from_addr: str, account_addr: str, calldata: bytes) -> tuple:
     """eth_call-simulate the mint+stake before broadcasting. Returns (ok, info):
     ok=True + would-be tokenId on success, ok=False + revert detail on failure.
-    Read-only — never signs or sends."""
+    Read-only — never signs or sends.
+
+    CAVEAT (confirmed 2026-07-03): the returned tokenId is only a PREDICTION taken
+    from an eth_call against pre-broadcast state. Aerodrome's NPM tokenId counter is
+    shared across every user of the protocol, not just this account, so if any other
+    mint lands on-chain between this simulation and the real broadcast, the actual
+    assigned id will differ (seen twice today, both off by exactly +1 — one other
+    mint slipped in each time). Never treat this as the confirmed id for a
+    downstream action (e.g. aero-rebalance create) — call _aero_decode_minted_token_id
+    on the real receipt after broadcast instead."""
     try:
         ret = w3.eth.call({"from": from_addr, "to": account_addr,
                            "data": "0x" + calldata.hex()})
@@ -4313,6 +4322,36 @@ def _aero_simulate_mint(w3, from_addr: str, account_addr: str, calldata: bytes) 
         return False, f"{type(e).__name__}: {str(e)[:200]}"
     token_id = int.from_bytes(bytes(ret)[:32], "big") if len(ret) >= 32 else None
     return True, token_id
+
+
+def _aero_decode_minted_token_id(receipt) -> int | None:
+    """Read the AUTHORITATIVE minted tokenId from a real mint transaction's receipt,
+    by finding the NPM's own Transfer(0x0 -> account, tokenId) mint event in its logs.
+    Use this instead of _aero_simulate_mint's pre-broadcast guess for anything that
+    needs the real id (confirmation messages, chaining into aero-rebalance create,
+    etc.) — the simulated id can be stale by the time the real tx lands (see
+    _aero_simulate_mint's docstring)."""
+    def _norm(h) -> str:
+        # HexBytes.hex() omits the "0x" prefix in some web3.py versions but not
+        # others (and plain str values may or may not have it) — normalize to a
+        # bare lowercase hex string so comparisons never depend on that quirk.
+        s = h.hex() if hasattr(h, "hex") else str(h)
+        return s.lower().removeprefix("0x")
+
+    transfer_topic = _norm(Web3.keccak(text="Transfer(address,address,uint256)"))
+    npm = Web3.to_checksum_address(AERODROME_NPM_V3)
+    zero_addr_topic = "0" * 64
+    for log in receipt.get("logs", []):
+        if Web3.to_checksum_address(log.get("address", "")) != npm:
+            continue
+        topics = log.get("topics", [])
+        if len(topics) != 4:
+            continue
+        topics_hex = [_norm(t) for t in topics]
+        if topics_hex[0] != transfer_topic or topics_hex[1] != zero_addr_topic:
+            continue
+        return int(topics_hex[3], 16)
+    return None
 
 def _aero_simulate_call(w3, from_addr: str, account_addr: str, calldata: bytes) -> tuple:
     """eth_call-simulate an Aerodrome facet write before broadcasting."""
@@ -4927,6 +4966,14 @@ def _cmd_aero_add_liquidity_manual(pool_key, amount0, amount1, slippage_pct, exe
     }
     receipt = _sign_and_send(w3, acct, tx, "Add liquidity", timeout=300, fallback_gas=5000000)
     ok = receipt["status"] == 1
+    if not ok:
+        print("  ABORT: mint transaction reverted.")
+        sys.exit(2)
+    real_token_id = _aero_decode_minted_token_id(receipt)
+    if real_token_id is not None:
+        print(f"  ✓ Mint confirmed. tokenId: {real_token_id}")
+    else:
+        print("  ✓ Mint confirmed. (could not decode tokenId from receipt logs)")
 
 
 def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width_pct):
@@ -5181,7 +5228,11 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
     if not ok:
         print("  ABORT: mint transaction reverted.")
         sys.exit(2)
-    print("  ✓ Mint confirmed.")
+    real_token_id = _aero_decode_minted_token_id(receipt)
+    if real_token_id is not None:
+        print(f"  ✓ Mint confirmed. tokenId: {real_token_id}")
+    else:
+        print("  ✓ Mint confirmed. (could not decode tokenId from receipt logs)")
 
 
 def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float = 1.0,
