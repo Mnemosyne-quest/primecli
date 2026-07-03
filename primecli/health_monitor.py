@@ -385,6 +385,25 @@ def save_last_equity(state_dir: str, equity: float):
     path.write_text(str(equity))
 
 
+def load_health_swing_streak(state_dir: str) -> int:
+    """Consecutive trustworthy ticks a health swing vs the frozen pre-swing baseline
+    has held. Escalation requires >=2 so a single-tick misprice, or an in-progress
+    multi-step autofarm converge that just hasn't settled yet, can't trigger it."""
+    path = Path(state_dir) / "health-swing-streak"
+    if path.exists():
+        try:
+            return int(path.read_text().strip())
+        except (ValueError, OSError):
+            return 0
+    return 0
+
+
+def save_health_swing_streak(state_dir: str, n: int):
+    path = Path(state_dir) / "health-swing-streak"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(n))
+
+
 def load_stop_loss_streak(state_dir: str) -> int:
     """Consecutive trusted ticks the stop-loss drawdown has held. A full close requires
     >=2 so a single-tick misprice that deflates equity can't trigger it."""
@@ -1025,8 +1044,20 @@ def run_tick(
     # suppress the escalation when the valuation is incomplete OR the equity jumped
     # implausibly vs the previous reading (a real LP's equity does not multiply between
     # 5-min ticks — that's a misprice or a deposit, neither of which is a liquidation risk).
-    # We still update the baselines each trustworthy/priced tick so a one-off anomaly can't
-    # permanently freeze them.
+    #
+    # That plausibility gate alone wasn't enough: a multi-step autofarm converge (remove
+    # LP, borrow, swap, mint) causes several genuinely large tick-to-tick swings while it
+    # executes — not misreads, real transient values — and each one passed the gate.
+    # Confirmed 2026-07-03: parakletos-4's lever-up converge produced five different >10pp
+    # readings in a row (61.3/73.4/84.3/100.0/65.8), each re-triggering because the
+    # previous (already-anomalous) tick became the next comparison baseline — 4 escalation
+    # agents spawned in 15 minutes, racing each other and the autofarm cron on the same
+    # live position. So — mirroring the stop-loss streak pattern below (Bruno, 2026-06-26)
+    # — a swing must hold for 2 consecutive trustworthy ticks against the SAME frozen
+    # pre-swing baseline before it escalates. The baseline is frozen (not advanced to the
+    # anomalous reading) while a swing is unconfirmed, so a converge that settles within
+    # one tick self-resolves with zero escalations; a genuinely sustained change confirms
+    # and fires within ~2 ticks, same as today's already-approved stop-loss behavior.
     val_ok, _swing_val_reason = valuation_complete(defi_data)
     last_pct = load_last_health(state_dir)
     last_eq = load_last_equity(state_dir)
@@ -1037,25 +1068,41 @@ def run_tick(
         and 0.5 <= (cur_eq / last_eq) <= 2.0
     )
     trustworthy = val_ok and (last_eq is None or eq_plausible)
+    advance_pct_baseline = True
     if trustworthy:
         if last_pct is not None and cur_pct is not None:
             diff = abs(cur_pct - last_pct)
             if diff > 10:
-                escalated = write_escalation(state_dir, "health-swing", {
-                    "reason": "health_swing",
-                    "from_pct": last_pct,
-                    "to_pct": cur_pct,
-                    "delta": diff,
-                    "label": label,
-                })
-                result["escalation"] = "health_swing" if escalated else "health_swing (cooldown, suppressed)"
+                streak = load_health_swing_streak(state_dir) + 1
+                save_health_swing_streak(state_dir, streak)
+                if streak >= 2:
+                    escalated = write_escalation(state_dir, "health-swing", {
+                        "reason": "health_swing",
+                        "from_pct": last_pct,
+                        "to_pct": cur_pct,
+                        "delta": diff,
+                        "label": label,
+                        "confirmations": streak,
+                    })
+                    result["escalation"] = "health_swing" if escalated else "health_swing (cooldown, suppressed)"
+                    save_health_swing_streak(state_dir, 0)
+                else:
+                    result["action"] = f"health_swing pending confirmation ({streak}/2)"
+                    # Freeze the baseline: keep comparing the NEXT tick against this same
+                    # pre-swing last_pct instead of advancing to the anomalous cur_pct.
+                    advance_pct_baseline = False
+            else:
+                save_health_swing_streak(state_dir, 0)
     else:
         result["swing_guard"] = (
             "incomplete_valuation" if not val_ok else "implausible_equity_jump"
         )
     # Track latest readings regardless (consecutive-tick basis), so a transient misprice
     # can't permanently poison the baseline and a real deposit only skips a single tick.
-    if cur_pct is not None:
+    # Exception: an unconfirmed pending swing (see above) intentionally does NOT advance
+    # the health-pct baseline, so the next tick still confirms/resolves against the same
+    # pre-swing reference rather than the anomalous one.
+    if cur_pct is not None and advance_pct_baseline:
         save_last_health(state_dir, cur_pct)
     if cur_eq is not None:
         save_last_equity(state_dir, cur_eq)

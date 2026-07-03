@@ -856,14 +856,43 @@ def test_health_swing_suppressed_on_misprice_equity_jump(tmp_path, monkeypatch):
     assert r2.get("swing_guard") == "implausible_equity_jump", r2
 
 
-def test_health_swing_fires_on_real_swing_stable_equity(tmp_path, monkeypatch):
-    """A genuine health swing on STABLE equity still escalates."""
+def test_health_swing_requires_two_confirmations(tmp_path, monkeypatch):
+    """A genuine, SUSTAINED health swing on stable equity still escalates, but only
+    after holding for 2 consecutive trustworthy ticks vs the frozen pre-swing baseline
+    — mirrors the stop-loss confirmation pattern. A single-tick swing (e.g. one step of
+    a still-executing multi-tx autofarm converge) must NOT escalate on its own."""
     sd = str(tmp_path / "state")
     strat = _observer_strategy(tmp_path)
     _tick(tmp_path, monkeypatch, _priced(1700, 1400, 53.0), strat, sd)
-    # Tick 2: real drop to 38%, equity stable (~$300, same supplied/debt).
+    # Tick 2: real drop to 38%, equity stable (~$300, same supplied/debt) → pending, no escalation.
     r2 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 38.0), strat, sd)
-    assert r2.get("escalation") == "health_swing", r2
+    assert r2.get("escalation") is None, r2
+    assert "pending confirmation" in r2.get("action", ""), r2
+    # Tick 3: swing persists vs the SAME frozen 53% baseline → 2nd confirmation → escalate.
+    r3 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 38.0), strat, sd)
+    assert r3.get("escalation") == "health_swing", r3
+
+
+def test_health_swing_self_resolves_without_escalating(tmp_path, monkeypatch):
+    """A single anomalous tick that reverts back close to baseline on the next tick
+    (e.g. one step of a multi-tx converge settling) must never escalate — confirmed
+    2026-07-03: a real lever-up converge produced 5 different >10pp readings in a row,
+    each becoming the next tick's comparison baseline under the old always-advance
+    logic, firing 4 escalation agents in 15 minutes. Freezing the baseline while a
+    swing is unconfirmed lets a reading that returns near the pre-swing value clear
+    the streak instead of re-triggering forever."""
+    sd = str(tmp_path / "state")
+    strat = _observer_strategy(tmp_path)
+    _tick(tmp_path, monkeypatch, _priced(1700, 1400, 71.7), strat, sd)
+    # Tick 2: swing to 61.3% vs frozen 71.7 baseline (diff 10.4) → pending (1/2).
+    r2 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 61.3), strat, sd)
+    assert r2.get("escalation") is None, r2
+    assert "pending confirmation" in r2.get("action", ""), r2
+    # Tick 3: settles back to 73.4% — still compared against the FROZEN 71.7 baseline
+    # (diff 1.7, not the pending 61.3 reading), so the streak clears with no escalation.
+    r3 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 73.4), strat, sd)
+    assert r3.get("escalation") is None, r3
+    assert hm.load_health_swing_streak(sd) == 0
 
 
 def test_stop_loss_requires_two_confirmations(tmp_path, monkeypatch):
