@@ -3398,6 +3398,43 @@ def _paraswap_requote_until_clean(src_token, src_dec, dest_token, dest_dec, amou
     print(f"  ✗ All {_PARASWAP_REQUOTE_ATTEMPTS} ParaSwap quotes reverted in simulation.")
     return last
 
+# Bounded slippage escalation: re-quoting at a FIXED slippage_pct only helps when
+# ParaSwap rotates to a different (whitelisted) executor/route. It does nothing when
+# ParaSwap's own off-chain quote is itself measurably rich vs the pool's live price -
+# confirmed on a WETH/EURC Aerodrome Slipstream pool where the quote sat ~3.2% above
+# the pool's own slot0 price, so every requote at 1% slippage reverted identically with
+# SwapFailed() (0x81ceff30, the facet's wrapper around ParaSwap's own
+# InsufficientReturnAmount()). Widening slippage (not re-quoting) is what actually
+# clears that case. Steps up only on that exact failure signature - a different error
+# (e.g. insufficient balance) won't be fixed by more slippage room, so we stop
+# immediately rather than burning extra RPC round-trips.
+_SLIPPAGE_ESCALATION_STEP_PCT = 1.5
+_SLIPPAGE_ESCALATION_MAX_PCT = 4.5  # stays clear of the facet's hard 5% ceiling
+
+def _paraswap_swap_with_escalation(src_token, src_dec, dest_token, dest_dec, amount_in_wei,
+                                   slippage_pct, pa_cs, sim_fn):
+    """Wraps _paraswap_requote_until_clean with bounded slippage escalation (see above).
+    Starts at the caller's slippage_pct (unchanged behavior if that already clears).
+    On an all-attempts-failed SwapFailed() result, steps slippage_pct up by
+    _SLIPPAGE_ESCALATION_STEP_PCT and re-runs the full requote loop, capped at
+    _SLIPPAGE_ESCALATION_MAX_PCT. Returns the same shape as
+    _paraswap_requote_until_clean (the last attempted route, sim_ok reflecting whether
+    it ultimately cleared)."""
+    slip = slippage_pct
+    while True:
+        route = _paraswap_requote_until_clean(src_token, src_dec, dest_token, dest_dec,
+                                              amount_in_wei, slip, pa_cs, sim_fn)
+        route["slippage_pct_used"] = slip
+        if route["sim_ok"] or slip >= _SLIPPAGE_ESCALATION_MAX_PCT:
+            return route
+        if not route["last_err"] or "81ceff30" not in str(route["last_err"]):
+            return route  # different failure mode - more slippage room won't fix it
+        next_slip = min(slip + _SLIPPAGE_ESCALATION_STEP_PCT, _SLIPPAGE_ESCALATION_MAX_PCT)
+        print(f"  All quotes failed with SwapFailed() at {slip:.2f}% slippage - the "
+              f"ParaSwap quote may be stale vs the live pool price. Retrying at "
+              f"{next_slip:.2f}%...")
+        slip = next_slip
+
 def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.0,
              execute: bool = False):
     """Swap one in-account asset for another via the Degen Account on ParaSwap v6.
@@ -3464,19 +3501,22 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
             return True, None
         except Exception as e:
             return False, str(e)
-    route = _paraswap_requote_until_clean(
+    route = _paraswap_swap_with_escalation(
         from_cfg["token"], from_cfg["decimals"], to_cfg["token"], to_cfg["decimals"],
         amount_in, slippage_pct, pa_cs, _sim_paraswap)
     price_route, tx_built, full = route["price_route"], route["tx_built"], route["full"]
     selector_hex, data_bytes = route["selector_hex"], route["data_bytes"]
     quoted_out, min_out, sim_ok = route["quoted_out"], route["min_out"], route["sim_ok"]
+    slippage_used = route.get("slippage_pct_used", slippage_pct)
 
     print(f"Swap {amount} {from_asset_sym} -> {to_asset_sym} on Degen Account {pa_cs}  (via ParaSwap/Velora)")
     print(f"  Router method: {price_route['contractMethod']} ({selector_hex})")
     print(f"  Augustus router: {tx_built['to']}")
     print(f"  Expected out: {quoted_out / 10**to_cfg['decimals']:.6f} {to_asset_sym}")
     if min_out is not None:
-        print(f"  Min out (@{slippage_pct}% slippage): {min_out / 10**to_cfg['decimals']:.6f} {to_asset_sym}")
+        print(f"  Min out (@{slippage_used:.2f}% slippage): {min_out / 10**to_cfg['decimals']:.6f} {to_asset_sym}")
+        if slippage_used != slippage_pct:
+            print(f"  (requested {slippage_pct}% was not routable - escalated to {slippage_used:.2f}% to clear SwapFailed())")
     print(f"  ParaSwap srcUSD ${price_route.get('srcUSD','?')} -> destUSD ${price_route.get('destUSD','?')}")
     print("  Facet enforces a 5% hard slippage cap (RedStone-priced) on top of this.")
 
@@ -3485,8 +3525,9 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
         return
 
     if not sim_ok:
-        print(f"✗ Refusing to broadcast: every ParaSwap quote reverted in simulation "
-              f"({_PARASWAP_REQUOTE_ATTEMPTS} attempts). Try again shortly.")
+        print(f"✗ Refusing to broadcast: every ParaSwap quote reverted in simulation, "
+              f"even after escalating slippage tolerance up to {slippage_used:.2f}%. "
+              "Try again shortly.")
         return
 
     # Rebuild the payload fresh for broadcast (the sim payload may be near the
