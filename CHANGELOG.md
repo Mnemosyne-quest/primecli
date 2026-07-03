@@ -6,6 +6,36 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-07-03
+
+### Fixed
+- **`degenprime` solvency-gated calls reverted for accounts whose only exposure
+  to a RedStone-priced asset was inside a staked Aerodrome LP.**
+  `degen_account_price_feeds()` built the RedStone feed list from
+  `getAllOwnedAssets()` + `getDebts()` only — staked LP NFTs never appear in
+  either (real collateral, but the gauge holds the NFT), so an asset held
+  *exclusively* inside a staked LP (no raw balance, no debt in it) never got
+  its feed requested. `getTotalValue`/`getHealthRatio`/`isSolvent`/`repay`/
+  `shouldRebalance` then reverted for lack of a price, and `summary`/`defi
+  --json` silently reported it as "RedStone unavailable" — health 0%, no
+  `totalValueUsd`. Surfaced on a live WETH/EURC position: RedStone does have a
+  EURC feed on Base (tracked as `EUROC`), the account was never actually
+  underwater (verified on-chain: `getTotalValue` ≈ $1780, `getHealthRatio` ≈
+  1.23, `isSolvent` = true), the revert was purely a feed-scan gap.
+  `degen_account_price_feeds(account, w3=None)` now also enumerates staked
+  Aerodrome LP legs (via `_aero_position_legs`) when `w3` is passed; all three
+  call sites (summary/defi solvency path, `repay`, `aero-rebalance
+  shouldRebalance`) now pass it.
+- **Related alias miss:** `_aero_position_legs` read LP leg symbols straight
+  off the ERC20 (`_resolve_token_symbol` → `"EURC"`), while DegenPrime's
+  TokenManager and RedStone's feed use the aliased name (`"EUROC"`) that
+  `_account_asset_symbol` already applies to raw holdings. Without aliasing at
+  the source, LP-leg USD lookups against `REDSTONE_AVAILABLE_FEEDS` /
+  `solvency["prices"]` silently missed, leaving the local `health_pct` at 0%
+  even once the on-chain values were fixed. `_aero_position_legs` now aliases
+  `sym0`/`sym1` at construction, matching every other consumer of account
+  symbols.
+
 ### Changed
 - **Batched several sequential-`eth_call` read loops into single Multicall3
   round-trips to cut RPC call volume** (the DegenPrime Aerodrome inventory scan
