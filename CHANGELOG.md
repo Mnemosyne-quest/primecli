@@ -6,6 +6,16 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-04
+
+### Changed
+- **Portability audit follow-up to v0.12.0.** `health_monitor.py`'s
+  `NOTIFY_SCRIPT` is now overridable via `PRIMECLI_NOTIFY_SCRIPT` (falls back
+  to the previous hardcoded path unchanged — purely additive). Fixed a stray
+  personal shebang left in `deltaprime.py`
+  (`#!/root/.openclaw/venv/bin/python3` -> `#!/usr/bin/env python3`, matching
+  its `arbprime`/`degenprime` siblings).
+
 ## [0.12.0] - 2026-07-04
 
 ### Changed
