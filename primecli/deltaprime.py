@@ -311,13 +311,14 @@ AGENTS = {
     "paraklaudios": ("/root/paraklaudios/.credentials.env", "PARAKLAUDIOS_EVM_PRIVATE_KEY"),
 
     # HD seed-derived entries (from Parakletos's BIP39 seed)
-    "parakletos-2": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/0'/0/0"),
-    "parakletos-3": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/0'/0/1"),
-    "parakletos-4": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/0'/0/2"),
-    "parakletos-5": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/0'/0/3"),
-    "parakletos-6": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/0'/0/4"),
-    "parakletos-7": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/1'/0/0"),
-    "parakletos-8": ("/root/.openclaw/workspace/config/wallet.seed", None, "m/44'/60'/2'/0/0"),
+    # Seed file relocated 2026-07-04 (Bruno + Parakletos): workspace/config/wallet.seed -> /root/.openclaw/wallet.seed.
+    "parakletos-2": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/0"),
+    "parakletos-3": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/1"),
+    "parakletos-4": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/2"),
+    "parakletos-5": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/3"),
+    "parakletos-6": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/4"),
+    "parakletos-7": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/1'/0/0"),
+    "parakletos-8": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/2'/0/0"),
 }
 _SELECTED_AGENT = None        # set by the --as CLI flag in main()
 _CLI_KEY = None               # set by the --key CLI flag in main()

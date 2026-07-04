@@ -6,6 +6,18 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-07-04
+
+### Fixed
+- **HD wallet seed path stale after relocation.** Parakletos's BIP39 seed file
+  moved from `/root/.openclaw/workspace/config/wallet.seed` to
+  `/root/.openclaw/wallet.seed`. All three HD-derived `AGENTS` registries
+  (`_wallets.py`, `arbprime.py`, `deltaprime.py`) still pointed at the old
+  path, so every `parakletos-2`..`parakletos-8` key derivation raised
+  `FileNotFoundError` — silently breaking range-monitor, autofarm, and
+  account-health-monitor for every position on those HD wallets. Updated all
+  three registries to the new path.
+
 ## [0.11.7] - 2026-07-04
 
 ### Fixed
