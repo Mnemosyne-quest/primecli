@@ -157,6 +157,13 @@ def fake_signer(monkeypatch):
         def sign_transaction(self, tx):  # never called in dry-run
             raise AssertionError("sign_transaction must not run in a dry-run test")
 
+    # Register the test agent so the `args.agent not in AGENTS` gate in
+    # bridge.run() passes regardless of environment. The built-in registry now
+    # ships EMPTY (wallets load from an external config that isn't present in CI
+    # / a fresh install), so the tests must supply their own agent rather than
+    # rely on personal wallet data being baked into the package. The dummy entry
+    # is never dereferenced — _agent_key is stubbed right below.
+    monkeypatch.setattr(bridge, "AGENTS", {"core1": ("/dev/null", "CORE1_TEST_KEY")})
     monkeypatch.setattr(bridge, "_agent_key", lambda agent: "0x" + "11" * 32)
     monkeypatch.setattr(bridge.Account, "from_key", staticmethod(lambda key: _Acct()))
     return _Acct()
