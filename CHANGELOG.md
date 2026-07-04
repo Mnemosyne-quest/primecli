@@ -6,6 +6,26 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.7] - 2026-07-04
+
+### Fixed
+- **`_aero_decode_minted_token_id` only recognized V3 (Slipstream) mints.** A V2
+  (legacy) pool mint emits its Transfer(0x0->account) from `AERODROME_NPM_V2`, a
+  different contract than `AERODROME_NPM_V3` — checking only V3 silently missed
+  every V2 mint, always falling through to "could not decode tokenId from receipt
+  logs" (confirmed live on an AERO/cbBTC V2 rebuild). Now checks both NPM
+  deployments. Added `test_decodes_v2_pool_mint`.
+
+### Added
+- **`aero-rebuild` now warns when the position being removed has an active
+  rebalance order.** Removing a position clears/orphans its order — nothing
+  recreates it automatically for the new tokenId (the new id doesn't exist until
+  after the mint, and guessing at trigger/mode/fee settings for a real on-chain
+  order is the wrong failure mode). The command now prints a clear heads-up
+  before Step 1, with the exact `aero-rebalance create` command to run afterward.
+  Confirmed live 2026-07-04: a core1 rebuild left the position with no active
+  order until manually recreated.
+
 ## [0.11.6] - 2026-07-04
 
 ### Fixed

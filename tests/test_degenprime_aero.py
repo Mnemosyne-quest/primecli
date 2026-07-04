@@ -16,6 +16,7 @@ import importlib
 dp = importlib.import_module("primecli.degenprime")
 
 NPM_V3 = dp.AERODROME_NPM_V3
+NPM_V2 = dp.AERODROME_NPM_V2
 TRANSFER_TOPIC = "0x" + dp.Web3.keccak(text="Transfer(address,address,uint256)").hex().removeprefix("0x")
 ZERO_ADDR_TOPIC = "0x" + "0" * 64
 DEGEN_ACCOUNT = "0x3A04E3B0B5Ab5d21c5a0E4De8953654591F53Cb6"
@@ -68,6 +69,15 @@ def test_decodes_mint_then_stake_receipt():
     Transfer(account->gauge) for the SAME tokenId -- must pick the mint one."""
     receipt = {"logs": [_mint_log(2037736), _stake_log(2037736)]}
     assert dp._aero_decode_minted_token_id(receipt) == 2037736
+
+
+def test_decodes_v2_pool_mint():
+    """A V2 (legacy, non-Slipstream) pool mint emits its Transfer from
+    AERODROME_NPM_V2, a different contract than V3. Checking only V3 silently
+    missed every V2 mint (confirmed live 2026-07-04, AERO/cbBTC rebuild) --
+    always fell through to 'could not decode tokenId from receipt logs'."""
+    receipt = {"logs": [_mint_log(72732676, address=NPM_V2)]}
+    assert dp._aero_decode_minted_token_id(receipt) == 72732676
 
 
 def test_ignores_unrelated_transfers_on_other_contracts():

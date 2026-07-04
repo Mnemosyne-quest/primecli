@@ -4355,10 +4355,14 @@ def _aero_decode_minted_token_id(receipt) -> int | None:
         return s.lower().removeprefix("0x")
 
     transfer_topic = _norm(Web3.keccak(text="Transfer(address,address,uint256)"))
-    npm = Web3.to_checksum_address(AERODROME_NPM_V3)
+    # Check BOTH NPM deployments — a V2 (legacy) pool mint emits its Transfer from
+    # AERODROME_NPM_V2, not V3. Checking only V3 silently missed every V2 mint,
+    # always falling through to "could not decode tokenId from receipt logs"
+    # (confirmed live 2026-07-04 on an AERO/cbBTC V2 rebuild).
+    npms = {Web3.to_checksum_address(AERODROME_NPM_V2), Web3.to_checksum_address(AERODROME_NPM_V3)}
     zero_addr_topic = "0" * 64
     for log in receipt.get("logs", []):
-        if Web3.to_checksum_address(log.get("address", "")) != npm:
+        if Web3.to_checksum_address(log.get("address", "")) not in npms:
             continue
         topics = log.get("topics", [])
         if len(topics) != 4:
@@ -5288,6 +5292,25 @@ def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float 
         print(f"Cannot match position #{token_id} to a known pool.")
         sys.exit(2)
     pool_cfg = AERODROME_POOLS[pool_key]
+
+    # Warn if this position has an active on-chain rebalance order — removing the
+    # position clears/orphans that order (confirmed live 2026-07-04: a core1 rebuild
+    # left the position with NO active order afterward, requiring a manual
+    # `aero-rebalance create` for the new tokenId). This is a heads-up, not an
+    # auto-fix: the new tokenId only exists after Step 3 mints it, so recreating the
+    # order isn't something this function can safely automate — it doesn't know
+    # what trigger-bps/mode/max-fee the caller wants on the fresh position, and
+    # silently guessing on a real on-chain order is the wrong failure mode here.
+    try:
+        old_order = account.functions.getRebalanceOrder(token_id).call()
+        if int(old_order[7]) > 0:  # createdOn > 0 => an order exists
+            print(f"  NOTE: position #{token_id} has an active rebalance order — "
+                  "removing it will clear that order. Recreate it for the new "
+                  f"position afterward: degenprime aero-rebalance create --token-id "
+                  f"<NEW_ID> --width-pct {width_pct} --execute (check `aerodrome-positions` "
+                  "for <NEW_ID> once this rebuild completes).")
+    except Exception:
+        pass  # best-effort heads-up only; never block the rebuild on this read
 
     print(f"\nStep 1: Removing position #{token_id}...")
     if execute:
