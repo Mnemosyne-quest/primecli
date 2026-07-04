@@ -6,6 +6,34 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-04
+
+### Changed
+- **Named-wallet registry externalised — the package no longer ships personal
+  wallet data.** `_wallets.py` is now the single source of truth for the
+  `AGENTS` registry; `arbprime.py` and `deltaprime.py` dropped their duplicated
+  copies and now import `AGENTS` / `_read_env_var` / `_agent_key` from it
+  (`degenprime.py` and `bridge.py` already did). The built-in registry ships
+  **empty** — no wallet names, file paths, or env-var names live in the
+  published source anymore. Entries are loaded at import time from an external
+  JSON config and overlaid on the (empty) built-in (external wins on a name
+  collision). This removes the three-places-to-fix duplication that caused the
+  2026-07-04 v0.11.8 seed-path bug: a path/wallet change is now a config edit,
+  not a version bump + PyPI release. (Consolidation also fixed a latent drift:
+  `arbprime`'s copy was missing the `core1` entry that `deltaprime`/`_wallets`
+  carried.)
+
+### Added
+- **`PRIMECLI_WALLETS_CONFIG` env var + external wallet config.** Wallet
+  resolution reads a JSON file resolved from `$PRIMECLI_WALLETS_CONFIG`,
+  defaulting to `~/.primecli/wallets.json`. Shape: an object mapping wallet name
+  to either `{"env_file": "...", "env_var": "..."}` (raw key) or
+  `{"seed_path": "...", "derivation_path": "..."}` (HD-derived). Loading is
+  fail-soft: a missing file yields an empty registry (a fresh `pip install`
+  with no config never crashes on import), while malformed JSON, a wrong
+  top-level type, or a malformed entry warns to stderr and is skipped rather
+  than raising. Added `tests/test_wallets_external_config.py`.
+
 ## [0.11.8] - 2026-07-04
 
 ### Fixed

@@ -1,14 +1,27 @@
 """Shared named-wallet key resolution for the primecli siblings.
 
-Single source of truth for the agent→(env_file, var) secrets map and the
-helpers that read a private key out of it. degenprime and the bridge command
-import from here so the map is defined once; deltaprime/arbprime carry their own
-historical copies (kept for now to stay surgical — see the note below).
+Single source of truth for the agent→key-resolution registry and the helpers
+that read a private key out of it. deltaprime, arbprime, degenprime and the
+bridge command all import `AGENTS` / `_read_env_var` / `_agent_key` from here, so
+the registry is defined exactly once.
 
-Security: never log or echo the values these helpers return. They are raw
-private keys.
+The published package ships with an EMPTY built-in registry — no personal wallet
+names, file paths, or env-var names live in the source. At import time the
+registry is overlaid with entries from an external JSON config file (see
+`_load_external_agents`), resolved from `$PRIMECLI_WALLETS_CONFIG` and defaulting
+to `~/.primecli/wallets.json`. A plain path/wallet change is then just a config
+edit — no version bump or PyPI release. Loading is fail-soft: a missing file
+yields an empty overlay, and malformed JSON warns to stderr and is ignored
+rather than crashing every invocation.
+
+Security: never log or echo the values these helpers return — they are raw
+private keys. Only wallet names and non-secret metadata (paths, env-var names)
+ever appear in output.
 """
 
+import json
+import os
+import sys
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -61,28 +74,103 @@ def _derive_private_key(seed_path: str, derivation_path: str) -> str:
 # ---------------------------------------------------------------------------
 # Agent / wallet registry
 #
-# Tuple formats:
-#   (env_path, env_var)           — raw key from env file (existing)
-#   (seed_path, None, deriv_path) — HD-derived from seed file
+# Internal tuple formats (what _agent_key / HD_AGENTS consume):
+#   (env_path, env_var)           — raw key read from an env file
+#   (seed_path, None, deriv_path) — HD-derived from a BIP39 seed file
 # The third element (None vs deriv_path) distinguishes the two modes.
+#
+# The built-in registry ships EMPTY: personal wallet names / paths / env-var
+# names do NOT live in the published source. Entries come from an external JSON
+# config file, overlaid on top of the (empty) built-in at import time. See
+# `_load_external_agents`.
 # ---------------------------------------------------------------------------
 
-AGENTS = {
-    # Raw key entries (from env files)
-    "parakletos":   ("/root/.openclaw/.env",                "PARAKLETOS_EVM_PRIVATE_KEY"),
-    "paraklaudios": ("/root/paraklaudios/.credentials.env", "PARAKLAUDIOS_EVM_PRIVATE_KEY"),
-    "core1":        ("/root/.openclaw/.env",                "BRUNO_CORE1_PRIVATE_KEY"),
+# Default location for the external registry when $PRIMECLI_WALLETS_CONFIG is
+# unset. A neutral path under the invoking user's home, so every agent that
+# shares a home reads the same file regardless of which one runs the tool.
+_DEFAULT_WALLETS_CONFIG = Path.home() / ".primecli" / "wallets.json"
 
-    # HD seed-derived entries (from Parakletos's BIP39 seed)
-    # Seed file relocated 2026-07-04 (Bruno + Parakletos): workspace/config/wallet.seed -> /root/.openclaw/wallet.seed.
-    "parakletos-2": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/0"),
-    "parakletos-3": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/1"),
-    "parakletos-4": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/2"),
-    "parakletos-5": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/3"),
-    "parakletos-6": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/4"),
-    "parakletos-7": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/1'/0/0"),
-    "parakletos-8": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/2'/0/0"),
-}
+
+def _wallets_config_path():
+    """Resolve the external wallets-config path: $PRIMECLI_WALLETS_CONFIG if set,
+    else the default ~/.primecli/wallets.json."""
+    env = os.environ.get("PRIMECLI_WALLETS_CONFIG")
+    return Path(env) if env else _DEFAULT_WALLETS_CONFIG
+
+
+def _entry_from_spec(spec):
+    """Convert one external JSON wallet spec into the internal tuple shape.
+
+    Accepts either:
+      {"env_file": "...", "env_var": "..."}          -> (env_file, env_var)
+      {"seed_path": "...", "derivation_path": "..."} -> (seed_path, None, derivation_path)
+    Returns None if the spec is not a recognised shape (caller skips + warns).
+    """
+    if not isinstance(spec, dict):
+        return None
+    if "seed_path" in spec and "derivation_path" in spec:
+        return (str(spec["seed_path"]), None, str(spec["derivation_path"]))
+    if "env_file" in spec and "env_var" in spec:
+        return (str(spec["env_file"]), str(spec["env_var"]))
+    return None
+
+
+def _load_external_agents(config_path=None):
+    """Load the external wallet registry from JSON. Fail-soft and never raises:
+
+      * file missing             -> {} (silent — a fresh install with no config)
+      * unreadable / bad JSON    -> {} + one-line stderr warning
+      * top-level not an object  -> {} + warning
+      * a single malformed entry -> that entry skipped + warning, others kept
+
+    Only wallet names and non-secret paths / var-names are read here; the secrets
+    themselves are read lazily by _agent_key when a key is actually resolved.
+    """
+    path = Path(config_path) if config_path is not None else _wallets_config_path()
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        print(f"primecli: cannot read wallets config {path}: {e}", file=sys.stderr)
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        print(f"primecli: malformed wallets config {path}: {e}", file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print(
+            f"primecli: wallets config {path} must be a JSON object of "
+            f"name -> spec; ignoring.",
+            file=sys.stderr,
+        )
+        return {}
+    out = {}
+    for name, spec in data.items():
+        entry = _entry_from_spec(spec)
+        if entry is None:
+            print(
+                f"primecli: skipping malformed wallet entry '{name}' in {path}",
+                file=sys.stderr,
+            )
+            continue
+        out[name] = entry
+    return out
+
+
+# Built-in registry ships EMPTY — see the module docstring. External entries win
+# on a name collision, so a future non-empty built-in default would be an
+# overridable fallback, not a hard override.
+_BUILTIN_AGENTS = {}
+
+
+def _build_registry():
+    """Overlay the external config on top of the (empty) built-in registry."""
+    return {**_BUILTIN_AGENTS, **_load_external_agents()}
+
+
+AGENTS = _build_registry()
 
 HD_AGENTS = {name for name, entry in AGENTS.items() if len(entry) == 3 and entry[1] is None}
 

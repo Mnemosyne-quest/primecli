@@ -263,53 +263,14 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 #
 # To add another wallet: add a row to AGENTS, export ARBPRIME_PRIVATE_KEY, or pass --key.
 
-# ---------------------------------------------------------------------------
-# HD wallet derivation from a BIP39 seed file.
-# The seed file is a plaintext mnemonic with tight permissions (chmod 600).
-# The derivation functions NEVER log or print the mnemonic.
-# ---------------------------------------------------------------------------
-_HD_DERIVE_CACHE = {}
-def _ensure_hd_libs():
-    global _HD_DERIVE_CACHE
-    if "mnemonic" not in _HD_DERIVE_CACHE:
-        from mnemonic import Mnemonic
-        from bip32 import BIP32
-        _HD_DERIVE_CACHE["mnemonic"] = Mnemonic
-        _HD_DERIVE_CACHE["BIP32"] = BIP32
-def _derive_private_key(seed_path, derivation_path):
-    _ensure_hd_libs()
-    Mnemonic = _HD_DERIVE_CACHE["mnemonic"]
-    BIP32 = _HD_DERIVE_CACHE["BIP32"]
-    raw = Path(seed_path).read_text().strip()
-    if not raw:
-        raise RuntimeError(f"Seed file {seed_path} is empty")
-    words = raw.split()
-    if len(words) not in (12, 15, 18, 21, 24):
-        raise RuntimeError(f"Seed file {seed_path} has {len(words)} words; expected 12-24")
-    mnemo = Mnemonic("english")
-    if not mnemo.check(raw):
-        raise RuntimeError(f"Seed file {seed_path} contains an invalid mnemonic (checksum fail)")
-    seed = mnemo.to_seed(raw)
-    bip = BIP32.from_seed(seed)
-    privkey = bip.get_privkey_from_path(derivation_path)
-    return privkey.hex()
-# ---------------------------------------------------------------------------
-
-AGENTS = {
-    # Raw key entries (from env files)
-    "parakletos":   ("/root/.openclaw/.env",                "PARAKLETOS_EVM_PRIVATE_KEY"),
-    "paraklaudios": ("/root/paraklaudios/.credentials.env", "PARAKLAUDIOS_EVM_PRIVATE_KEY"),
-
-    # HD seed-derived entries (from Parakletos's BIP39 seed)
-    # Seed file relocated 2026-07-04 (Bruno + Parakletos): workspace/config/wallet.seed -> /root/.openclaw/wallet.seed.
-    "parakletos-2": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/0"),
-    "parakletos-3": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/1"),
-    "parakletos-4": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/2"),
-    "parakletos-5": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/3"),
-    "parakletos-6": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/0'/0/4"),
-    "parakletos-7": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/1'/0/0"),
-    "parakletos-8": ("/root/.openclaw/wallet.seed", None, "m/44'/60'/2'/0/0"),
-}
+# Named-wallet registry + key readers now live in primecli._wallets as the SINGLE
+# source of truth (was a duplicated copy here — the cause of the 2026-07-04
+# 3-places-to-fix seed-path bug). _wallets ships an EMPTY built-in registry and
+# overlays it with an external JSON config ($PRIMECLI_WALLETS_CONFIG, default
+# ~/.primecli/wallets.json), so a wallet/path change no longer needs a package
+# release. Re-exported here so `AGENTS`, `_read_env_var`, `_agent_key` references
+# below keep working unchanged.
+from primecli._wallets import AGENTS, _read_env_var, _agent_key  # noqa: E402
 _SELECTED_AGENT = None        # set by the --as CLI flag in main()
 _CLI_KEY = None               # set by the --key CLI flag in main()
 _OWNER_ADDRESS = None          # set by --owner for keyless read-only commands (main())
@@ -800,40 +761,6 @@ def _set_gas_price_for(chain_id, w3, tx_dict):
         tx_dict["maxPriorityFeePerGas"] = prio
     except Exception:
         tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 1 * 10**9)
-
-def _read_env_var(path, var):
-    """Return the value of `var` from a KEY=VALUE env file, or None if absent."""
-    try:
-        for line in Path(path).read_text().splitlines():
-            s = line.strip()
-            if s.startswith(var + "="):
-                return s.split("=", 1)[1].strip().strip('"').strip("'")
-    except FileNotFoundError:
-        return None
-    return None
-
-def _agent_key(agent):
-    if agent not in AGENTS:
-        raise RuntimeError(
-            f"Unknown agent '{agent}'. Known agents: {', '.join(AGENTS)}. "
-            f"Or set ARBPRIME_PRIVATE_KEY, or ARBPRIME_ENV_FILE + ARBPRIME_KEY_VAR."
-        )
-    entry = AGENTS[agent]
-    # HD wallet derivation (3-tuple with None in middle)
-    if len(entry) == 3 and entry[1] is None:
-        seed_path, _, deriv_path = entry
-        try:
-            return _derive_private_key(seed_path, deriv_path)
-        except RuntimeError as e:
-            raise RuntimeError(
-                f"Failed to derive key for agent '{agent}' (deriv_path={deriv_path}): {e}"
-            ) from e
-    # Raw key from env file (existing logic)
-    path, var = entry
-    key = _read_env_var(path, var)
-    if not key:
-        raise RuntimeError(f"{var} not found in {path} (agent '{agent}').")
-    return key
 
 def _sign_and_send(w3, acct, tx, label, timeout=180, fallback_gas=3000000, buffer_bps=1250, gas_price_fn=None):
     """Sign, send, wait for a tx with gas estimation + OOG retry + error surfacing.
