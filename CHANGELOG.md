@@ -6,6 +6,21 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-07-04
+
+### Fixed
+- **`aero-rebuild` stranded funds mid-operation in `--execute` mode.** Step 1
+  (`cmd_aero_remove_liquidity`) fully closes the position — unstakes, removes
+  liquidity, collects fees, and burns the NFT. The pool lookup that Steps 2/3
+  (sweep idle assets + re-mint at the new width) depend on ran *after* that burn,
+  reading the now-nonexistent tokenId and aborting with "Could not read position
+  #N" — after the funds were already unwound into loose tokens sitting idle in
+  the account, undeployed. Confirmed live 2026-07-04 on a core1 aero-cbbtc-200
+  rebuild: ~$1,860 sat loose for several minutes before being manually swept and
+  re-minted. Fixed by resolving the pool *before* removing the position. Added
+  `tests/test_aero_rebuild.py` (mocked, offline) asserting the pool lookup
+  precedes removal — nothing previously covered this function at all.
+
 ## [0.11.4] - 2026-07-03
 
 ### Fixed

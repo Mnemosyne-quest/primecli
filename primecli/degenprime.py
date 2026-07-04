@@ -5251,13 +5251,13 @@ def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float 
     account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
     print(f"Degen Account: {pa}")
 
-    print(f"\nStep 1: Removing position #{token_id}...")
-    if execute:
-        cmd_aero_remove_liquidity([token_id], 100.0, execute=True)
-    else:
-        print("  Would remove position (preview). Run with --execute to proceed.")
-
-    # Find the pool from the position
+    # Find the pool from the position BEFORE removing it — Step 1 burns the NFT
+    # (fully closed: unstaked + removed + collected + burned), so reading it back
+    # afterward returns nothing. Resolving the pool first means Steps 2/3 (sweep +
+    # re-mint) still run even in --execute mode, instead of aborting post-burn with
+    # "Could not read position" and leaving the swept funds sitting idle/undeployed
+    # in the account (confirmed live 2026-07-04: ~$1,860 stranded for several
+    # minutes on a core1 rebuild before being manually redeployed).
     pos = _aero_read_position(w3, token_id, pa)
     if pos is None:
         print(f"Could not read position #{token_id}.")
@@ -5272,6 +5272,12 @@ def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float 
         print(f"Cannot match position #{token_id} to a known pool.")
         sys.exit(2)
     pool_cfg = AERODROME_POOLS[pool_key]
+
+    print(f"\nStep 1: Removing position #{token_id}...")
+    if execute:
+        cmd_aero_remove_liquidity([token_id], 100.0, execute=True)
+    else:
+        print("  Would remove position (preview). Run with --execute to proceed.")
 
     # ⚠️  Aerodrome V3 gauge anti-sniping (10-second cooldown). The
     # batchRemoveStakedLiquidityAerodrome (Step 1) unstaked from the gauge at
