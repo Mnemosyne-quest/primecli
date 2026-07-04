@@ -1547,7 +1547,15 @@ def run_tick(
                 if r.returncode == 0:
                     cooldown_file.write_text(str(int(time.time())))
                     result["action"] = f"repaid ${repay_amt:.2f}"
-                    _notify(f"🔄 ✅ {label}: repaid ${repay_amt:.2f} USDC directly from raw balance (health was {pct}% — no swap needed)")
+                    new_debt_after = max(0.0, debt - repay_amt)
+                    new_health_pct = min(100.0, max(0.0, 100 * (1 - new_debt_after / (max_mult * equity)))) if max_mult > 0 and equity > 0.01 else 0.0
+                    _notify(
+                        f"✅ DE-LEVER — {label}:\n"
+                        f"  Repaid: ${repay_amt:.2f} USDC\n"
+                        f"  Pre-health: {pct}% → {new_health_pct:.1f}%\n"
+                        f"  Source: raw USDC balance (no swap needed)\n"
+                        f"  Debt reduced: ${debt:.2f} → ${new_debt_after:.2f}"
+                    )
                 else:
                     result["error"] = f"repay failed: {r.stderr[:200]}"
             except Exception as e:
@@ -1564,6 +1572,12 @@ def run_tick(
             borrow_amt = delta
             if borrow_amt < 1:
                 result["action"] = "none (borrow too small)"
+                _notify(
+                    f"ℹ️ LEVER-UP SKIPPED — {label}:\n"
+                    f"  Health: {pct}% (above {high}% target)\n"
+                    f"  Would borrow: ${borrow_amt:.2f} but amount too small (${borrow_amt:.2f} < $1.00)\n"
+                    f"  Will retry on next tick"
+                )
                 return result
 
             # Stranded-debt guard (GMX): the GMX/avax defisims autofarm is NOT
@@ -1608,6 +1622,18 @@ def run_tick(
                 result["action"] = f"would borrow ${borrow_amt:.2f} USDC (defisims deploys)"
                 return result
 
+            # Phase 1: Announce intent BEFORE borrow
+            _post_health = min(100.0, max(0.0, 100 * (1 - (debt + borrow_amt) / (max_mult * (equity + borrow_amt))))) if max_mult > 0 and equity + borrow_amt > 0.01 else 0.0
+            _notify(
+                f"⏳ LEVER-UP INTENT — {label}:\n"
+                f"  Pre-health: {pct}% (target ~50%)\n"
+                f"  Will borrow: ${borrow_amt:.2f} USDC\n"
+                f"  Current position: ${equity:.2f} equity, ${debt:.2f} debt\n"
+                f"  Post-borrow health: ~{_post_health:.1f}%\n"
+                f"  Next step: defisims autofarm will deploy borrowed USDC into LP on next tick\n"
+                f"  ⚠️ Borrowed USDC sits RAW until deploy — rate/price risk while un-deployed"
+            )
+
             # Borrow USDC
             try:
                 r = subprocess.run(
@@ -1634,14 +1660,27 @@ def run_tick(
                     )
                     if sr.returncode == 0:
                         result["action"] = f"borrowed ${borrow_amt:.2f}, swapped to {swap_target}"
-                        _notify(f"🔄 ⬆️ {label}: leveraging up — borrowed ${borrow_amt:.2f} USDC and swapped to {swap_target} (health was {pct}%, adding leverage for yield)")
+                        _notify(
+                            f"✅ LEVER-UP EXECUTED — {label}:\n"
+                            f"  Borrowed: ${borrow_amt:.2f} USDC → swapped to {swap_target}\n"
+                            f"  Pre-health: {pct}% → post-health: check next monitor tick\n"
+                            f"  Next: defisims autofarm will manage {swap_target} position\n"
+                            f"  ⚠️ Position is over-levered (+1 tick cost) until LP deploy completes"
+                        )
                     else:
                         result["warning"] = f"swap to {swap_target} failed after borrow: {sr.stderr[:200]}"
                 except Exception as e:
                     result["error"] = f"borrow+swap error: {e}"
             else:
                 result["action"] = f"borrowed ${borrow_amt:.2f} USDC (defisims autofarm deploys)"
-                _notify(f"🔄 ⬆️ {label}: leveraging up — borrowed ${borrow_amt:.2f} USDC (health was {pct}%, defisims autofarm will deploy into LP)")
+                _notify(
+                    f"✅ LEVER-UP EXECUTED — {label}:\n"
+                    f"  Borrowed: ${borrow_amt:.2f} USDC\n"
+                    f"  Pre-health: {pct}% → post-health: check next monitor tick\n"
+                    f"  Raw USDC now in account: ~${(raw_usdc + borrow_amt):.2f}\n"
+                    f"  Next: defisims autofarm will deploy into LP (may take 1-2 ticks)\n"
+                    f"  ⚠️ Position is over-levered (+1 tick cost) until LP deploy completes"
+                )
 
             cooldown_file.write_text(str(int(time.time())))
     return result

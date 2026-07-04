@@ -170,6 +170,8 @@ BASE_RPC = os.environ.get("DEGENPRIME_RPC", "https://base-rpc.publicnode.com")
 _BASE_RPC_FALLBACKS = [
     "https://base.drpc.org",
     "https://base.meowrpc.com",
+    "https://base.gateway.tenderly.co",
+    "https://base-pokt.nodies.app",
 ]
 EXPLORER = "https://basescan.org"
 CHAIN_ID = 8453
@@ -513,7 +515,7 @@ def get_w3():
     last_exc = None
     for attempt, url in enumerate(candidates * 2):  # At most 2 rounds through the list
         try:
-            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
+            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 15}))
             # Quick health check — eth_chainId is cheaper for providers than block_number
             w3.eth.chain_id
             _W3 = w3
@@ -3246,6 +3248,7 @@ def _print_revert_reason(w3, tx, receipt):
 SWAP_ASSETS = {cfg["symbol"]: {"symbol": cfg["symbol"], "token": cfg["token"], "decimals": cfg["decimals"]}
                for cfg in POOLS.values()}
 
+
 def _swap_asset_meta(w3, symbol: str):
     """Resolve a swap-side symbol to {token, decimals}. Falls back to TokenManager for
     non-pool collateral (memecoins). Returns None if the asset is unknown.
@@ -4048,9 +4051,26 @@ def cmd_aerodrome_positions(json_out=False):
 
     --json emits a machine-readable object (and prints nothing else) so callers like
     the portfolio report can render range % without scraping text."""
-    w3 = get_w3()
+    try:
+        w3 = get_w3()
+    except Exception as e:
+        if json_out:
+            print(json.dumps({"wallet": None, "prime_account": None, "positions": [],
+                              "error": f"get_w3: {type(e).__name__}: {e}"}))
+        else:
+            print(f"Error: could not connect to RPC: {type(e).__name__}: {e}")
+        sys.exit(1)
     acct = get_account()
-    pa = get_prime_account(w3, acct.address)
+    try:
+        pa = get_prime_account(w3, acct.address)
+    except Exception as e:
+        if json_out:
+            print(json.dumps({"wallet": acct.address, "prime_account": None, "positions": [],
+                              "error": f"get_prime_account: {type(e).__name__}: {e}"}))
+        else:
+            print(f"Wallet: {acct.address}")
+            print(f"Error: could not read prime account: {type(e).__name__}: {e}")
+        sys.exit(1)
     if not pa:
         if json_out:
             print(json.dumps({"wallet": acct.address, "prime_account": None, "positions": []}))
@@ -4086,53 +4106,49 @@ def cmd_aerodrome_positions(json_out=False):
     # for those. NPM.positions() returns the real struct for any holder.
     out = []
     for tid in ids:
-        # Resolve the owning deployment (ownership-aware) and read the full struct so
-        # tickSpacing + version are in scope — needed to pick the position's OWN pool
-        # cfg below (a bare token-pair match returns the dead V2 pool for weth-euroc-v3).
-        _npm, ver, p = _aero_npm_for_token(w3, tid, pa)
-        if p is None:
-            if not json_out:
-                print(f"    [{tid}] position read failed")
-            out.append({"token_id": tid, "error": "position read failed"})
-            continue
-        # positions(): nonce, operator, token0, token1, tickSpacing, tickLower,
-        #              tickUpper, liquidity, ...
-        token0, token1, tick_spacing = p[2], p[3], p[4]
-        tick_lower, tick_upper, liq = p[5], p[6], p[7]
-        sym0 = _resolve_token_symbol(w3, token0)
-        sym1 = _resolve_token_symbol(w3, token1)
-        # Human price = token1 per token0 = 1.0001**tick * 10**(dec0 - dec1).
-        dec0 = _resolve_token_decimals(w3, token0)
-        dec1 = _resolve_token_decimals(w3, token1)
-        price_lower = price_upper = None
-        if dec0 is not None and dec1 is not None:
-            scale = 10 ** (dec0 - dec1)
-            price_lower = 1.0001 ** tick_lower * scale
-            price_upper = 1.0001 ** tick_upper * scale
-
-        pool_cfg = _aero_match_pool_cfg(token0, token1, tick_spacing, ver)
-        rng = _aero_range_metrics(w3, pool_cfg, tick_lower, tick_upper) if pool_cfg else None
-
-        entry = {
-            "token_id": tid, "pair": f"{sym0}/{sym1}",
-            "tick_lower": tick_lower, "tick_upper": tick_upper, "liquidity": liq,
-            "price_lower": price_lower, "price_upper": price_upper,
-            "price_quote": f"{sym1}/{sym0}",
-        }
-        if rng:
-            entry.update(rng)
-        out.append(entry)
-
-        if not json_out:
-            base = (f"    [{tid}] {sym0}/{sym1}  ticks=[{tick_lower}, {tick_upper}]  liq={liq}")
-            if price_lower is not None:
-                base += f"  price_range=[{price_lower:.6g}, {price_upper:.6g}] ({sym1}/{sym0})"
-            print(base)
+        try:
+            _npm, ver, p = _aero_npm_for_token(w3, tid, pa)
+            if p is None:
+                if not json_out:
+                    print(f"    [{tid}] position read failed")
+                out.append({"token_id": tid, "error": "position read failed"})
+                continue
+            token0, token1, tick_spacing = p[2], p[3], p[4]
+            tick_lower, tick_upper, liq = p[5], p[6], p[7]
+            sym0 = _resolve_token_symbol(w3, token0)
+            sym1 = _resolve_token_symbol(w3, token1)
+            dec0 = _resolve_token_decimals(w3, token0)
+            dec1 = _resolve_token_decimals(w3, token1)
+            price_lower = price_upper = None
+            if dec0 is not None and dec1 is not None:
+                scale = 10 ** (dec0 - dec1)
+                price_lower = 1.0001 ** tick_lower * scale
+                price_upper = 1.0001 ** tick_upper * scale
+            pool_cfg = _aero_match_pool_cfg(token0, token1, tick_spacing, ver)
+            rng = _aero_range_metrics(w3, pool_cfg, tick_lower, tick_upper) if pool_cfg else None
+            entry = {
+                "token_id": tid, "pair": f"{sym0}/{sym1}",
+                "tick_lower": tick_lower, "tick_upper": tick_upper, "liquidity": liq,
+                "price_lower": price_lower, "price_upper": price_upper,
+                "price_quote": f"{sym1}/{sym0}",
+            }
             if rng:
-                status = "IN RANGE" if rng["in_range"] else "OUT OF RANGE"
-                print(f"         {status}  ±{rng['width_pct']}% wide  ·  "
-                      f"{rng['pct_through_range']}% through  ·  "
-                      f"-{rng['dist_to_lower_pct']}% to lower / +{rng['dist_to_upper_pct']}% to upper")
+                entry.update(rng)
+            out.append(entry)
+            if not json_out:
+                base = (f"    [{tid}] {sym0}/{sym1}  ticks=[{tick_lower}, {tick_upper}]  liq={liq}")
+                if price_lower is not None:
+                    base += f"  price_range=[{price_lower:.6g}, {price_upper:.6g}] ({sym1}/{sym0})"
+                print(base)
+                if rng:
+                    status = "IN RANGE" if rng["in_range"] else "OUT OF RANGE"
+                    print(f"         {status}  ±{rng['width_pct']}% wide  ·  "
+                          f"{rng['pct_through_range']}% through  ·  "
+                          f"-{rng['dist_to_lower_pct']}% to lower / +{rng['dist_to_upper_pct']}% to upper")
+        except Exception as pos_e:
+            if not json_out:
+                print(f"    [{tid}] position error: {type(pos_e).__name__}: {pos_e}")
+            out.append({"token_id": tid, "error": f"{type(pos_e).__name__}: {pos_e}"})
 
     if json_out:
         print(json.dumps({"wallet": acct.address, "prime_account": pa, "positions": out}))
@@ -6362,6 +6378,11 @@ def main():
         _dispatch()
     except RuntimeError as e:
         print(f"degenprime: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"degenprime: internal error ({type(e).__name__}: {e})", file=sys.stderr)
+        if os.environ.get("DEBUG"):
+            raise
         sys.exit(1)
 
 def _dispatch():

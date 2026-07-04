@@ -6,6 +6,26 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.6] - 2026-07-04
+
+### Fixed
+- **`aerodrome-positions` crashed the whole listing on one bad RPC read.** A
+  transient failure in `get_w3`/`get_prime_account`, or reading a single
+  position, took down the entire command instead of surfacing which position
+  failed. Now wrapped per-stage: connection/account failures return a
+  structured error (JSON mode) or a clear message and exit, and a single
+  position's read failure is recorded against that tokenId while the rest of
+  the listing still completes.
+- `main()` no longer lets an unexpected exception print a raw Python
+  traceback to the user; prints a one-line `internal error (...)` message
+  and exits 1. Set `DEBUG=1` to get the full traceback back for diagnosis.
+
+### Changed
+- Added two more Base RPC fallbacks (`base.gateway.tenderly.co`,
+  `base-pokt.nodies.app`) and raised the per-provider connect timeout from
+  10s to 15s — more headroom against the RPC flakiness that's shown up
+  repeatedly this week.
+
 ## [0.11.5] - 2026-07-04
 
 ### Fixed
