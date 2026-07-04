@@ -291,7 +291,10 @@ def append_history(state_dir: str, entry: dict):
         path.write_text("\n".join(lines[-1000:]) + "\n")
 
 
-NOTIFY_SCRIPT = os.path.expanduser("/root/.openclaw/workspace/scripts/notify.sh")
+NOTIFY_SCRIPT = os.environ.get(
+    "PRIMECLI_NOTIFY_SCRIPT",
+    os.path.expanduser("/root/.openclaw/workspace/scripts/notify.sh"),
+)
 
 
 def _notify(text: str):

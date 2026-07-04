@@ -1,4 +1,4 @@
-#!/root/.openclaw/venv/bin/python3
+#!/usr/bin/env python3
 """DeltaPrime Protocol interaction module (Avalanche C-chain).
 
 Lending pools take direct EOA deposits/withdrawals. Borrowing and leverage go
