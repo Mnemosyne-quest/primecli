@@ -895,6 +895,25 @@ def test_health_swing_self_resolves_without_escalating(tmp_path, monkeypatch):
     assert hm.load_health_swing_streak(sd) == 0
 
 
+def test_health_swing_ignores_improving_health(tmp_path, monkeypatch):
+    """A large sustained UPWARD swing (e.g. a repay that fixed itself on retry) must
+    never escalate — only a drop is a liquidation-risk signal. Regression for
+    2026-07-05, when a 29.5%->55.5% recovery on parakletos-2 escalated exactly like a
+    real crash would have, against an account that was never in danger."""
+    sd = str(tmp_path / "state")
+    strat = _observer_strategy(tmp_path)
+    _tick(tmp_path, monkeypatch, _priced(1700, 1400, 29.5), strat, sd)
+    # Tick 2: health improves to 55.5%, equity stable — would have been a pending swing
+    # under the old abs()-based check. Must be treated like no swing at all.
+    r2 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 55.5), strat, sd)
+    assert r2.get("escalation") is None, r2
+    assert "pending confirmation" not in r2.get("action", ""), r2
+    assert hm.load_health_swing_streak(sd) == 0
+    # Tick 3: even held for a second tick, still no escalation.
+    r3 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 55.5), strat, sd)
+    assert r3.get("escalation") is None, r3
+
+
 def test_stop_loss_requires_two_confirmations(tmp_path, monkeypatch):
     """A genuine drawdown must hold for 2 consecutive trusted reads before a full close."""
     sd = str(tmp_path / "state")

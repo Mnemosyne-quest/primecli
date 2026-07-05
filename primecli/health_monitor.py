@@ -1074,7 +1074,14 @@ def run_tick(
     advance_pct_baseline = True
     if trustworthy:
         if last_pct is not None and cur_pct is not None:
-            diff = abs(cur_pct - last_pct)
+            # Only a DROP is a liquidation-risk signal worth an escalation + intervention
+            # agent. A large upward swing (e.g. a repay that just fixed itself on retry)
+            # is good news, not danger -- escalating it anyway spawns the same "close
+            # everything, rebalance to ~50%, redeploy" playbook a real crash would trigger,
+            # against an account that isn't actually in trouble. Confirmed 2026-07-05
+            # (parakletos-2): a 29.5%->55.5% recovery swing escalated exactly like a crash
+            # would have. Treat an improving health reading like "no swing".
+            diff = last_pct - cur_pct
             if diff > 10:
                 streak = load_health_swing_streak(state_dir) + 1
                 save_health_swing_streak(state_dir, streak)

@@ -6,6 +6,19 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-07-05
+
+### Fixed
+- **`health_monitor.py`'s health-swing detector no longer escalates on an
+  IMPROVING health reading.** It previously fired on any sustained swing
+  `>10` percentage points held for 2 consecutive ticks, in either direction —
+  so a health reading that recovered (e.g. a repay swap that failed once and
+  succeeded on the very next retry) triggered the exact same "close
+  everything, rebalance to target, redeploy" escalation playbook a real
+  crash would. Only a drop is a liquidation-risk signal; an increase is
+  treated like no swing at all (streak resets, no escalation, no agent
+  spawned).
+
 ## [0.12.1] - 2026-07-04
 
 ### Changed
