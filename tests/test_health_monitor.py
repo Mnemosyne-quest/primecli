@@ -857,19 +857,20 @@ def test_health_swing_suppressed_on_misprice_equity_jump(tmp_path, monkeypatch):
 
 
 def test_health_swing_requires_two_confirmations(tmp_path, monkeypatch):
-    """A genuine, SUSTAINED health swing on stable equity still escalates, but only
-    after holding for 2 consecutive trustworthy ticks vs the frozen pre-swing baseline
-    — mirrors the stop-loss confirmation pattern. A single-tick swing (e.g. one step of
-    a still-executing multi-tx autofarm converge) must NOT escalate on its own."""
+    """A genuine, SUSTAINED health swing to a DANGEROUS level (below the escalation floor)
+    on stable equity still escalates, but only after holding for 2 consecutive trustworthy
+    ticks vs the frozen pre-swing baseline — mirrors the stop-loss confirmation pattern. A
+    single-tick swing (e.g. one step of a still-executing multi-tx autofarm converge) must
+    NOT escalate on its own."""
     sd = str(tmp_path / "state")
     strat = _observer_strategy(tmp_path)
     _tick(tmp_path, monkeypatch, _priced(1700, 1400, 53.0), strat, sd)
-    # Tick 2: real drop to 38%, equity stable (~$300, same supplied/debt) → pending, no escalation.
-    r2 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 38.0), strat, sd)
+    # Tick 2: real drop to 15% (below the 20% danger floor), equity stable → pending, no escalation.
+    r2 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 15.0), strat, sd)
     assert r2.get("escalation") is None, r2
     assert "pending confirmation" in r2.get("action", ""), r2
     # Tick 3: swing persists vs the SAME frozen 53% baseline → 2nd confirmation → escalate.
-    r3 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 38.0), strat, sd)
+    r3 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 15.0), strat, sd)
     assert r3.get("escalation") == "health_swing", r3
 
 
@@ -883,14 +884,35 @@ def test_health_swing_self_resolves_without_escalating(tmp_path, monkeypatch):
     the streak instead of re-triggering forever."""
     sd = str(tmp_path / "state")
     strat = _observer_strategy(tmp_path)
-    _tick(tmp_path, monkeypatch, _priced(1700, 1400, 71.7), strat, sd)
-    # Tick 2: swing to 61.3% vs frozen 71.7 baseline (diff 10.4) → pending (1/2).
-    r2 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 61.3), strat, sd)
+    _tick(tmp_path, monkeypatch, _priced(1700, 1400, 35.0), strat, sd)
+    # Tick 2: swing to 15% vs frozen 35% baseline (diff 20, below the 20% floor) → pending (1/2).
+    r2 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 15.0), strat, sd)
     assert r2.get("escalation") is None, r2
     assert "pending confirmation" in r2.get("action", ""), r2
-    # Tick 3: settles back to 73.4% — still compared against the FROZEN 71.7 baseline
-    # (diff 1.7, not the pending 61.3 reading), so the streak clears with no escalation.
-    r3 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 73.4), strat, sd)
+    # Tick 3: settles back to 34% — still compared against the FROZEN 35% baseline
+    # (diff 1, not the pending 15% reading), so the streak clears with no escalation.
+    r3 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 34.0), strat, sd)
+    assert r3.get("escalation") is None, r3
+    assert hm.load_health_swing_streak(sd) == 0
+
+
+def test_health_swing_in_band_does_not_escalate(tmp_path, monkeypatch):
+    """A large DOWN-swing that stays above the danger floor (e.g. the autofarm dispatcher's
+    own rebuild moving health 20-40pp but leaving it in a safe range) must NOT escalate —
+    that self-amplifying escalation loop ran 3 agents / 31 txs on parakletos-2 in 20 min
+    (2026-07-11). Only a drop landing below SWING_ESCALATION_DANGER_FLOOR is a liquidation
+    signal; a swing that begins and ends in-band records swing_guard and advances normally."""
+    sd = str(tmp_path / "state")
+    strat = _observer_strategy(tmp_path)
+    _tick(tmp_path, monkeypatch, _priced(1700, 1400, 71.0), strat, sd)
+    # Tick 2: big drop to 45% (diff 26 > 10) but well above the 20% floor → benign, no streak.
+    r2 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 45.0), strat, sd)
+    assert r2.get("escalation") is None, r2
+    assert "pending confirmation" not in r2.get("action", ""), r2
+    assert hm.load_health_swing_streak(sd) == 0
+    assert "suppressed" in r2.get("swing_guard", ""), r2
+    # Tick 3: held at 45% — still no escalation, still no streak.
+    r3 = _tick(tmp_path, monkeypatch, _priced(1700, 1400, 45.0), strat, sd)
     assert r3.get("escalation") is None, r3
     assert hm.load_health_swing_streak(sd) == 0
 

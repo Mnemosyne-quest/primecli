@@ -2767,7 +2767,39 @@ def cmd_summary(as_json: bool = False):
         prices = solvency["prices"]
         # Resolve unpriced symbols same way as gather_defi does.
         price_map = dict(prices)
-        _hp_rows = [_asset_row(r) for r in supplied]
+        # Back-solve a single unpriced collateral symbol from getTotalValue so healthPct does
+        # not read a false 0 when a supplied asset has no RedStone feed (e.g. VIRTUAL). Same
+        # logic as gather_defi: with exactly one unpriced symbol across in-account + aero-leg
+        # collateral, its implied price makes the per-row USD sum back to getTotalValue. The
+        # authoritative totalValueUsd/debtUsd/solvent come straight from the SolvencyFacet and
+        # are unaffected — this only feeds the equity-health rows below. (2026-07-11)
+        _coll_amounts = {}
+        for _r in supplied:
+            _coll_amounts[_r["symbol"]] = _coll_amounts.get(_r["symbol"], 0.0) + _r["raw"] / 10**_r["decimals"]
+        for _lg in aero_legs:
+            if _lg.get("_synthetic"):
+                continue
+            _coll_amounts[_lg["sym0"]] = _coll_amounts.get(_lg["sym0"], 0.0) + _lg["amt0"]
+            _coll_amounts[_lg["sym1"]] = _coll_amounts.get(_lg["sym1"], 0.0) + _lg["amt1"]
+        if solvency["total"] is not None:
+            _priced_total = sum(a * price_map[s] for s, a in _coll_amounts.items() if s in price_map)
+            _unpriced = {s: a for s, a in _coll_amounts.items() if s not in price_map and a > 0}
+            if len(_unpriced) == 1:
+                _us, _uamt = next(iter(_unpriced.items()))
+                _uresid = solvency["total"] - _priced_total
+                if _uresid > 0 and _uamt > 0:
+                    price_map[_us] = _uresid / _uamt
+
+        def _hp_row(r):
+            # Health-input row priced from the back-solved price_map (NOT solvency["prices"]),
+            # so a feed-less collateral symbol still contributes equity to healthPct.
+            row = {"symbol": r["symbol"]}
+            _u = price_map.get(r["symbol"])
+            if _u is not None:
+                row["usd"] = round(r["raw"] / 10**r["decimals"] * _u, 2)
+            return row
+
+        _hp_rows = [_hp_row(r) for r in supplied]
         if aero_legs:
             for lg in aero_legs:
                 if lg.get("_synthetic"):
@@ -2781,7 +2813,7 @@ def cmd_summary(as_json: bool = False):
         # FIX issue-3 (cmd_summary json path): same getTotalValue gap fallback as
         # gather_defi — when aero_legs is empty but getTotalValue > priced_supplied,
         # inject the gap as a synthetic LP entry so health_pct is consistent.
-        _hp_borrowed = [_asset_row(r) for r in borrowed]
+        _hp_borrowed = [_hp_row(r) for r in borrowed]
         _hp = _compute_degen_account_health(_hp_rows, _hp_borrowed,
                                             aero_legs, solvency["total"], w3=w3,
                                             has_staked_nft=_has_staked)

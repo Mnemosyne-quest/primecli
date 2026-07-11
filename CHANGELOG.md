@@ -6,6 +6,29 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-07-11
+
+### Fixed
+- **`health_monitor.py`'s health-swing detector no longer escalates on a
+  DOWN-swing that begins and ends in a safe health range.** It previously
+  escalated any confirmed `>10` percentage point drop regardless of where it
+  landed — including swings caused by the caller's own multi-tx LP rebuild
+  (which routinely moves health 20-40pp over 2-3 minutes as part of normal
+  operation). Escalating those spawned a close-and-redeploy agent whose own
+  transactions caused further swings, which escalated again: 3 concurrent
+  agents running 31 on-chain transactions on one position within 20 minutes.
+  A down-swing now only escalates when it lands the account below a new
+  `SWING_ESCALATION_DANGER_FLOOR` (20%, above the existing `<10%` hard-critical
+  floor) — a genuine approach toward liquidation risk, not rebuild noise.
+- **`degenprime.py`'s `summary --json` `healthPct` no longer falsely reads
+  `0.0` when a supplied asset has no direct price feed** (e.g. a token only
+  priced as part of an LP leg). The health computation now applies the same
+  single-unpriced back-solve fallback `gather_defi` already used, so a
+  correctly-solvent account no longer reports a false zero health percentage
+  right after a fresh LP mint. `totalValueUsd`/`debtUsd`/`solvent` (sourced
+  from the on-chain SolvencyFacet) were never affected — this only fixes the
+  derived `healthPct` field.
+
 ## [0.12.2] - 2026-07-05
 
 ### Fixed

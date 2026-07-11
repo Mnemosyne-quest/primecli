@@ -40,6 +40,16 @@ from pathlib import Path
 # ── Tier config ─────────────────────────────────────────────────────
 TIER_MAX = {"basic": 5, "premium": 10}
 
+# A confirmed health DOWN-swing only escalates (spawns the close-and-redeploy agent) when it
+# lands the account below this floor — genuinely approaching the <10% hard-critical level. A
+# large swing that begins and ends in a safe range is NOT a liquidation risk: e.g. the autofarm
+# dispatcher's own multi-tx LP rebuild routinely moves health 20-40pp over 2-3 min but leaves it
+# well above this floor. Escalating those spawned a close/redeploy agent whose own txs caused
+# further swings — 3 concurrent agents / 31 on-chain txs on one position in 20 min (2026-07-11).
+# Set below the 30% target-band low and above the <10% hard floor: an early-warning for a genuine
+# crash, not a rebuild-noise trigger. The equity stop-loss and the <10% floor remain the backstops.
+SWING_ESCALATION_DANGER_FLOOR = 20.0
+
 
 # ════════════════════════════════════════════════════════════════════
 # Health computation
@@ -1082,7 +1092,15 @@ def run_tick(
             # (parakletos-2): a 29.5%->55.5% recovery swing escalated exactly like a crash
             # would have. Treat an improving health reading like "no swing".
             diff = last_pct - cur_pct
-            if diff > 10:
+            # A confirmed DOWN-swing only escalates when it lands the account in genuinely
+            # dangerous territory (below SWING_ESCALATION_DANGER_FLOOR). A large swing that
+            # begins and ends in a safe range is not a liquidation risk — most often it is the
+            # autofarm dispatcher's own multi-tx LP rebuild (health moves 20-40pp over 2-3 min,
+            # then settles). Escalating those spawned a close/redeploy agent whose own txs caused
+            # further swings: 3 concurrent agents / 31 txs on one position in 20 min (2026-07-11).
+            # The <10% hard floor (rebalance mode) and the equity stop-loss remain the backstops
+            # for a genuine crash.
+            if diff > 10 and cur_pct < SWING_ESCALATION_DANGER_FLOOR:
                 streak = load_health_swing_streak(state_dir) + 1
                 save_health_swing_streak(state_dir, streak)
                 if streak >= 2:
@@ -1102,6 +1120,13 @@ def run_tick(
                     # pre-swing last_pct instead of advancing to the anomalous cur_pct.
                     advance_pct_baseline = False
             else:
+                if diff > 10:
+                    # Large drop but still in a safe range — record why no escalation fired
+                    # (visible on the dashboard) and let the baseline advance normally.
+                    result["swing_guard"] = (
+                        f"downswing {diff:.1f}pp to {cur_pct:.1f}% suppressed "
+                        f"(>= {SWING_ESCALATION_DANGER_FLOOR:.0f}% floor, not liquidation risk)"
+                    )
                 save_health_swing_streak(state_dir, 0)
     else:
         result["swing_guard"] = (
