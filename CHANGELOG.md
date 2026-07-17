@@ -6,6 +6,28 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-07-17
+
+### Added
+- **`aero-add-liquidity --use-all-available` gains an optional `--reserve
+  SYMBOL:FRACTION` flag.** It holds back `FRACTION` (a real number in `[0,1]`) of
+  `SYMBOL`'s inventoried loose balance from the sweep, leaving that portion loose and
+  untouched in the Degen Account (no swap, no mint); the remaining `(1-FRACTION)`
+  deploys exactly as before. Generic over any symbol/fraction (case-insensitive
+  match); repeatable for multiple assets. The reserve is applied to the deploy set
+  BEFORE the pool/sweep split, so a reserved asset is excluded from both the non-pool
+  sweep-and-swap and the pool-token balancing. `FRACTION` is validated to `[0,1]`
+  (NaN and out-of-range rejected with a clear error). Motivating use: the defisims
+  AERO gauge-reward hold, which reserves a fraction of claimed AERO from the
+  autocompound rebuild so it accumulates for manual sale; its capability probe
+  inspects the new `reserve` parameter on `cmd_aero_add_liquidity`.
+- **Backward compatibility is exact:** omitting `--reserve` is a strict no-op —
+  `_aero_apply_reserve` returns the same deploy set unchanged and every new parameter
+  defaults to `None`, so the sweep is byte-identical to prior behaviour on every
+  position (this path serves all Aerodrome positions, including AERO-leg pools). New
+  offline tests (`tests/test_aero_reserve.py`) lock the parse, the subtract math, the
+  no-op guarantee, and the presence of the `reserve` parameter.
+
 ## [0.12.3] - 2026-07-11
 
 ### Fixed

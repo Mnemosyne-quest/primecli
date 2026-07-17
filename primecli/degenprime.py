@@ -29,7 +29,7 @@ Usage:
   degenprime aerodrome-positions
   degenprime aero-add-liquidity --pool weth-usdc-100 --amount-token0 0.05 --amount-token1 100 [--slippage 1] [--execute]
   degenprime aero-add-liquidity --pool virtual-weth-50-v3 --amount-token0 100 --amount-token1 0.05 [--slippage 1] [--execute]
-  degenprime aero-add-liquidity --pool weth-euroc-100-v3 --use-all-available [--width 2] [--slippage 1] [--execute]
+  degenprime aero-add-liquidity --pool weth-euroc-100-v3 --use-all-available [--width 2] [--slippage 1] [--reserve SYMBOL:FRACTION] [--execute]
   degenprime aero-increase-liquidity --pool weth-usdc-100 --token-id N --amount-token0 X --amount-token1 Y [--slippage 1] [--execute]
   degenprime aero-remove-liquidity --token-id N [--token-id M ...] [--execute]   (full close only)
   degenprime aero-collect-fees --token-id N [--execute]
@@ -4600,6 +4600,68 @@ def _swap_with_usdc_fallback(account, from_sym, to_sym, amount_human,
     return True
 
 
+def _aero_parse_reserve_specs(specs) -> dict:
+    """Parse repeated `--reserve SYMBOL:FRACTION` values into {SYMBOL_UPPER: fraction}.
+
+    FRACTION is the share of SYMBOL's inventoried loose balance to HOLD BACK from the
+    --use-all-available sweep (left loose + untouched, never swapped or minted). It must
+    be a real number in [0, 1]. Symbol is upper-cased (matching is case-insensitive, like
+    the rest of the account-symbol handling). Raises ValueError with a clear message on a
+    malformed spec, a non-numeric or NaN fraction, or a fraction outside [0, 1]."""
+    reserve = {}
+    for spec in specs or []:
+        s = str(spec).strip()
+        if ":" not in s:
+            raise ValueError(f"--reserve must be SYMBOL:FRACTION (got '{spec}')")
+        sym, _, frac_s = s.partition(":")
+        sym = sym.strip().upper()
+        if not sym:
+            raise ValueError(f"--reserve is missing SYMBOL (got '{spec}')")
+        try:
+            frac = float(frac_s.strip())
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"--reserve FRACTION must be a number in [0,1] (got '{frac_s}')")
+        if frac != frac or frac < 0.0 or frac > 1.0:  # NaN or out of range
+            raise ValueError(
+                f"--reserve FRACTION must be in [0,1] (got '{frac_s}')")
+        reserve[sym] = frac
+    return reserve
+
+
+def _aero_apply_reserve(valuable: dict, reserve) -> dict:
+    """Hold back a reserved FRACTION of specific assets from the sweep set.
+
+    `valuable` is {account_symbol: balance_wei} — the assets --use-all-available would
+    sweep + deploy. `reserve` is {SYMBOL_UPPER: fraction in [0,1]} (see
+    _aero_parse_reserve_specs). For each matching asset the reserved portion is removed
+    from the returned deploy set, so it is never swapped or minted — it simply stays
+    loose and untouched in the account; the remaining (1-fraction) still deploys.
+
+    Backward compatible: when `reserve` is empty/None this is a strict no-op — the SAME
+    dict object is returned, so the --use-all-available path is byte-identical to the
+    pre-reserve behaviour on every position that does not pass the flag. Matching is
+    case/alias-insensitive (via _account_asset_symbol) so a reserve of AERO is applied
+    however the account labels it. An asset reserved so heavily that <1 wei would remain
+    is dropped from the deploy set entirely (fully held). Pure — unit-tested."""
+    if not reserve:
+        return valuable
+    out = {}
+    for sym, bal_wei in valuable.items():
+        frac = reserve.get(_account_asset_symbol(sym).upper())
+        if frac is None:
+            frac = reserve.get(str(sym).upper())
+        if frac and frac > 0.0:
+            reserved_wei = int(Decimal(int(bal_wei)) * Decimal(str(frac)))
+            kept_wei = int(bal_wei) - reserved_wei
+            if kept_wei <= 0:
+                continue  # fully reserved -> left loose, nothing to deploy
+            out[sym] = kept_wei
+        else:
+            out[sym] = bal_wei
+    return out
+
+
 def _aero_separate_pool_and_sweeps(valuable: dict, sym0: str, sym1: str):
     """Split a {symbol: balance_wei} inventory into the two pool-token balances
     and the non-pool "sweep" assets, returning (pool0_bal_wei, pool1_bal_wei,
@@ -4670,7 +4732,7 @@ def _aero_inventory_available(w3, account, pool_cfg):
 
 def _aero_use_all_available(
     w3, acct, account, pa_cs, pool_cfg,
-    width_pct=2.0, slippage_pct=1.0, execute=False,
+    width_pct=2.0, slippage_pct=1.0, execute=False, reserve=None,
 ):
     """Use ALL available in-account funds (>$5 per asset) to open an Aerodrome CL position.
 
@@ -4741,6 +4803,29 @@ def _aero_use_all_available(
     if not valuable:
         print("  No available assets to deploy.")
         return False
+
+    # 4-bis. Reserve (AERO reward-hold + generic): hold back a fraction of specific
+    # assets from the sweep, leaving that portion loose + untouched (no swap, no mint).
+    # Strict no-op unless a `--reserve SYMBOL:FRACTION` was passed. Applied HERE — before
+    # the pool/sweep split below — so the reserved portion is excluded from BOTH the
+    # non-pool sweep-and-swap AND the pool-token balancing. See _aero_apply_reserve.
+    if reserve:
+        _before = dict(valuable)
+        valuable = _aero_apply_reserve(valuable, reserve)
+        for _rsym in sorted(_before):
+            _rf = reserve.get(_account_asset_symbol(_rsym).upper())
+            if _rf is None:
+                _rf = reserve.get(str(_rsym).upper())
+            if _rf and _rf > 0.0:
+                _rdec = inventory.get(_rsym, [0, 0, 0])[1] or 0
+                _held_wei = int(_before[_rsym]) - int(valuable.get(_rsym, 0))
+                _held = (_held_wei / (10 ** _rdec)) if _rdec else float(_held_wei)
+                print(f"  Reserve: holding {_rf * 100:.4f}% of {_rsym} "
+                      f"({_held:.6f}) loose — excluded from the sweep "
+                      f"(not swapped, not minted).")
+        if not valuable:
+            print("  No available assets to deploy after reserve.")
+            return False
 
     # 5. Identify non-pool assets (to sweep) and pool-token balances. Alias-aware
     # (EURC/EUROC) so the same underlying is never both a pool leg and a sweep
@@ -4884,7 +4969,7 @@ def _aero_use_all_available(
 def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
                            amount1: float = None, slippage_pct: float = 1.0,
                            execute: bool = False, width_pct: float = 2.0,
-                           use_all_available: bool = False):
+                           use_all_available: bool = False, reserve: dict = None):
     """Add concentrated liquidity to an Aerodrome Slipstream pool through the
     Degen Account's AerodromeFacet. Uses in-account token0/token1 balances.
 
@@ -4900,11 +4985,15 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
     assets with >$5 value from the Degen Account, swaps them into the pool
     tokens at the correct ratio, then mints. Dust (<$5) is left in account.
 
+    reserve (from `--reserve SYMBOL:FRACTION`, --use-all-available only) holds back
+    FRACTION of SYMBOL's loose balance from that sweep, leaving it loose + untouched
+    (no swap, no mint). None/{} = today's full sweep. See _aero_apply_reserve.
+
     The facet wraps the NPM mint(MintParams) call with remainsSolvent, so
     --execute appends a RedStone signed-price payload."""
     if use_all_available:
         return _cmd_aero_add_liquidity_all_available(
-            pool_key, slippage_pct, execute, width_pct
+            pool_key, slippage_pct, execute, width_pct, reserve=reserve
         )
     return _cmd_aero_add_liquidity_manual(
         pool_key, amount0, amount1, slippage_pct, execute, width_pct
@@ -5028,8 +5117,13 @@ def _cmd_aero_add_liquidity_manual(pool_key, amount0, amount1, slippage_pct, exe
         print("  ✓ Mint confirmed. (could not decode tokenId from receipt logs)")
 
 
-def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width_pct):
-    """Use ALL available funds path for aero-add-liquidity."""
+def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width_pct,
+                                          reserve=None):
+    """Use ALL available funds path for aero-add-liquidity.
+
+    `reserve` ({SYMBOL_UPPER: fraction}, or None) is threaded into both the preview
+    and execute passes of _aero_use_all_available so the reserved portion is held out
+    of the sweep identically in the dry-run plan and the live mint."""
     w3 = get_w3()
     acct = get_account()
     print(f"Wallet: {acct.address}")
@@ -5051,7 +5145,7 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
     # Preview plan first
     plan = _aero_use_all_available(
         w3, acct, account, pa_cs, pool_cfg,
-        width_pct, slippage_pct, execute=False
+        width_pct, slippage_pct, execute=False, reserve=reserve
     )
     if not plan:
         return
@@ -5080,7 +5174,7 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
     # Execute: run swaps then mint
     plan = _aero_use_all_available(
         w3, acct, account, pa_cs, pool_cfg,
-        width_pct, slippage_pct, execute=True
+        width_pct, slippage_pct, execute=True, reserve=reserve
     )
     if not plan:
         print("  Swap execution finished but post-swap plan is empty. Aborting mint.")
@@ -6639,6 +6733,7 @@ def _dispatch():
         amt0, amt1 = None, None
         slippage = 1.0
         width = 2.0
+        reserve_specs = []
         execute = "--execute" in args
         for i, a in enumerate(args):
             if a == "--pool" and i + 1 < len(args): pool_key = args[i + 1]
@@ -6650,6 +6745,7 @@ def _dispatch():
             if a == "--amount-cbbtc" and i + 1 < len(args): amt1 = float(args[i + 1])
             if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
             if a == "--width" and i + 1 < len(args): width = float(args[i + 1])
+            if a == "--reserve" and i + 1 < len(args): reserve_specs.append(args[i + 1])
         use_all = "--use-all-available" in args
         if not pool_key:
             print("Usage: degenprime aero-add-liquidity --pool <pool-key> --amount-token0 X --amount-token1 Y [--slippage 1] [--width 2] [--execute]")
@@ -6657,10 +6753,17 @@ def _dispatch():
             return
         if not use_all and (amt0 is None and amt1 is None):
             print("Specify --amount-token0 / --amount-token1 values or add --use-all-available to auto-detect.")
-            print("Usage: degenprime aero-add-liquidity --pool <pool-key> [--use-all-available] [--slippage 1] [--width 2] [--execute]")
+            print("Usage: degenprime aero-add-liquidity --pool <pool-key> [--use-all-available] [--slippage 1] [--width 2] [--execute] [--reserve SYMBOL:FRACTION]")
             return
+        try:
+            reserve = _aero_parse_reserve_specs(reserve_specs)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        if reserve and not use_all:
+            print("Note: --reserve only applies with --use-all-available; ignoring it for the manual --amount-* path.")
         if use_all:
-            cmd_aero_add_liquidity(pool_key, slippage_pct=slippage, execute=execute, width_pct=width, use_all_available=True)
+            cmd_aero_add_liquidity(pool_key, slippage_pct=slippage, execute=execute, width_pct=width, use_all_available=True, reserve=reserve or None)
         else:
             cmd_aero_add_liquidity(pool_key, amt0, amt1, slippage, execute, width)
     elif cmd == "aero-increase-liquidity":
