@@ -165,14 +165,14 @@ def test_aero_rebuild_sweep_applies_reserve_before_filtering(monkeypatch):
 
     pool_cfg = {"symbol0": "ETH", "symbol1": "EURC"}
     dp._aero_rebuild_sweep("w3", None, None, "0xacct", "pool-key",
-                           pool_cfg=pool_cfg, execute=True, reserve={"AERO": 0.5})
+                           pool_cfg=pool_cfg, execute=False, reserve={"AERO": 0.5})
     # Empty inventory short-circuits before valuable is built, so _aero_apply_reserve
     # is never reached on this path -- rerun with a non-empty inventory to confirm the
     # call actually happens and receives the right reserve dict.
     monkeypatch.setattr(dp, "_aero_inventory_available",
                         lambda w3, account, cfg: {"AERO": [100 * WEI, 18, 999.0]})
     dp._aero_rebuild_sweep("w3", None, None, "0xacct", "pool-key",
-                           pool_cfg=pool_cfg, execute=True, reserve={"AERO": 0.5})
+                           pool_cfg=pool_cfg, execute=False, reserve={"AERO": 0.5})
     assert calls == [{"AERO": 0.5}]
 
 
