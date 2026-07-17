@@ -16,7 +16,7 @@ Built for agent use:
 - RedStone-signed solvency math handled internally, with a regression test pinning the half-boundary `toFixed(8)` encoding.
 - ParaSwap calldata validated client-side against the on-chain executor allowlist before broadcast.
 
-**Current version:** 0.12.4 The 0.x line is pre-1.0, so breaking changes are possible. See [Releases](https://github.com/Mnemosyne-quest/primecli/releases).
+**Current version:** 0.12.5 The 0.x line is pre-1.0, so breaking changes are possible. See [Releases](https://github.com/Mnemosyne-quest/primecli/releases).
 
 > **Breaking change in 0.5.0:** there is no longer a default signing key. Earlier versions silently fell back to a baked-in agent when no key was configured; that fallback has been removed. With no key configured, every command now fails closed with `No signing key found...`. Set a key explicitly (see [Configuration](#configuration)).
 
