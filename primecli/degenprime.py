@@ -421,6 +421,41 @@ AERODROME_POOLS = {
                           "slipstreamVersion": 1,
                           "pool": "0xaa5fE7dCC07DCB8B7AFCd1B93874e7Cb1e0Ab50b",
                           "gauge": "0x9D025C59D53fA74a4eAcd62a709faC2dfffBC150"},
+    "weth-aero-200-v3": {"token0": "0x4200000000000000000000000000000000000006",  # WETH
+                         "token1": "0x940181a94A35A4569E4529A3CDfB74e38FD98631",  # AERO
+                         "tickSpacing": 200, "symbol0": "ETH", "symbol1": "AERO",
+                         "decimals0": 18, "decimals1": 18, "gauge_alive": True,
+                         "slipstreamVersion": 1,
+                         "pool": "0x4e506648d493C8870f55e870480f92f2F33ecE51",
+                         "gauge": "0x956495C06Ba757cdF85F73B5f6D5CcB505D288F1"},
+    "aero-cbbtc-200-v3": {"token0": "0x940181a94A35A4569E4529A3CDfB74e38FD98631",  # AERO
+                          "token1": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",  # cbBTC
+                          "tickSpacing": 200, "symbol0": "AERO", "symbol1": "cbBTC",
+                          "decimals0": 18, "decimals1": 8, "gauge_alive": True,
+                          "slipstreamVersion": 1,
+                          "pool": "0xCDBe19a6EF1B633BE744920C93eE40521d5cf2A6",
+                          "gauge": "0x7487eeD4266C774B84Db9f61b5f0222076Db9676"},
+    "euroc-usdc-1-v3": {"token0": "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42",  # EURC
+                        "token1": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",  # USDC
+                        "tickSpacing": 1, "symbol0": "EURC", "symbol1": "USDC",
+                        "decimals0": 6, "decimals1": 6, "gauge_alive": True,
+                        "slipstreamVersion": 1,
+                        "pool": "0xf39B7c34BE147F5DC1bC374f27AF2E9f03AD3113",
+                        "gauge": "0x3b798f9C872586CF0ba103400650Cf9E1acAF27F"},
+    "cbxrp-cbbtc-100-v3": {"token0": "0xcb585250f852C6c6bf90434AB21A00f02833a4af",  # cbXRP
+                           "token1": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",  # cbBTC
+                           "tickSpacing": 100, "symbol0": "cbXRP", "symbol1": "cbBTC",
+                           "decimals0": 6, "decimals1": 8, "gauge_alive": True,
+                           "slipstreamVersion": 1,
+                           "pool": "0x62916B911F2B64d0e3A3b72472D6f8C08c75DcAA",
+                           "gauge": "0xf018eBe4e6b3ff169be0a25218ec14F417fCad1a"},
+    "weth-vvv-100-v3": {"token0": "0x4200000000000000000000000000000000000006",  # WETH
+                        "token1": "0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf",  # VVV
+                        "tickSpacing": 100, "symbol0": "ETH", "symbol1": "VVV",
+                        "decimals0": 18, "decimals1": 18, "gauge_alive": True,
+                        "slipstreamVersion": 1,
+                        "pool": "0xA135B59Fe221C0c8D441294f97f96Fbc37Bc9fbE",
+                        "gauge": "0xCa9740aFFeDF731f95B3FBAb8d40835781c7aE4D"},
 }
 
 # ParaSwap v6 / Velora aggregator on Base. The Degen Account's ParaSwapFacet.paraSwapV6

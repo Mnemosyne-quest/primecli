@@ -324,3 +324,56 @@ def test_separate_pool_and_sweeps_no_alias_normal_split():
     assert pool0 == 10**18
     assert pool1 == 2_000_000
     assert sweeps == {"AERO": 999, "cbBTC": 7}
+
+
+# ─────────────── V3 batch 2: 4 more gauged pairs + 1 brand-new pair ──────────
+# Found via an exhaustive on-chain scan of the whole V2 registry against the
+# Gauges-V3 CLFactory (0xf8f2…61Ef): these 4 pairs already in the V2 registry now
+# also have live V3 pools with active gauges, plus WETH/VVV (Venice AI), a new pair
+# with no V2 counterpart. Same baked-pool + slipstreamVersion=1 shape as the two
+# original V3 entries. The baked `pool` short-circuits _aero_pool_address (no
+# factory call), so these stay pure/offline.
+
+_V3_BATCH2 = [
+    "weth-aero-200-v3",
+    "aero-cbbtc-200-v3",
+    "euroc-usdc-1-v3",
+    "cbxrp-cbbtc-100-v3",
+    "weth-vvv-100-v3",
+]
+
+
+@pytest.mark.parametrize("key", _V3_BATCH2)
+def test_v3_batch2_resolves_own_baked_pool(key):
+    cfg = dp.AERODROME_POOLS[key]
+    assert cfg.get("slipstreamVersion") == 1
+    # baked pool short-circuits _aero_pool_address (no factory call -> offline)
+    assert dp._aero_pool_address(cfg) == Web3.to_checksum_address(cfg["pool"])
+    # pair + tickSpacing + version resolves to this exact V3 entry
+    matched = dp._aero_match_pool_cfg(cfg["token0"], cfg["token1"],
+                                      cfg["tickSpacing"], "v3")
+    assert matched is cfg
+
+
+@pytest.mark.parametrize("key", _V3_BATCH2)
+def test_v3_batch2_slipstream_version_flows_into_mint_params(key):
+    cfg = dp.AERODROME_POOLS[key]
+    # word11 (struct field 12) of the mint arg tuple is uint8 slipstreamVersion.
+    params = dp._aero_mint_params(cfg, 10**18, 10**6, -100, 100, 0, 1.0)
+    assert params[11] == 1
+
+
+# The 4 batch-2 pairs that also exist as V2 entries at the SAME tickSpacing: the V2
+# sibling must still resolve under version "v2" — the new -v3 key must not shadow it.
+@pytest.mark.parametrize("v3_key,v2_key", [
+    ("weth-aero-200-v3", "weth-aero-200"),
+    ("aero-cbbtc-200-v3", "aero-cbbtc-200"),
+    ("euroc-usdc-1-v3", "euroc-usdc-1"),
+    ("cbxrp-cbbtc-100-v3", "cbxrp-cbbtc-100"),
+])
+def test_v3_batch2_v2_sibling_still_resolves(v3_key, v2_key):
+    v2 = dp.AERODROME_POOLS[v2_key]
+    matched = dp._aero_match_pool_cfg(v2["token0"], v2["token1"],
+                                      v2["tickSpacing"], "v2")
+    assert matched is v2
+    assert matched.get("slipstreamVersion", 0) == 0

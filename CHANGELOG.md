@@ -6,6 +6,25 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.5] - 2026-07-17
+
+### Added
+- **Five more Aerodrome Slipstream "Gauges-V3" pools in the DegenPrime registry**
+  (`AERODROME_POOLS`): `weth-aero-200-v3` (ETH/AERO), `aero-cbbtc-200-v3`
+  (AERO/cbBTC), `euroc-usdc-1-v3` (EURC/USDC), `cbxrp-cbbtc-100-v3` (cbXRP/cbBTC),
+  and `weth-vvv-100-v3` (ETH/VVV, Venice AI). Found via an exhaustive on-chain scan
+  of the whole V2 registry against the Gauges-V3 CLFactory
+  (`0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef` `getPool`) plus the Voter
+  (`gauges`/`isAlive`): the first four pairs already existed as V2 entries and now
+  also have live V3 pools with active gauges; ETH/VVV is a brand-new pair with no
+  V2 counterpart. Each entry bakes its on-chain-verified `pool` and `gauge` address
+  and `slipstreamVersion: 1`, following the exact pattern of the two original V3
+  entries (`virtual-weth-50-v3`, `weth-euroc-100-v3`). Registry-only addition: the
+  V2/V3 read+write infrastructure (`_aero_npm_for_token`, `_aero_pool_address`,
+  `_aero_mint_params`, `_aero_match_pool_cfg`) is already version-aware, so no other
+  code changed. The `-v3` key suffix keeps them from colliding with the untouched V2
+  entries, and version-aware matching keeps each V2 sibling resolving to its own pool.
+
 ## [0.12.4] - 2026-07-17
 
 ### Added
