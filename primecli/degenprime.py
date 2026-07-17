@@ -5444,15 +5444,18 @@ def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float 
         print(f"Could not read position #{token_id}.")
         sys.exit(2)
     pos_t0, pos_t1, _, _, _ = pos
-    pool_key = next(
-        (pk for pk, pc in AERODROME_POOLS.items()
-         if pc["token0"].lower() == pos_t0.lower() and pc["token1"].lower() == pos_t1.lower()),
-        None
-    )
+    # Version-aware match (_aero_match_pool_cfg), not a bare pair lookup: with both a
+    # V2 and V3 entry now sharing the same token0/token1 for several pairs (aero-cbbtc,
+    # weth-aero, euroc-usdc, cbxrp-cbbtc, virtual-weth, weth-euroc), a bare pair match
+    # always wins on the V2 entry (first in dict order) even when the real position is
+    # V3 — silently rebuilding a V3 position back into the dead V2 pool.
+    _npm, _ver, _raw_pos = _aero_npm_for_token(w3, token_id, pa)
+    _tick_spacing = _raw_pos[4] if _raw_pos else None
+    pool_cfg = _aero_match_pool_cfg(pos_t0, pos_t1, _tick_spacing, _ver)
+    pool_key = next((pk for pk, pc in AERODROME_POOLS.items() if pc is pool_cfg), None)
     if not pool_key:
         print(f"Cannot match position #{token_id} to a known pool.")
         sys.exit(2)
-    pool_cfg = AERODROME_POOLS[pool_key]
 
     # Warn if this position has an active on-chain rebalance order — removing the
     # position clears/orphans that order (confirmed live 2026-07-04: a core1 rebuild
@@ -6474,12 +6477,15 @@ def cmd_aero_rebalance_create(token_id: int, width_pct: float, mode: str = "outs
         pos = _aero_read_position(w3, token_id, pa)
         if pos:
             pos_t0, pos_t1, _, _, _ = pos
-            pos_t0, pos_t1 = pos_t0.lower(), pos_t1.lower()
-            pool_key = next(
-                (pk for pk, pc in AERODROME_POOLS.items()
-                 if pc["token0"].lower() == pos_t0 and pc["token1"].lower() == pos_t1),
-                None
-            )
+            # Version-aware match, not a bare pair lookup — see the identical fix +
+            # rationale in cmd_aero_rebuild. A bare pair match here would sweep against
+            # the wrong deployment's pool tick whenever the position's pair collides
+            # with an earlier V2 entry (harmless for the swap-only sweep itself, but the
+            # printed pool_key would mislead an operator into thinking a V2 sweep target).
+            _npm, _ver, _raw_pos = _aero_npm_for_token(w3, token_id, pa)
+            _tick_spacing = _raw_pos[4] if _raw_pos else None
+            _pool_cfg = _aero_match_pool_cfg(pos_t0, pos_t1, _tick_spacing, _ver)
+            pool_key = next((pk for pk, pc in AERODROME_POOLS.items() if pc is _pool_cfg), None)
             if pool_key:
                 print(f"  Auto-sweeping idle assets to pool: {pool_key}...")
                 _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, execute=execute)

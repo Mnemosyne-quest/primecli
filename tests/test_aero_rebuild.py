@@ -45,6 +45,17 @@ def _rig(monkeypatch, order_created_on: int = 0):
         calls.append("read_position")
         return (token0, token1, None, None, None)
 
+    # cmd_aero_rebuild resolves pool_key via _aero_match_pool_cfg(token0, token1,
+    # tickSpacing, version) now (version-aware, since V2/V3 entries can share a pair)
+    # -- stub the version/tickSpacing lookup this pulls from, same as fake_read_position
+    # stubs the token0/token1 lookup. Raw tuple mirrors NPM.positions(): tickSpacing is
+    # field index 4.
+    raw_pos = (0, "0x" + "0" * 40, token0, token1, pool_cfg["tickSpacing"], 0, 0, 0)
+
+    def fake_npm_for_token(w3, token_id, pa=None):
+        calls.append("npm_for_token")
+        return (MagicMock(), "v2", raw_pos)
+
     def fake_remove_liquidity(token_ids, percentage, execute=False):
         calls.append("remove_liquidity")
 
@@ -55,6 +66,7 @@ def _rig(monkeypatch, order_created_on: int = 0):
         calls.append("add_liquidity")
 
     monkeypatch.setattr(d, "_aero_read_position", fake_read_position)
+    monkeypatch.setattr(d, "_aero_npm_for_token", fake_npm_for_token)
     monkeypatch.setattr(d, "cmd_aero_remove_liquidity", fake_remove_liquidity)
     monkeypatch.setattr(d, "_aero_rebuild_sweep", fake_sweep)
     monkeypatch.setattr(d, "_cmd_aero_add_liquidity_all_available", fake_add_liquidity_all)
@@ -67,7 +79,7 @@ def test_rebuild_resolves_pool_before_removing_position(monkeypatch):
 
     d.cmd_aero_rebuild(token_id=123, width_pct=12.58, slippage_pct=1.0, execute=True)
 
-    assert calls == ["read_position", "remove_liquidity", "sweep", "add_liquidity"], (
+    assert calls == ["read_position", "npm_for_token", "remove_liquidity", "sweep", "add_liquidity"], (
         f"pool must be resolved BEFORE removal (removal burns the NFT, making a "
         f"post-removal read return None) -- got order {calls}"
     )

@@ -6,6 +6,23 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.6] - 2026-07-17
+
+### Fixed
+- **`aero-rebuild` and `aero-rebalance create` pool-key collision** introduced by
+  0.12.5's five new V3 registry entries: both resolved a position's pool by a bare
+  token0/token1 pair match, which always wins on the V2 entry (first in dict-insertion
+  order) for any pair that now has both a V2 and V3 entry — silently rebuilding a real
+  V3 position back into the dead V2 pool on the next automated rebuild. `aero-rebalance
+  create`'s idle-asset sweep had the same bug (cosmetically mislabeled sweep target,
+  no fund-misdirection since the sweep only swaps, never mints). Found live migrating
+  core1's AERO/cbBTC position off v2: recreating its rebalance order printed
+  "Auto-sweeping idle assets to pool: aero-cbbtc-200" for a tokenId that IS the v3
+  position. Fixed by routing both through the existing version-aware
+  `_aero_match_pool_cfg(token0, token1, tickSpacing, version)` helper (already used
+  correctly elsewhere, e.g. `_aero_position_legs`) instead of the naive inline lookup —
+  `_aero_match_pool_cfg`'s own docstring already documented this exact collision class.
+
 ## [0.12.5] - 2026-07-17
 
 ### Added
