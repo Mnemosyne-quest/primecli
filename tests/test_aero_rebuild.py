@@ -59,10 +59,10 @@ def _rig(monkeypatch, order_created_on: int = 0):
     def fake_remove_liquidity(token_ids, percentage, execute=False):
         calls.append("remove_liquidity")
 
-    def fake_sweep(w3, acct, account, pa_cs, pk, pc, execute=False):
+    def fake_sweep(w3, acct, account, pa_cs, pk, pc, execute=False, reserve=None):
         calls.append("sweep")
 
-    def fake_add_liquidity_all(pk, slippage_pct, execute, width_pct):
+    def fake_add_liquidity_all(pk, slippage_pct, execute, width_pct, reserve=None):
         calls.append("add_liquidity")
 
     monkeypatch.setattr(d, "_aero_read_position", fake_read_position)

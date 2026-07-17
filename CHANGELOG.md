@@ -6,6 +6,21 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.7] - 2026-07-18
+
+### Fixed
+- **`aero-rebalance create`/`update`, `aero-rebuild`, and `aero-increase-liquidity` now
+  accept `--reserve SYMBOL:FRACTION`**, threaded through to `_aero_rebuild_sweep` (reusing
+  the same `_aero_apply_reserve` helper `aero-add-liquidity --use-all-available` already
+  uses). Found live 2026-07-17 rebuilding parakletos-4's ETH/EURC position: a preceding
+  `aero-add-liquidity --reserve AERO:0.5` correctly held back half of the position's
+  accumulated AERO rewards, but recreating the on-chain rebalancer order right after ran
+  its own unconditional "sweep idle assets" pass and swept the held AERO into EURC anyway
+  — no value lost (still the same USD amount, just re-denominated), but the reward-hold
+  protection was silently undone by a code path that had no way to know about it. Any
+  caller with a reward-hold policy (or any other reservation) must now pass the same
+  `--reserve` flag to every one of these commands, not just the mint.
+
 ## [0.12.6] - 2026-07-17
 
 ### Fixed

@@ -135,3 +135,62 @@ def test_cmd_aero_add_liquidity_exposes_reserve_param():
     silently disabling the reward-hold enforcement in the live automation."""
     params = inspect.signature(dp.cmd_aero_add_liquidity).parameters
     assert "reserve" in params
+
+
+@pytest.mark.parametrize("fn_name", [
+    "cmd_aero_rebuild", "cmd_aero_increase_liquidity", "cmd_aero_rebalance_create",
+])
+def test_rebalance_and_rebuild_paths_expose_reserve_param(fn_name):
+    """Regression guard (found live 2026-07-17, parakletos-4): aero-rebalance create's
+    auto-sweep step had no way to know about a reservation a preceding
+    aero-add-liquidity --reserve had just made, so it swept the held-back asset anyway.
+    Fixed by threading reserve through _aero_rebuild_sweep and every caller that invokes
+    it (aero-rebuild, aero-increase-liquidity, aero-rebalance create/update all share
+    it). Lock the param on every caller, same pattern as the add-liquidity probe above."""
+    params = inspect.signature(getattr(dp, fn_name)).parameters
+    assert "reserve" in params
+
+
+def test_aero_rebuild_sweep_applies_reserve_before_filtering(monkeypatch):
+    """_aero_rebuild_sweep must run inventory through _aero_apply_reserve (the same,
+    already-tested subtraction helper aero-add-liquidity uses) before deciding what's
+    sweepable — the exact step that was missing when this bug shipped live (found
+    2026-07-17: recreating a rebalancer order swept an asset a preceding --reserve'd
+    mint had just excluded, since this function had no way to know about it). Verifies
+    the wiring, not the subtraction math itself (already covered above)."""
+    calls = []
+    monkeypatch.setattr(dp, "_aero_apply_reserve",
+                        lambda valuable, reserve: calls.append(reserve) or valuable)
+    monkeypatch.setattr(dp, "_aero_inventory_available", lambda w3, account, cfg: {})
+
+    pool_cfg = {"symbol0": "ETH", "symbol1": "EURC"}
+    dp._aero_rebuild_sweep("w3", None, None, "0xacct", "pool-key",
+                           pool_cfg=pool_cfg, execute=True, reserve={"AERO": 0.5})
+    # Empty inventory short-circuits before valuable is built, so _aero_apply_reserve
+    # is never reached on this path -- rerun with a non-empty inventory to confirm the
+    # call actually happens and receives the right reserve dict.
+    monkeypatch.setattr(dp, "_aero_inventory_available",
+                        lambda w3, account, cfg: {"AERO": [100 * WEI, 18, 999.0]})
+    dp._aero_rebuild_sweep("w3", None, None, "0xacct", "pool-key",
+                           pool_cfg=pool_cfg, execute=True, reserve={"AERO": 0.5})
+    assert calls == [{"AERO": 0.5}]
+
+
+def test_aero_rebuild_sweep_reserve_none_never_calls_apply_reserve(monkeypatch):
+    """Backward compatibility: no reserve passed -> _aero_apply_reserve is never
+    invoked at all (strict no-op path), matching every existing caller unchanged."""
+    called = []
+    monkeypatch.setattr(dp, "_aero_apply_reserve", lambda *a, **k: called.append(1))
+    monkeypatch.setattr(dp, "_aero_inventory_available",
+                        lambda w3, account, cfg: {"AERO": [100 * WEI, 18, 999.0]})
+    monkeypatch.setattr(dp, "build_redstone_payload", lambda feeds: b"")
+    monkeypatch.setattr(dp, "_read_prices_usd",
+                        lambda w3, account, syms, payload: [Decimal("1") for _ in syms])
+
+    pool_cfg = {"symbol0": "ETH", "symbol1": "EURC"}
+    try:
+        dp._aero_rebuild_sweep("w3", None, None, "0xacct", "pool-key",
+                               pool_cfg=pool_cfg, execute=False, reserve=None)
+    except Exception:
+        pass  # only the reserve-call-count matters here, not a full clean run
+    assert called == []

@@ -5417,7 +5417,7 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
 
 
 def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float = 1.0,
-                     execute: bool = False):
+                     execute: bool = False, reserve: dict = None):
     """Remove an existing Aerodrome position, sweep all idle assets >$5 into the
     correct pool-token ratio, and mint a brand-new position at ±width_pct around
     the current tick. One-shot full rebuild that ensures no funds hang unused."""
@@ -5493,20 +5493,20 @@ def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float 
         time.sleep(14)
 
     print(f"\nStep 2: Sweeping idle assets >$5 to pool {pool_key}...")
-    _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg, execute=execute)
+    _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg, execute=execute, reserve=reserve)
 
     print(f"\nStep 3: Opening fresh {pool_key} position...")
     if execute:
-        _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute=True, width_pct=width_pct)
+        _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute=True, width_pct=width_pct, reserve=reserve)
     else:
         print(f"  Preview: degenprime aero-add-liquidity --pool {pool_key} --use-all-available --width {width_pct}")
         # Run preview
-        _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute=False, width_pct=width_pct)
+        _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute=False, width_pct=width_pct, reserve=reserve)
 
 def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
                                 amount0: float = None, amount1: float = None,
                                 slippage_pct: float = 1.0,
-                                execute: bool = False):
+                                execute: bool = False, reserve: dict = None):
     """Increase liquidity on an existing staked Aerodrome Slipstream NFT.
 
     Selector 0x747f6827 = increaseStakedLiquidityAerodrome (uint256×6 tuple).
@@ -5550,7 +5550,7 @@ def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
     # Sweep idle assets >$5 into the bottleneck pool token
     pa_cs = Web3.to_checksum_address(pa)
     print("  Checking for idle assets to sweep...")
-    _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg, execute=execute)
+    _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg, execute=execute, reserve=reserve)
 
     # Re-read updated balances after sweeps
     avail0 = _aero_in_account_balance(account, pool_cfg["symbol0"])
@@ -6357,9 +6357,18 @@ def _aero_rebalance_write(fn_name: str, params: tuple, preview: dict, label: str
 
 
 
-def _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg=None, execute=False):
+def _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg=None, execute=False, reserve=None):
     """Sweep idle assets >$5 into the pool's bottleneck token. Called by rebalance
-    and rebuild paths so idle funds get deployed alongside the position."""
+    and rebuild paths so idle funds get deployed alongside the position.
+
+    `reserve` ({SYMBOL_UPPER: fraction}, or None) excludes a held-back fraction of an
+    asset from this sweep, same semantics as aero-add-liquidity's --reserve (see
+    _aero_apply_reserve). Without it this sweep will happily sweep an asset a CALLER
+    deliberately held back moments earlier via a separate --reserve'd mint (confirmed
+    live 2026-07-17: aero-rebalance create's auto-sweep swept the AERO a preceding
+    aero-add-liquidity --reserve AERO:0.5 had just excluded, since this function had
+    no way to know about that reservation). Backward compatible: None/empty is a
+    strict no-op, identical to the old unconditional-sweep behaviour."""
     if pool_cfg is None:
         if pool_key not in AERODROME_POOLS:
             print(f"  Unknown pool '{pool_key}'. Skipping asset sweep.")
@@ -6394,6 +6403,13 @@ def _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg=None, execu
                 if usd >= MIN_USD_VALUE}
     if not valuable:
         return
+
+    # Strict no-op unless a reserve was passed — excludes the held-back fraction
+    # from this sweep, same as _aero_use_all_available's identical guard.
+    if reserve:
+        valuable = _aero_apply_reserve(valuable, reserve)
+        if not valuable:
+            return
 
     # Determine which non-pool assets to sweep
     # Normalize via _account_asset_symbol so symbol aliases (EURC/EUROC) don't
@@ -6460,13 +6476,20 @@ def _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg=None, execu
 def cmd_aero_rebalance_create(token_id: int, width_pct: float, mode: str = "outside",
                               trigger_bps: int = 100, max_fee_weth: float = 0.001,
                               mint_slip_bps: int = 100, swap_slip_bps: int = 100,
-                              execute: bool = False):
+                              execute: bool = False, reserve: dict = None):
     """Turn on the auto-rebalancer for an existing Aerodrome position. Builds
     CreateRebalanceOrderParams from a symmetric ±width_pct band + a trigger mode, then
     creates the order via createRebalanceOrder.
 
     Before creating the order, sweeps idle in-account assets >$5 into the pool's
-    bottleneck token so they get deployed when the rebalancer reopens the position."""
+    bottleneck token so they get deployed when the rebalancer reopens the position.
+    `reserve` ({SYMBOL_UPPER: fraction}, or None) excludes a held-back fraction from
+    that sweep — pass it whenever a caller has its own reward-hold policy (e.g. AERO)
+    that a preceding aero-add-liquidity --reserve already protected; otherwise this
+    auto-sweep will happily sweep the exact asset that reservation just excluded
+    (confirmed live 2026-07-17 on parakletos-4: recreating the rebalancer after a
+    --reserve AERO:0.5 mint swept the held AERO anyway, since this sweep had no way
+    to know about that reservation)."""
     # Sweep idle assets to the pool's bottleneck token
     w3 = get_w3()
     acct = get_account()
@@ -6488,7 +6511,7 @@ def cmd_aero_rebalance_create(token_id: int, width_pct: float, mode: str = "outs
             pool_key = next((pk for pk, pc in AERODROME_POOLS.items() if pc is _pool_cfg), None)
             if pool_key:
                 print(f"  Auto-sweeping idle assets to pool: {pool_key}...")
-                _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, execute=execute)
+                _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, execute=execute, reserve=reserve)
                 if pool_key.endswith("-v3"):
                     print(f"  (Note: {pool_key} is a Gauges-V3 pool with a 10-second")
                     print(f"  anti-sniping cooldown. The protocol's executor should handle")
@@ -6507,9 +6530,10 @@ def cmd_aero_rebalance_create(token_id: int, width_pct: float, mode: str = "outs
 def cmd_aero_rebalance_update(token_id: int, width_pct: float, mode: str = "outside",
                               trigger_bps: int = 100, max_fee_weth: float = 0.001,
                               mint_slip_bps: int = 100, swap_slip_bps: int = 100,
-                              execute: bool = False):
+                              execute: bool = False, reserve: dict = None):
     """Re-tune an existing rebalance order's bands/trigger/fee via updateRebalanceOrder.
-    Same args/struct as create."""
+    Same args/struct as create. `reserve` is accepted only for CLI signature symmetry
+    with create (they share one dispatch call) — update never sweeps, so it's unused."""
     try:
         params, preview = _build_rebalance_order_params(
             token_id, width_pct, mode, trigger_bps, max_fee_weth, mint_slip_bps, swap_slip_bps)
@@ -6812,6 +6836,7 @@ def _dispatch():
         token_id = None
         amt0, amt1 = None, None
         slippage = 1.0
+        reserve_specs = []
         execute = "--execute" in args
         for i, a in enumerate(args):
             if a == "--pool" and i + 1 < len(args): pool_key = args[i + 1]
@@ -6823,10 +6848,16 @@ def _dispatch():
             if a == "--amount-cbbtc" and i + 1 < len(args): amt1 = float(args[i + 1])
             if a == "--amount-usdc" and i + 1 < len(args): amt1 = float(args[i + 1])
             if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
+            if a == "--reserve" and i + 1 < len(args): reserve_specs.append(args[i + 1])
         if not pool_key or token_id is None or (amt0 is None and amt1 is None):
-            print("Usage: degenprime aero-increase-liquidity --pool weth-usdc-100 --token-id N --amount-token0 X --amount-token1 Y [--slippage 1] [--execute]")
+            print("Usage: degenprime aero-increase-liquidity --pool weth-usdc-100 --token-id N --amount-token0 X --amount-token1 Y [--slippage 1] [--execute] [--reserve SYMBOL:FRACTION]")
             return
-        cmd_aero_increase_liquidity(pool_key, token_id, amt0, amt1, slippage, execute)
+        try:
+            reserve = _aero_parse_reserve_specs(reserve_specs)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        cmd_aero_increase_liquidity(pool_key, token_id, amt0, amt1, slippage, execute, reserve)
     elif cmd == "aero-remove-liquidity":
         token_ids = []
         percentage = 100.0
@@ -6852,15 +6883,22 @@ def _dispatch():
         token_id = None
         width_pct = 2.0
         slippage = 1.0
+        reserve_specs = []
         execute = "--execute" in args
         for i, a in enumerate(args):
             if a == "--token-id" and i + 1 < len(args): token_id = int(args[i + 1])
             if a == "--width-pct" and i + 1 < len(args): width_pct = float(args[i + 1])
             if a == "--slippage" and i + 1 < len(args): slippage = float(args[i + 1])
+            if a == "--reserve" and i + 1 < len(args): reserve_specs.append(args[i + 1])
         if token_id is None:
-            print("Usage: degenprime aero-rebuild --token-id N [--width-pct 2.0] [--slippage 1] [--execute]")
+            print("Usage: degenprime aero-rebuild --token-id N [--width-pct 2.0] [--slippage 1] [--execute] [--reserve SYMBOL:FRACTION]")
             return
-        cmd_aero_rebuild(token_id, width_pct, slippage, execute)
+        try:
+            reserve = _aero_parse_reserve_specs(reserve_specs)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        cmd_aero_rebuild(token_id, width_pct, slippage, execute, reserve)
 
     elif cmd == "aero-claim-rewards":
         execute = "--execute" in args
@@ -6878,6 +6916,7 @@ def _dispatch():
         as_json = "--json" in args
         check = "--check" in args
         history = "--history" in args
+        reserve_specs = []
         for i, a in enumerate(args):
             if a == "--token-id" and i + 1 < len(args): token_id = int(args[i + 1])
             if a == "--width-pct" and i + 1 < len(args): width_pct = float(args[i + 1])
@@ -6886,6 +6925,7 @@ def _dispatch():
             if a == "--max-fee-weth" and i + 1 < len(args): max_fee_weth = float(args[i + 1])
             if a == "--mint-slip-bps" and i + 1 < len(args): mint_slip_bps = int(args[i + 1])
             if a == "--swap-slip-bps" and i + 1 < len(args): swap_slip_bps = int(args[i + 1])
+            if a == "--reserve" and i + 1 < len(args): reserve_specs.append(args[i + 1])
         if mode not in ("outside", "inside"):
             print("--mode must be 'outside' or 'inside'.")
             return
@@ -6895,11 +6935,17 @@ def _dispatch():
             if token_id is None or width_pct is None:
                 print(f"Usage: degenprime aero-rebalance {sub} --token-id N --width-pct W "
                       f"[--mode outside|inside] [--trigger-bps T] [--max-fee-weth F] "
-                      f"[--mint-slip-bps 100] [--swap-slip-bps 100] [--execute]")
+                      f"[--mint-slip-bps 100] [--swap-slip-bps 100] [--execute] "
+                      f"[--reserve SYMBOL:FRACTION]")
+                return
+            try:
+                reserve = _aero_parse_reserve_specs(reserve_specs)
+            except ValueError as e:
+                print(f"Error: {e}")
                 return
             fn = cmd_aero_rebalance_create if sub == "create" else cmd_aero_rebalance_update
             fn(token_id, width_pct, mode, trigger_bps, max_fee_weth,
-               mint_slip_bps, swap_slip_bps, execute)
+               mint_slip_bps, swap_slip_bps, execute, reserve)
         elif sub == "cancel":
             if token_id is None:
                 print("Usage: degenprime aero-rebalance cancel --token-id N [--execute]")
