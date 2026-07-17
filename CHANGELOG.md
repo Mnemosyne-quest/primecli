@@ -6,6 +6,16 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.8] - 2026-07-18
+
+### Fixed
+- Test hygiene only: `test_aero_reserve.py`'s new sweep-wiring test hit a real signing
+  key attempt in CI (no credentials there) because it wasn't actually offline despite
+  the file's own docstring promising it was — masked locally by a real key being
+  configured in this dev environment. v0.12.7's own CI run correctly caught this before
+  publishing, so that tag exists but was never released to PyPI; this is the real
+  v0.12.7 content, renumbered. See v0.12.7 below for the actual feature/fix.
+
 ## [0.12.7] - 2026-07-18
 
 ### Fixed
