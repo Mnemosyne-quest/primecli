@@ -6,6 +6,31 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **`get_max_pool_utilisation_for_borrowing(proxy, w3=None)`** in all three protocol tools
+  (degenprime / deltaprime / arbprime) — reads a pool's on-chain hard borrow ceiling
+  `Pool.getMaxPoolUtilisationForBorrowing()` (0.925 = 92.5% on every DegenPrime/DeltaPrime/
+  ArbPrime pool today, verified live 2026-07-18), the utilisation above which a borrow
+  reverts with `MaxPoolUtilisationBreached()` (selector `0xe5739c7e`). Never raises: returns
+  the documented `MAX_POOL_UTIL_FALLBACK` (0.925) when the call reverts or a pool predates the
+  getter, so a borrow-sizing caller always has a safe cap to stay below. Also surfaced as a
+  `maxPoolUtilisation` field (a FRACTION, not percent) in `pool-info --json` — read in the
+  same Multicall3 (no extra round-trip; `allowFailure` means it's simply omitted when the leg
+  reverts). This fixes the class of `MaxPoolUtilisationBreached()` reverts where the
+  capacity/borrow-sizing layer assumed a hardcoded 0.88/0.90/0.95 cap instead of the real
+  on-chain 0.925 (hit live on core1's AERO/cbBTC lever-up, 2026-07-18).
+
+### Fixed
+- **`aero-add-liquidity --use-all-available` no longer silently mints a DUPLICATE position.**
+  The flag always mints a fresh NFT; when the Degen Account already held an OPEN position on
+  the same pool this created a second, duplicate LP (only one of which the auto-rebalancer was
+  armed on) — hit live on core1's AERO/cbBTC. The user-facing command now detects an existing
+  open position (matching token pair + tickSpacing, liquidity > 0) and refuses, pointing at
+  `aero-increase-liquidity --token-id N`; a new `--allow-duplicate` flag overrides for the
+  rare intentional second position. The internal rebuild path (which mints only after burning
+  the old NFT, so no open position exists at that point) is unaffected — the guard lives only
+  in the user-facing entry.
+
 ## [0.12.9] - 2026-07-18
 
 ### Fixed

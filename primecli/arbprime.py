@@ -1352,11 +1352,44 @@ def redstone_view_call(w3, account, fn_name: str, payload: bytes, args: list = N
 
 # ─── Commands ──────────────────────────────────────────────────────────────
 
+# ── On-chain hard borrow-utilisation cap ─────────────────────────────────────
+# Every ArbPrime (DeltaPrime-on-Arbitrum) lending Pool enforces an absolute borrow ceiling
+# via the public view getMaxPoolUtilisationForBorrowing() (1e18-scaled fraction). A borrow
+# that would push the pool's utilisation past it reverts on-chain with
+# MaxPoolUtilisationBreached() (selector 0xe5739c7e). Verified 0.925 (92.5%) on every
+# Arbitrum pool 2026-07-18 — but READ IT LIVE, never assume: this constant is only the
+# fallback for when the call reverts or a pool predates the getter, so a borrow-sizing
+# caller can always stay below a real cap.
+MAX_POOL_UTIL_FALLBACK = 0.925
+_MAX_POOL_UTIL_SIG = "getMaxPoolUtilisationForBorrowing()"
+
+
+def get_max_pool_utilisation_for_borrowing(proxy, w3=None):
+    """Pool.getMaxPoolUtilisationForBorrowing() as a fraction (0.925 == 92.5%).
+
+    `proxy` is the lending Pool proxy address; `w3` is injectable (tests / call reuse)
+    and defaults to get_w3(). NEVER raises — returns MAX_POOL_UTIL_FALLBACK (0.925) when
+    the call reverts, the pool doesn't expose the getter, or the value is implausible — so
+    a borrow-sizing caller always has a safe cap to stay below. The selector is computed
+    statically (no connection needed to encode); only the eth_call touches the network."""
+    try:
+        if w3 is None:
+            w3 = get_w3()
+        raw = w3.eth.call({"to": Web3.to_checksum_address(proxy),
+                           "data": Web3.keccak(text=_MAX_POOL_UTIL_SIG)[:4]})
+        val = int.from_bytes(raw, "big") / 1e18
+        # A real utilisation ceiling is a fraction in (0, 1]; anything else is a bad read.
+        return val if 0.0 < val <= 1.0 else MAX_POOL_UTIL_FALLBACK
+    except Exception:
+        return MAX_POOL_UTIL_FALLBACK
+
+
 def _pool_info_data(pool_name: str) -> dict:
     """Read every pool-info field for one pool in a SINGLE Multicall3 eth_call:
-    totalSupply, totalBorrowed, getDepositRate, getBorrowingRate, and (when a signer is
-    configured) the EOA's pool balance. Returns the raw + decoded values plus the off-chain
-    KuCoin USD price. Shared by the human-facing print path and the --json path.
+    totalSupply, totalBorrowed, getDepositRate, getBorrowingRate, getMaxPoolUtilisationFor-
+    Borrowing, and (when a signer is configured) the EOA's pool balance. Returns the raw +
+    decoded values plus the off-chain KuCoin USD price. Shared by the human-facing print
+    path and the --json path.
 
     Single call regardless of signer presence: my-deposit's leg is appended only when a
     key is resolvable; without a key it's skipped entirely (still one eth_call total)."""
@@ -1368,6 +1401,10 @@ def _pool_info_data(pool_name: str) -> dict:
         ("totalBorrowed", contract.encode_abi("totalBorrowed", args=[])),
         ("getDepositRate", contract.encode_abi("getDepositRate", args=[])),
         ("getBorrowingRate", contract.encode_abi("getBorrowingRate", args=[])),
+        # Raw selector (not in the pool ABI): the on-chain hard borrow-util cap. multicall()
+        # uses allowFailure, so a pool that predates the getter just yields ok=False → the
+        # field is omitted downstream and the sizing layer falls back to MAX_POOL_UTIL_FALLBACK.
+        ("maxPoolUtil", "0x" + Web3.keccak(text=_MAX_POOL_UTIL_SIG)[:4].hex()),
     ]
     try:
         acct = get_account()
@@ -1379,7 +1416,7 @@ def _pool_info_data(pool_name: str) -> dict:
                              for _, d in legs])
     out_types = {"totalSupply": ["uint256"], "totalBorrowed": ["uint256"],
                  "getDepositRate": ["uint256"], "getBorrowingRate": ["uint256"],
-                 "balanceOf": ["uint256"]}
+                 "maxPoolUtil": ["uint256"], "balanceOf": ["uint256"]}
     decoded = {}
     for (name, _data), (ok, rd) in zip(legs, results):
         if not ok or not rd:
@@ -1436,6 +1473,14 @@ def _pool_json_shape(data: dict) -> dict:
         out["depositRate"] = _compact_num(dr_raw / 1e18 * 100)
     if br_raw is not None:
         out["borrowingRate"] = _compact_num(br_raw / 1e18 * 100)
+    mu_raw = raw.get("maxPoolUtil")
+    if mu_raw is not None:
+        _mu = mu_raw / 1e18
+        # On-chain hard borrow cap as a FRACTION (0.925), NOT percent like `utilization`.
+        # Emitted only when the getter read succeeds; a downstream sizer that finds it
+        # absent falls back to the documented MAX_POOL_UTIL_FALLBACK.
+        if 0.0 < _mu <= 1.0:
+            out["maxPoolUtilisation"] = _compact_num(_mu, places=4)
     if price and ts_raw is not None:
         out["tokenPrice"] = _compact_num(price, places=4)
         out["tvl"] = _compact_num(ts_raw / 10**d * price)

@@ -1612,13 +1612,44 @@ def redstone_view_call(w3, account, fn_name: str, payload: bytes, args: list = N
 
 # ─── Commands ──────────────────────────────────────────────────────────────
 
+# ── On-chain hard borrow-utilisation cap ─────────────────────────────────────
+# Every DegenPrime lending Pool enforces an absolute borrow ceiling via the public view
+# getMaxPoolUtilisationForBorrowing() (1e18-scaled fraction). A borrow that would push the
+# pool's utilisation past it reverts on-chain with MaxPoolUtilisationBreached() (selector
+# 0xe5739c7e). Verified 0.925 (92.5%) on every Base pool 2026-07-18 — but READ IT LIVE,
+# never assume: this constant is only the fallback for when the call reverts or a pool
+# predates the getter, so a borrow-sizing caller can always stay below a real cap.
+MAX_POOL_UTIL_FALLBACK = 0.925
+_MAX_POOL_UTIL_SIG = "getMaxPoolUtilisationForBorrowing()"
+
+
+def get_max_pool_utilisation_for_borrowing(proxy, w3=None):
+    """Pool.getMaxPoolUtilisationForBorrowing() as a fraction (0.925 == 92.5%).
+
+    `proxy` is the lending Pool proxy address; `w3` is injectable (tests / call reuse)
+    and defaults to get_w3(). NEVER raises — returns MAX_POOL_UTIL_FALLBACK (0.925) when
+    the call reverts, the pool doesn't expose the getter, or the value is implausible — so
+    a borrow-sizing caller always has a safe cap to stay below. The selector is computed
+    statically (no connection needed to encode); only the eth_call touches the network."""
+    try:
+        if w3 is None:
+            w3 = get_w3()
+        raw = w3.eth.call({"to": Web3.to_checksum_address(proxy),
+                           "data": Web3.keccak(text=_MAX_POOL_UTIL_SIG)[:4]})
+        val = int.from_bytes(raw, "big") / 1e18
+        # A real utilisation ceiling is a fraction in (0, 1]; anything else is a bad read.
+        return val if 0.0 < val <= 1.0 else MAX_POOL_UTIL_FALLBACK
+    except Exception:
+        return MAX_POOL_UTIL_FALLBACK
+
+
 def _pool_info_data(pool_name: str) -> dict:
     """Read every pool-info field for one pool in a SINGLE Multicall3 eth_call:
-    totalSupply, totalBorrowed, getDepositRate, getBorrowingRate, and (when a signer is
-    configured) the EOA's pool balance. Returns the raw + decoded values plus the
-    off-chain KuCoin USD price. Shared by the human-facing print path and the --json
-    path. cb-prefixed pool symbols fall back to their bare ticker for the KuCoin probe
-    (cbBTC -> BTC, cbDOGE -> DOGE, etc.)."""
+    totalSupply, totalBorrowed, getDepositRate, getBorrowingRate, getMaxPoolUtilisationFor-
+    Borrowing, and (when a signer is configured) the EOA's pool balance. Returns the raw +
+    decoded values plus the off-chain KuCoin USD price. Shared by the human-facing print
+    path and the --json path. cb-prefixed pool symbols fall back to their bare ticker for
+    the KuCoin probe (cbBTC -> BTC, cbDOGE -> DOGE, etc.)."""
     contract, cfg, w3 = get_pool_contract(pool_name)
     proxy_cs = Web3.to_checksum_address(cfg["proxy"])
     legs = [
@@ -1626,6 +1657,10 @@ def _pool_info_data(pool_name: str) -> dict:
         ("totalBorrowed", contract.encode_abi("totalBorrowed", args=[])),
         ("getDepositRate", contract.encode_abi("getDepositRate", args=[])),
         ("getBorrowingRate", contract.encode_abi("getBorrowingRate", args=[])),
+        # Raw selector (not in the pool ABI): the on-chain hard borrow-util cap. multicall()
+        # uses allowFailure, so a pool that predates the getter just yields ok=False → the
+        # field is omitted downstream and the sizing layer falls back to MAX_POOL_UTIL_FALLBACK.
+        ("maxPoolUtil", "0x" + Web3.keccak(text=_MAX_POOL_UTIL_SIG)[:4].hex()),
     ]
     try:
         acct = get_account()
@@ -1637,7 +1672,7 @@ def _pool_info_data(pool_name: str) -> dict:
                              for _, d in legs])
     out_types = {"totalSupply": ["uint256"], "totalBorrowed": ["uint256"],
                  "getDepositRate": ["uint256"], "getBorrowingRate": ["uint256"],
-                 "balanceOf": ["uint256"]}
+                 "maxPoolUtil": ["uint256"], "balanceOf": ["uint256"]}
     decoded = {}
     for (name, _data), (ok, rd) in zip(legs, results):
         if not ok or not rd:
@@ -1693,6 +1728,14 @@ def _pool_json_shape(data: dict) -> dict:
         out["depositRate"] = _compact_num(dr_raw / 1e18 * 100)
     if br_raw is not None:
         out["borrowingRate"] = _compact_num(br_raw / 1e18 * 100)
+    mu_raw = raw.get("maxPoolUtil")
+    if mu_raw is not None:
+        _mu = mu_raw / 1e18
+        # On-chain hard borrow cap as a FRACTION (0.925), NOT percent like `utilization`.
+        # Emitted only when the getter read succeeds; a downstream sizer that finds it
+        # absent falls back to the documented MAX_POOL_UTIL_FALLBACK.
+        if 0.0 < _mu <= 1.0:
+            out["maxPoolUtilisation"] = _compact_num(_mu, places=4)
     if price and ts_raw is not None:
         out["tokenPrice"] = _compact_num(price, places=4)
         out["tvl"] = _compact_num(ts_raw / 10**d * price)
@@ -5031,10 +5074,45 @@ def _aero_use_all_available(
     return (total0_wei, total1_wei, tick_lower, tick_upper, pool_tick)
 
 
+def _aero_open_positions_for_pool(w3, account, pa, pool_key):
+    """Read-only: tokenIds of the Degen Account's OPEN (liquidity>0) Aerodrome positions
+    whose token pair + tickSpacing match `pool_key`'s AERODROME_POOLS cfg.
+
+    Used to detect an already-open position before `aero-add-liquidity --use-all-available`
+    mints a SEPARATE duplicate NFT for the same pool (the caller should grow the existing
+    one via `aero-increase-liquidity --token-id N` instead). Returns [] on ANY read failure
+    (fail-open: a flaky enumeration must never BLOCK a legitimate first open — the guard is
+    a safety net over the prior always-double-mint behaviour, not a hard requirement)."""
+    cfg = AERODROME_POOLS.get(pool_key)
+    if not cfg:
+        return []
+    want_pair = {cfg["token0"].lower(), cfg["token1"].lower()}
+    want_ts = cfg["tickSpacing"]
+    try:
+        ids = account.functions.getOwnedStakedAerodromeTokenIds().call()
+    except Exception:
+        return []
+    matches = []
+    for tid in (ids or []):
+        try:
+            _npm, _ver, p = _aero_npm_for_token(w3, tid, pa)
+            if not p:
+                continue
+            # positions() struct: p[2]=token0, p[3]=token1, p[4]=tickSpacing, p[7]=liquidity
+            token0, token1, tick_spacing, liq = p[2], p[3], p[4], p[7]
+            if liq and int(liq) > 0 and tick_spacing == want_ts and \
+               {str(token0).lower(), str(token1).lower()} == want_pair:
+                matches.append(tid)
+        except Exception:
+            continue
+    return matches
+
+
 def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
                            amount1: float = None, slippage_pct: float = 1.0,
                            execute: bool = False, width_pct: float = 2.0,
-                           use_all_available: bool = False, reserve: dict = None):
+                           use_all_available: bool = False, reserve: dict = None,
+                           allow_duplicate: bool = False):
     """Add concentrated liquidity to an Aerodrome Slipstream pool through the
     Degen Account's AerodromeFacet. Uses in-account token0/token1 balances.
 
@@ -5049,6 +5127,10 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
     --use-all-available skips --amount-* and instead reads ALL non-pool
     assets with >$5 value from the Degen Account, swaps them into the pool
     tokens at the correct ratio, then mints. Dust (<$5) is left in account.
+    It ALWAYS mints a fresh NFT, so if an OPEN position already exists on the
+    same pool this REFUSES (would create a duplicate) — grow the existing one
+    with `aero-increase-liquidity --token-id N`, or pass allow_duplicate=True to
+    force a second position.
 
     reserve (from `--reserve SYMBOL:FRACTION`, --use-all-available only) holds back
     FRACTION of SYMBOL's loose balance from that sweep, leaving it loose + untouched
@@ -5057,6 +5139,42 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
     The facet wraps the NPM mint(MintParams) call with remainsSolvent, so
     --execute appends a RedStone signed-price payload."""
     if use_all_available:
+        # Double-mint guard (2026-07-18): --use-all-available ALWAYS mints a fresh NFT. If the
+        # account already holds an OPEN position on this exact pool, that silently creates a
+        # SECOND, duplicate position (only one of which the on-chain rebalancer is armed on) —
+        # a real footgun hit live on core1's AERO/cbBTC. Refuse and point at the targeted
+        # increase-liquidity path instead; --allow-duplicate overrides for the rare
+        # intentional second position. NB: this guard lives only in the user-facing entry, so
+        # the rebuild path (which calls _cmd_aero_add_liquidity_all_available directly AFTER
+        # burning the old NFT) is unaffected — no open position exists at that point.
+        if not allow_duplicate:
+            try:
+                _w3 = get_w3()
+                _acct = get_account()
+                _pa = get_prime_account(_w3, _acct.address)
+                if _pa:
+                    _account = _w3.eth.contract(
+                        address=Web3.to_checksum_address(_pa), abi=PRIME_ACCOUNT_ABI)
+                    _existing = _aero_open_positions_for_pool(_w3, _account, _pa, pool_key)
+                    if _existing:
+                        _ids = ", ".join(str(t) for t in _existing)
+                        print(f"⛔ REFUSED: the Degen Account already has an OPEN Aerodrome position on "
+                              f"'{pool_key}' (tokenId {_ids}). `aero-add-liquidity --use-all-available` "
+                              f"mints a SEPARATE, DUPLICATE NFT instead of growing it (only one of which "
+                              f"the auto-rebalancer would be armed on).")
+                        print(f"   To ADD to the existing position, use:")
+                        print(f"     degenprime aero-increase-liquidity --pool {pool_key} "
+                              f"--token-id {_existing[0]} --amount-token0 X --amount-token1 Y [--execute]")
+                        print(f"   To intentionally open a SECOND position anyway, re-run with "
+                              f"--allow-duplicate.")
+                        sys.exit(2)
+            except SystemExit:
+                raise
+            except Exception as _guard_e:
+                # Detection is a safety net, not a hard gate — never block a legitimate open
+                # just because enumeration failed. Warn and fall through to the normal path.
+                print(f"  (note: could not check for an existing position "
+                      f"({type(_guard_e).__name__}); proceeding — watch for a duplicate mint.)")
         return _cmd_aero_add_liquidity_all_available(
             pool_key, slippage_pct, execute, width_pct, reserve=reserve
         )
@@ -6842,9 +6960,13 @@ def _dispatch():
             if a == "--width" and i + 1 < len(args): width = float(args[i + 1])
             if a == "--reserve" and i + 1 < len(args): reserve_specs.append(args[i + 1])
         use_all = "--use-all-available" in args
+        allow_dup = "--allow-duplicate" in args
         if not pool_key:
             print("Usage: degenprime aero-add-liquidity --pool <pool-key> --amount-token0 X --amount-token1 Y [--slippage 1] [--width 2] [--execute]")
             print("Example V3: degenprime aero-add-liquidity --pool virtual-weth-50-v3 --amount-token0 100 --amount-token1 0.05")
+            print("Note: with --use-all-available, an existing OPEN position on the same pool is refused")
+            print("      (would mint a duplicate NFT) — grow it with aero-increase-liquidity, or pass")
+            print("      --allow-duplicate to force a second position.")
             return
         if not use_all and (amt0 is None and amt1 is None):
             print("Specify --amount-token0 / --amount-token1 values or add --use-all-available to auto-detect.")
@@ -6858,7 +6980,7 @@ def _dispatch():
         if reserve and not use_all:
             print("Note: --reserve only applies with --use-all-available; ignoring it for the manual --amount-* path.")
         if use_all:
-            cmd_aero_add_liquidity(pool_key, slippage_pct=slippage, execute=execute, width_pct=width, use_all_available=True, reserve=reserve or None)
+            cmd_aero_add_liquidity(pool_key, slippage_pct=slippage, execute=execute, width_pct=width, use_all_available=True, reserve=reserve or None, allow_duplicate=allow_dup)
         else:
             cmd_aero_add_liquidity(pool_key, amt0, amt1, slippage, execute, width)
     elif cmd == "aero-increase-liquidity":
