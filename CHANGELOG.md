@@ -6,6 +6,26 @@ All notable changes to `primecli` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.9] - 2026-07-18
+
+### Fixed
+- **Broadcast now retries once on a stale-nonce rejection.** `get_w3()` caches a single
+  RPC endpoint for the process lifetime, but public multi-node providers (the ones in
+  `_BASE_RPC_FALLBACKS`) often load-balance one URL across several backend nodes with no
+  read-your-writes guarantee across requests. A tx built with `nonce =
+  get_transaction_count(...)` immediately after a PRECEDING tx's receipt confirmed could
+  still be rejected with `nonce too low: next nonce N+1, tx nonce N` if the node serving
+  the nonce lookup was lagging behind the one that confirmed the earlier tx. Hit live
+  2026-07-18 on an `aero-add-liquidity --use-all-available` sequence on Base
+  (degenprime): each precision-balancing swap confirmed fine, but the immediately-
+  following mint's broadcast rejected on this exact race. New `_send_raw_with_nonce_retry`
+  helper (used by `_sign_and_send`, the single broadcast entry point in all three
+  protocol CLIs) catches only this specific rejection, waits 3s, re-fetches the nonce,
+  and retries the broadcast once — any other error, or a second failure, still propagates
+  unchanged. Applied identically to `degenprime.py`, `deltaprime.py`, and `arbprime.py`
+  (byte-identical shared code across the three chains). 4 new tests (recovery, bounded
+  retry, non-nonce errors pass through untouched, cross-file identity).
+
 ## [0.12.8] - 2026-07-18
 
 ### Fixed

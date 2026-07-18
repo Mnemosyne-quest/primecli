@@ -768,12 +768,42 @@ def _set_gas_price_for(chain_id, w3, tx_dict):
     except Exception:
         tx_dict["gasPrice"] = max(int(w3.eth.gas_price * 2), 1 * 10**9)
 
+def _send_raw_with_nonce_retry(w3, acct, tx, label):
+    """Sign + broadcast `tx`, retrying ONCE on a stale-nonce rejection.
+
+    `get_w3()` caches a single RPC endpoint for the process lifetime, but public
+    multi-node providers often load-balance a single URL across several backend
+    nodes with no read-your-writes guarantee across requests. A tx built with
+    `nonce = get_transaction_count(...)` right after a PRECEDING tx's receipt
+    confirmed can still get "nonce too low: next nonce N+1, tx nonce N" if the node
+    serving the nonce lookup was lagging behind the one that confirmed the earlier
+    tx — confirmed live 2026-07-18 on Base (degenprime), same shared code path.
+
+    On that specific rejection: wait 3s for the lagging backend to catch up,
+    re-fetch the nonce, re-sign, and retry the broadcast once. Any other exception,
+    or a second failure, propagates unchanged — this is not a general retry-on-
+    any-error wrapper, only the one well-understood race. Returns the tx_hash."""
+    try:
+        signed = acct.sign_transaction(tx)
+        return w3.eth.send_raw_transaction(signed.raw_transaction)
+    except Exception as e:
+        if "nonce too low" not in str(e).lower():
+            raise
+        print(f"  {label}: stale nonce ({e}) — waiting for RPC to catch up, retrying once...")
+        time.sleep(3)
+        tx["nonce"] = w3.eth.get_transaction_count(acct.address)
+        signed = acct.sign_transaction(tx)
+        return w3.eth.send_raw_transaction(signed.raw_transaction)
+
+
 def _sign_and_send(w3, acct, tx, label, timeout=180, fallback_gas=3000000, buffer_bps=1250, gas_price_fn=None):
     """Sign, send, wait for a tx with gas estimation + OOG retry + error surfacing.
 
     Always estimates gas from final calldata (incl. RedStone payload) then adds a
     buffer. If the tx fails with status=0 and gasUsed == gasLimit (out of gas),
     retries once with 50% more buffer. Surfaces the gas stats on any failure.
+    Broadcast itself retries once on a stale-nonce rejection — see
+    _send_raw_with_nonce_retry.
 
     Gas limit override logic:
     - If tx dict has a non-None "gas" key, use that as the starting fallback_gas
@@ -792,8 +822,7 @@ def _sign_and_send(w3, acct, tx, label, timeout=180, fallback_gas=3000000, buffe
         gas_price_fn(w3, tx)
     else:
         _set_gas_price(w3, tx)
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    tx_hash = _send_raw_with_nonce_retry(w3, acct, tx, label)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
     ok = receipt["status"] == 1
     if ok:
@@ -812,8 +841,7 @@ def _sign_and_send(w3, acct, tx, label, timeout=180, fallback_gas=3000000, buffe
         tx["nonce"] = w3.eth.get_transaction_count(acct.address)
         tx.pop("gas", None)
         tx["gas"] = _estimate_gas_limit(w3, tx, int(fallback_gas * 1.5), new_bps)
-        signed = acct.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = _send_raw_with_nonce_retry(w3, acct, tx, label)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
         ok = receipt["status"] == 1
         if ok:

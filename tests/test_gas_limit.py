@@ -119,7 +119,14 @@ def test_estimate_gas_limit_exists_in_all():
 
 
 def test_degenprime_no_remaining_hardcoded_sends():
-    """Verify no send_raw_transaction outside helper (excluding approvals)."""
+    """Verify no send_raw_transaction outside a designated helper (excluding approvals).
+
+    Two helpers are legitimate broadcast sites: _sign_and_send (the main entry point)
+    and _send_raw_with_nonce_retry (its low-level broadcaster, added 2026-07-18 to
+    retry once on a stale-nonce rejection — see its docstring). Both are under 60
+    lines; any send_raw_transaction outside either, or outside an approval tx, is a
+    caller that bypassed the shared helper and should be flagged.
+    """
     import ast, re
 
     with open(Path(__file__).resolve().parent.parent / "primecli" / "degenprime.py") as f:
@@ -132,18 +139,20 @@ def test_degenprime_no_remaining_hardcoded_sends():
             if node.func.attr == "send_raw_transaction":
                 calls.append(node.lineno)
 
-    # Filter out the helper function
-    helper_line = None
+    # Locate both legitimate helper functions.
+    helper_lines = []
     for i, line in enumerate(src.split("\n")):
-        if "def _sign_and_send" in line:
-            helper_line = i + 1
-            break
+        if "def _sign_and_send" in line or "def _send_raw_with_nonce_retry" in line:
+            helper_lines.append(i + 1)
+
+    def _inside_a_helper(ln):
+        return any(ln >= h and ln < h + 60 for h in helper_lines)
 
     # Filter out approval txs (100k gas) and helper internals
     remaining = []
     for ln in calls:
-        if helper_line and ln >= helper_line and ln < helper_line + 60:
-            continue  # inside helper
+        if _inside_a_helper(ln):
+            continue
         line_text = src.split("\n")[ln - 1]
         ctx = src.split("\n")[max(0, ln - 6) : ln + 2]
         ctx_str = "\n".join(ctx)
@@ -152,3 +161,110 @@ def test_degenprime_no_remaining_hardcoded_sends():
         remaining.append(ln)
 
     assert not remaining, f"Non-helper, non-approval send_raw_transaction at lines: {remaining}"
+
+
+class FakeAcct:
+    """Minimal fake account — sign_transaction just echoes the tx as "signed"."""
+
+    address = "0xFAKE"
+
+    class _Signed:
+        raw_transaction = b"\x01\x02"
+
+    def sign_transaction(self, tx):
+        return self._Signed()
+
+
+class FakeEthNonceRace:
+    """Simulates the exact 2026-07-18 race: the first send_raw_transaction rejects
+    with a stale-nonce error (the tx's nonce was already consumed by the time this
+    backend saw the broadcast); a subsequent get_transaction_count call returns the
+    corrected nonce, and the retried send succeeds."""
+
+    def __init__(self, fail_times=1):
+        self.send_calls = 0
+        self.nonce_calls = 0
+        self.fail_times = fail_times
+
+    def send_raw_transaction(self, raw):
+        self.send_calls += 1
+        if self.send_calls <= self.fail_times:
+            raise Exception(
+                "{'code': -32000, 'message': 'nonce too low: next nonce 335, tx nonce 334'}")
+        return b"\xaa" * 32
+
+    def get_transaction_count(self, addr):
+        self.nonce_calls += 1
+        return 334 + self.nonce_calls  # simulates the RPC catching up
+
+
+class FakeW3NonceRace:
+    def __init__(self, fail_times=1):
+        self.eth = FakeEthNonceRace(fail_times)
+
+
+def test_nonce_retry_recovers_on_stale_nonce():
+    """_send_raw_with_nonce_retry: a 'nonce too low' rejection triggers exactly one
+    retry with a freshly-fetched nonce, and the retried send succeeds."""
+    w3 = FakeW3NonceRace(fail_times=1)
+    acct = FakeAcct()
+    tx = {"nonce": 334}
+    result = dgp._send_raw_with_nonce_retry(w3, acct, tx, "test tx")
+    assert result == b"\xaa" * 32
+    assert w3.eth.send_calls == 2, "should have retried exactly once after the failure"
+    assert w3.eth.nonce_calls == 1, "should have re-fetched the nonce exactly once"
+    assert tx["nonce"] == 335, "tx dict's nonce should be updated to the fresh value"
+
+
+def test_nonce_retry_gives_up_after_second_failure():
+    """A SECOND stale-nonce rejection is not retried again — propagates the error
+    rather than looping, matching the 'one bounded retry' contract."""
+    w3 = FakeW3NonceRace(fail_times=2)
+    acct = FakeAcct()
+    tx = {"nonce": 334}
+    try:
+        dgp._send_raw_with_nonce_retry(w3, acct, tx, "test tx")
+        assert False, "expected the second nonce-too-low rejection to propagate"
+    except Exception as e:
+        assert "nonce too low" in str(e).lower()
+    assert w3.eth.send_calls == 2, "should attempt exactly twice (initial + one retry)"
+
+
+def test_nonce_retry_does_not_intercept_other_errors():
+    """A non-nonce error (e.g. insufficient funds) must propagate immediately, with
+    NO retry and no extra get_transaction_count call — this is not a general
+    retry-on-any-error wrapper."""
+
+    class FakeEthOtherError:
+        def __init__(self):
+            self.send_calls = 0
+            self.nonce_calls = 0
+
+        def send_raw_transaction(self, raw):
+            self.send_calls += 1
+            raise Exception("insufficient funds for gas * price + value")
+
+        def get_transaction_count(self, addr):
+            self.nonce_calls += 1
+            return 999
+
+    class FakeW3Other:
+        def __init__(self):
+            self.eth = FakeEthOtherError()
+
+    w3 = FakeW3Other()
+    acct = FakeAcct()
+    tx = {"nonce": 334}
+    try:
+        dgp._send_raw_with_nonce_retry(w3, acct, tx, "test tx")
+        assert False, "expected the non-nonce error to propagate"
+    except Exception as e:
+        assert "insufficient funds" in str(e)
+    assert w3.eth.send_calls == 1, "must not retry a non-nonce error"
+    assert w3.eth.nonce_calls == 0, "must not re-fetch the nonce for a non-nonce error"
+
+
+def test_send_raw_with_nonce_retry_exists_in_all():
+    assert hasattr(dgp, "_send_raw_with_nonce_retry")
+    assert hasattr(dp, "_send_raw_with_nonce_retry")
+    assert hasattr(ap, "_send_raw_with_nonce_retry")
