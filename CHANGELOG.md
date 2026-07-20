@@ -4,6 +4,47 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.14.0] - 2026-07-20
+
+### Fixed
+- **`aero-increase-liquidity` now converges the two pool-token balances onto the
+  position's tick-range ratio instead of stranding the excess on the larger side.**
+  The command swept idle NON-pool assets into the bottleneck pool token, then capped the
+  two pool-token balances to whichever was smaller (`_aero_cap_to_balance`) and minted —
+  so when the two legs were not already near the CL range ratio it silently left the
+  excess of the larger leg undeployed. The fresh-mint path (`aero-add-liquidity
+  --use-all-available` and `aero-rebuild`'s remint) already ran a "precision balancing"
+  pass for exactly this — up to 3 direct token0<->token1 swaps that converge onto the
+  k0/k1 tick-range target — but `aero-increase-liquidity` had none. Hit live 2026-07-20:
+  rebuilding core1's AERO/cbBTC position left ~$74.56 of loose AERO+cbBTC auto-supplied
+  to the lending pool rather than deployed in the LP, and a manual `aero-increase-liquidity`
+  sweep-in could not fully deploy it either — it capped to the smaller leg and stranded
+  the rest, forcing a hand-computed manual swap before the leftover could go in. The
+  balancing loop is now factored into a shared `_aero_precision_balance(...)` helper called
+  from BOTH paths: the fresh-mint path passes `width_pct` (the band re-centres on the moving
+  tick each pass — behaviour byte-for-byte unchanged), while `aero-increase-liquidity` passes
+  the existing NFT's fixed `[tick_lower, tick_upper]` and runs it after the non-pool sweep,
+  execute-only. The deliberate anti-dust-grinding limits (3-pass cap; skip a residual swap
+  worth < $5 after pass 0) are preserved unchanged.
+
+### Changed
+- **The precision-balancing loop now honours `--reserve` on a pool's OWN leg.**
+  `_aero_precision_balance` threads the same `reserve` dict the non-pool sweep uses
+  (`_aero_apply_reserve`): if a reserve names one of the two pool tokens, that fraction of
+  the leg's entry balance is held out of BOTH the k0/k1 target and the swap cap, so
+  balancing can never swap away a reserved pool token (the hold is snapshotted once from the
+  entry balance so multi-pass convergence can't erode below it). This keeps the "deploy
+  everything, no leftovers" goal from overriding the AERO reward-hold carve-out. Dormant
+  today — a live reserve only ever names a non-pool reward token, so no current pool config
+  exercises this branch — but implemented defensively, since `reserve` is a generic mechanism
+  and not core1-specific. Strict no-op (and zero extra balance reads) when no reserve is
+  passed, so the mint path stays byte-for-byte.
+- 8 new offline tests (`tests/test_aero_precision_balance.py`): convergence of a one-sided
+  balance in both fixed-band (increase) and width-recompute (mint) modes; pool-leg reserve
+  exclusion (partial and full hold); the no-reserve strict no-op; and the two command wiring
+  paths (increase runs balancing after the sweep, execute-only, on the fixed band with
+  reserve threaded; add-liquidity delegates with `width_pct` + `reserve`). Full suite 355 green.
+
 ## [0.13.1] - 2026-07-20
 
 ### Added

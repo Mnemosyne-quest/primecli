@@ -5301,80 +5301,59 @@ def _cmd_aero_add_liquidity_manual(pool_key, amount0, amount1, slippage_pct, exe
         print("  ✓ Mint confirmed. (could not decode tokenId from receipt logs)")
 
 
-def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width_pct,
-                                          reserve=None):
-    """Use ALL available funds path for aero-add-liquidity.
+def _aero_precision_balance(w3, account, pool_cfg, tick_lower, tick_upper, pool_tick,
+                            slippage_pct, execute, width_pct=None, reserve=None):
+    """Converge the two pool-token in-account balances onto the exact ratio the CL
+    tick range needs, via up to _MAX_PRECISION_PASSES direct token0<->token1 swaps.
 
-    `reserve` ({SYMBOL_UPPER: fraction}, or None) is threaded into both the preview
-    and execute passes of _aero_use_all_available so the reserved portion is held out
-    of the sweep identically in the dry-run plan and the live mint."""
-    w3 = get_w3()
-    acct = get_account()
-    print(f"Wallet: {acct.address}")
-    pa = get_prime_account(w3, acct.address)
-    if not pa:
-        print("No Degen Account yet. Create with: degenprime create-account --execute")
-        sys.exit(2)
-    pa_cs = Web3.to_checksum_address(pa)
-    account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
-    print(f"Degen Account: {pa}")
+    After a non-pool sweep the two pool tokens are rarely at the range ratio; without
+    this, _aero_fit_amounts_to_range strands the excess on the larger side ($100+ on a
+    single-pass mint sweep, or the ~$74.56 a post-rebuild increase-liquidity left
+    undeployed on core1 2026-07-20). Each pass re-reads the pool tick (earlier swaps
+    move price), derives the k0/k1 tick-range target, and sells the over-weighted leg;
+    it early-exits once balanced within _TOL, or once the residual swap is worth < $5
+    after pass 0, and stops on a failed swap.
 
-    if pool_key not in AERODROME_POOLS:
-        print(f"Unknown pool '{pool_key}'. Choose from: {', '.join(AERODROME_POOLS)}")
-        sys.exit(2)
-    pool_cfg = AERODROME_POOLS[pool_key]
-    sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
-    dec0, dec1 = pool_cfg["decimals0"], pool_cfg["decimals1"]
+    The $5-after-pass-0 gate and the 3-pass cap are deliberate anti-dust-grinding
+    limits (a prior fix) — do not lower without cause.
 
-    # Preview plan first
-    plan = _aero_use_all_available(
-        w3, acct, account, pa_cs, pool_cfg,
-        width_pct, slippage_pct, execute=False, reserve=reserve
-    )
-    if not plan:
-        return
-    total0_wei, total1_wei, tick_lower, tick_upper, pool_tick = plan
+    width_pct: when not None (fresh-mint / rebuild path) the range is recomputed from
+    width_pct around the freshly-read pool tick each pass, so it tracks the moving
+    price. When None (increase-liquidity on an existing NFT) the passed tick_lower/
+    tick_upper are held fixed — balance to the position's own band.
 
-    # Fit to range (safety net)
-    amt0, amt1, _ = _aero_fit_amounts_to_range(
-        pool_cfg, total0_wei, total1_wei, tick_lower, tick_upper, pool_tick
-    )
-    if amt0 == 0 and amt1 == 0:
-        print("  Nothing to deposit after fitting amounts to range.")
-        return
+    reserve ({SYMBOL_UPPER: fraction} or None): if it names one of the pool's OWN legs,
+    that fraction of the leg's entry balance is held out of BOTH the k0/k1 target and
+    the swap cap, so precision balancing never swaps away a reserved pool token. The
+    hold is snapshotted once from the entry balance so multi-pass convergence can't
+    erode below it. Strict no-op — and zero extra reads — when None/empty. (Today a
+    reserve only ever names a non-pool reward token, so this branch is dormant but
+    structurally correct.)
 
-    print(f"\n  {"=" * 60}")
-    print(f"  DEPLOY PLAN")
-    print(f"  {"=" * 60}")
-    print(f"  Pool: {sym0}/{sym1} (tickSpacing={pool_cfg['tickSpacing']})")
-    print(f"  Tick range: [{tick_lower}, {tick_upper}] (width: +/-{width_pct}%)")
-    print(f"  {sym0}: {fmt_token_amount(amt0, dec0)}")
-    print(f"  {sym1}: {fmt_token_amount(amt1, dec1)}")
-
-    if not execute:
-        print(f"\n  Preview only. Run with --execute to broadcast swaps + mint.")
-        return
-
-    # Execute: run swaps then mint
-    plan = _aero_use_all_available(
-        w3, acct, account, pa_cs, pool_cfg,
-        width_pct, slippage_pct, execute=True, reserve=reserve
-    )
-    if not plan:
-        print("  Swap execution finished but post-swap plan is empty. Aborting mint.")
-        sys.exit(2)
-    total0_wei, total1_wei, tick_lower, tick_upper, pool_tick = plan
-
-    # ── Precision balance sweep ──────────────────────────────────
-    # After sweeping non-pool assets, the two pool tokens are rarely
-    # at the exact ratio required by the CL tick range.  Execute up
-    # to 3 precision swaps between pool tokens to converge, so that
-    # _aero_fit_amounts_to_range leaves at most a few dollars of
-    # residual rather than the $100+ that a single-pass sweep can
-    # strand.
+    Returns the final (tick_lower, tick_upper, pool_tick) after the loop — the caller
+    uses these for the subsequent fit-to-range + mint.
+    """
     from decimal import localcontext as _lc
     import json as _json
+    sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
+    dec0, dec1 = pool_cfg["decimals0"], pool_cfg["decimals1"]
     _MAX_PRECISION_PASSES = 3
+
+    # Snapshot the held-back (reserved) wei per pool leg ONCE from the entry balance,
+    # reusing the same subtraction helper the non-pool sweep uses. Fixing it here means
+    # subsequent passes subtract a constant hold rather than re-deriving frac*balance
+    # off a shrinking balance (which would let repeated swaps erode the reserve).
+    _reserved0 = _reserved1 = 0
+    if reserve:
+        _e0 = _aero_in_account_balance(account, sym0)
+        _e1 = _aero_in_account_balance(account, sym1)
+        _kept = _aero_apply_reserve({sym0: _e0, sym1: _e1}, reserve)
+        _reserved0 = int(_e0) - int(_kept.get(sym0, 0))
+        _reserved1 = int(_e1) - int(_kept.get(sym1, 0))
+        for _rs, _rw, _rd in ((sym0, _reserved0, dec0), (sym1, _reserved1, dec1)):
+            if _rw > 0:
+                print(f"  Reserve: holding {fmt_token_amount(_rw, _rd)} {_rs} out of "
+                      f"precision balancing (not swapped).")
 
     for _pass in range(_MAX_PRECISION_PASSES):
         # Re-read pool tick — earlier swaps may have moved the price
@@ -5391,12 +5370,19 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
             print(f"  Precision pass {_pass+1}: cannot read pool tick ({e}). Skipping.")
             break
 
-        tick_lower, tick_upper = _aero_tick_range(
-            pool_cfg["tickSpacing"], None, width_pct, pool_tick
-        )
+        # Fresh-mint / rebuild path re-centres the range on the moving tick each pass;
+        # increase-liquidity (width_pct=None) balances to the NFT's fixed band instead.
+        if width_pct is not None:
+            tick_lower, tick_upper = _aero_tick_range(
+                pool_cfg["tickSpacing"], None, width_pct, pool_tick
+            )
 
         _bal0 = _aero_in_account_balance(account, sym0)
         _bal1 = _aero_in_account_balance(account, sym1)
+        # Exclude any reserved pool-leg fraction from what balancing may spend.
+        if reserve:
+            _bal0 = _bal0 - _reserved0 if _bal0 > _reserved0 else 0
+            _bal1 = _bal1 - _reserved1 if _bal1 > _reserved1 else 0
         if _bal0 == 0 and _bal1 == 0:
             break
 
@@ -5480,6 +5466,85 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
             print(f"  Precision swap pass {_pass+1} failed (direct + USDC 2-hop). "
                   f"Continuing with current balances.")
             break
+
+    return tick_lower, tick_upper, pool_tick
+
+
+def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width_pct,
+                                          reserve=None):
+    """Use ALL available funds path for aero-add-liquidity.
+
+    `reserve` ({SYMBOL_UPPER: fraction}, or None) is threaded into both the preview
+    and execute passes of _aero_use_all_available so the reserved portion is held out
+    of the sweep identically in the dry-run plan and the live mint."""
+    w3 = get_w3()
+    acct = get_account()
+    print(f"Wallet: {acct.address}")
+    pa = get_prime_account(w3, acct.address)
+    if not pa:
+        print("No Degen Account yet. Create with: degenprime create-account --execute")
+        sys.exit(2)
+    pa_cs = Web3.to_checksum_address(pa)
+    account = w3.eth.contract(address=pa_cs, abi=PRIME_ACCOUNT_ABI)
+    print(f"Degen Account: {pa}")
+
+    if pool_key not in AERODROME_POOLS:
+        print(f"Unknown pool '{pool_key}'. Choose from: {', '.join(AERODROME_POOLS)}")
+        sys.exit(2)
+    pool_cfg = AERODROME_POOLS[pool_key]
+    sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
+    dec0, dec1 = pool_cfg["decimals0"], pool_cfg["decimals1"]
+
+    # Preview plan first
+    plan = _aero_use_all_available(
+        w3, acct, account, pa_cs, pool_cfg,
+        width_pct, slippage_pct, execute=False, reserve=reserve
+    )
+    if not plan:
+        return
+    total0_wei, total1_wei, tick_lower, tick_upper, pool_tick = plan
+
+    # Fit to range (safety net)
+    amt0, amt1, _ = _aero_fit_amounts_to_range(
+        pool_cfg, total0_wei, total1_wei, tick_lower, tick_upper, pool_tick
+    )
+    if amt0 == 0 and amt1 == 0:
+        print("  Nothing to deposit after fitting amounts to range.")
+        return
+
+    print(f"\n  {"=" * 60}")
+    print(f"  DEPLOY PLAN")
+    print(f"  {"=" * 60}")
+    print(f"  Pool: {sym0}/{sym1} (tickSpacing={pool_cfg['tickSpacing']})")
+    print(f"  Tick range: [{tick_lower}, {tick_upper}] (width: +/-{width_pct}%)")
+    print(f"  {sym0}: {fmt_token_amount(amt0, dec0)}")
+    print(f"  {sym1}: {fmt_token_amount(amt1, dec1)}")
+
+    if not execute:
+        print(f"\n  Preview only. Run with --execute to broadcast swaps + mint.")
+        return
+
+    # Execute: run swaps then mint
+    plan = _aero_use_all_available(
+        w3, acct, account, pa_cs, pool_cfg,
+        width_pct, slippage_pct, execute=True, reserve=reserve
+    )
+    if not plan:
+        print("  Swap execution finished but post-swap plan is empty. Aborting mint.")
+        sys.exit(2)
+    total0_wei, total1_wei, tick_lower, tick_upper, pool_tick = plan
+
+    # ── Precision balance sweep ──────────────────────────────────
+    # After sweeping non-pool assets, the two pool tokens are rarely at the exact
+    # ratio the CL tick range needs. Converge them via up to 3 direct token0<->token1
+    # swaps (shared with aero-increase-liquidity) so _aero_fit_amounts_to_range leaves
+    # at most a few dollars of residual rather than the $100+ a single-pass sweep can
+    # strand. width_pct re-centres the range on the moving tick each pass; reserve is
+    # honoured on a pool leg (no-op otherwise).
+    tick_lower, tick_upper, pool_tick = _aero_precision_balance(
+        w3, account, pool_cfg, tick_lower, tick_upper, pool_tick,
+        slippage_pct, execute, width_pct=width_pct, reserve=reserve,
+    )
 
     # Re-read balances and mint
     in_acct0 = _aero_in_account_balance(account, sym0)
@@ -5661,8 +5726,12 @@ def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
     Selector 0x747f6827 = increaseStakedLiquidityAerodrome (uint256×6 tuple).
     Verified on-chain via Diamond Loupe 2026-06-19 (beacon at 0x85C2BAA2...).
 
-    Sweeps idle in-account assets >$5 into the pool's bottleneck token first,
-    so any hanging funds get deployed alongside the requested amounts.
+    Sweeps idle non-pool assets >$5 into the pool's bottleneck token, then runs the
+    same precision-balancing pass the fresh-mint path uses — up to 3 direct
+    token0<->token1 swaps to converge the two pool-token balances onto the NFT's own
+    tick-range ratio (honouring any --reserve on a pool leg) — so a top-up deploys
+    both legs fully instead of stranding the excess on the larger side. Balancing runs
+    only with --execute.
     """
     import time
     w3 = get_w3()
@@ -5700,6 +5769,18 @@ def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
     pa_cs = Web3.to_checksum_address(pa)
     print("  Checking for idle assets to sweep...")
     _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg, execute=execute, reserve=reserve)
+
+    # Then converge the two pool-token balances onto THIS NFT's existing tick-range
+    # ratio (same precision balancing the fresh-mint path runs), so a top-up deploys
+    # both legs instead of stranding the excess on the larger side — the gap that left
+    # ~$74.56 of AERO/cbBTC undeployed on core1 after a 2026-07-20 rebuild, which a
+    # manual increase-liquidity couldn't sweep in because it only capped to the smaller
+    # side. Fixed band (width_pct=None); reserve honoured; execute-only, like the mint.
+    if execute:
+        _aero_precision_balance(
+            w3, account, pool_cfg, int(tick_lower), int(tick_upper), None,
+            slippage_pct, execute=execute, width_pct=None, reserve=reserve,
+        )
 
     # Re-read updated balances after sweeps
     avail0 = _aero_in_account_balance(account, pool_cfg["symbol0"])
