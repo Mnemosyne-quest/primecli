@@ -4,6 +4,22 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.13.1] - 2026-07-20
+
+### Added
+- **`npm_version` field on each `aerodrome-positions --json` entry** (degenprime) — the
+  on-chain-verified Aerodrome Slipstream deployment (`"v2"`/`"v3"`) a position's NFT actually
+  lives on, as already resolved by `_aero_npm_for_token`. `cmd_aerodrome_positions` computed
+  this internally (to pick the right pool config for range metrics) but dropped it before
+  building the JSON, so JSON consumers could not tell which of the two overlapping NPM
+  deployments held a position. Many pairs (e.g. AERO/cbBTC) have a registry entry on BOTH
+  deployments at the identical tickSpacing, so pair + tickSpacing alone cannot disambiguate —
+  a downstream consumer that had to guess ("prefer V3") displayed the wrong generation for a
+  real position still on the V2 NPM (2026-07-20). Exposing the already-resolved value lets
+  callers read the fact instead of guessing. Purely additive: the resolution logic (fixed in
+  the 2026-07-17 V2/V3 collision pass) is unchanged. 2 new offline tests drive the command
+  end-to-end and assert the field carries the resolved deployment for both the v2 and v3 cases.
+
 ## [0.13.0] - 2026-07-18
 
 ### Added

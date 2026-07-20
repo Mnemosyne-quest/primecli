@@ -4268,6 +4268,7 @@ def cmd_aerodrome_positions(json_out=False):
             rng = _aero_range_metrics(w3, pool_cfg, tick_lower, tick_upper) if pool_cfg else None
             entry = {
                 "token_id": tid, "pair": f"{sym0}/{sym1}",
+                "npm_version": ver,
                 "tick_lower": tick_lower, "tick_upper": tick_upper, "liquidity": liq,
                 "price_lower": price_lower, "price_upper": price_upper,
                 "price_quote": f"{sym1}/{sym0}",

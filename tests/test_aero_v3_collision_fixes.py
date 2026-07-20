@@ -16,6 +16,7 @@ Pure/offline (per conftest): no network, no RPC, no signing. The on-chain reads
 from __future__ import annotations
 
 import importlib
+import json
 
 import pytest
 from web3 import Web3
@@ -377,3 +378,59 @@ def test_v3_batch2_v2_sibling_still_resolves(v3_key, v2_key):
                                       v2["tickSpacing"], "v2")
     assert matched is v2
     assert matched.get("slipstreamVersion", 0) == 0
+
+
+# ─────────────── FIX 5: resolved npm_version reaches the position JSON ───────
+# The resolver above returns the on-chain-verified deployment ('v2'/'v3'), but
+# cmd_aerodrome_positions used to drop it before building each JSON entry — leaving a
+# downstream consumer to GUESS the deployment when pair+tickSpacing can't disambiguate
+# (and it guessed wrong for a real position, 2026-07-20). The command now writes that
+# resolved value into every entry as "npm_version". These tests drive the whole command
+# offline and assert the field carries exactly what _aero_npm_for_token resolved.
+
+class _Acct:
+    def __init__(self, address):
+        self.address = address
+
+
+def _drive_positions_json(monkeypatch, capsys, w3, pa):
+    """Run cmd_aerodrome_positions(json_out=True) fully offline and return the parsed JSON.
+    Only the three real entry points (get_w3/get_account/get_prime_account) and the live
+    pool-tick read (_aero_range_metrics, irrelevant to npm_version) are stubbed; resolution,
+    symbol, and decimal lookups run against the address-keyed w3 stub and the static maps."""
+    monkeypatch.setattr(dp, "get_w3", lambda: w3)
+    monkeypatch.setattr(dp, "get_account", lambda: _Acct("0x" + "99" * 20))
+    monkeypatch.setattr(dp, "get_prime_account", lambda _w3, _owner: pa)
+    monkeypatch.setattr(dp, "_aero_range_metrics", lambda *a, **k: None)
+    dp.cmd_aerodrome_positions(json_out=True)
+    return json.loads(capsys.readouterr().out.strip())
+
+
+def test_positions_json_carries_resolved_npm_version_v3(monkeypatch, capsys):
+    # tokenId live on BOTH NPMs; pa holds the V3 one -> resolver returns 'v3', and the V3
+    # (GENUINE, WETH/EURC) struct — not the V2 stranger — is what gets rendered.
+    w3 = _W3({
+        PA: {"getOwnedStakedAerodromeTokenIds": lambda: [12345]},
+        V2: {"positions": lambda tid: FOREIGN, "ownerOf": lambda tid: STRANGER},
+        V3: {"positions": lambda tid: GENUINE, "ownerOf": lambda tid: PA},
+    })
+    data = _drive_positions_json(monkeypatch, capsys, w3, PA)
+
+    assert len(data["positions"]) == 1
+    pos = data["positions"][0]
+    assert pos["npm_version"] == "v3"
+    assert pos["token_id"] == 12345
+    # proves the V3 struct was read, not the V2 collision (both share ticks/liq)
+    assert pos["pair"] == f"{dp._resolve_token_symbol(w3, WETH)}/{dp._resolve_token_symbol(w3, EURC)}"
+
+
+def test_positions_json_carries_resolved_npm_version_v2(monkeypatch, capsys):
+    # Only V2 knows the id (V3 reverts) -> resolver returns 'v2'; the field reflects it.
+    w3 = _W3({
+        PA: {"getOwnedStakedAerodromeTokenIds": lambda: [777]},
+        V2: {"positions": lambda tid: FOREIGN, "ownerOf": _revert},
+        V3: {"positions": _revert},
+    })
+    data = _drive_positions_json(monkeypatch, capsys, w3, PA)
+
+    assert data["positions"][0]["npm_version"] == "v2"
