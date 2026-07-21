@@ -456,6 +456,31 @@ AERODROME_POOLS = {
                         "slipstreamVersion": 1,
                         "pool": "0xA135B59Fe221C0c8D441294f97f96Fbc37Bc9fbE",
                         "gauge": "0xCa9740aFFeDF731f95B3FBAb8d40835781c7aE4D"},
+    # ── Added 2026-07-21: three pools confirmed live on app.degenprime.io's own
+    # "Total Balance" LP-token list (V3 badge + tick-spacing badge shown there),
+    # cross-verified via CLFactory.getPool()/Voter.gauges() and rewardRate()
+    # matching Aerodrome's own vote-page emissions numbers exactly. ──────────
+    "weth-usdc-50-v3": {"token0": "0x4200000000000000000000000000000000000006",  # WETH
+                        "token1": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",  # USDC
+                        "tickSpacing": 50, "symbol0": "ETH", "symbol1": "USDC",
+                        "decimals0": 18, "decimals1": 6, "gauge_alive": True,
+                        "slipstreamVersion": 1,
+                        "pool": "0x3FE04A59Ebd38cF06080a6F60a98D124eb59392A",
+                        "gauge": "0xA0B61fdB9f1FB9b917Fe38b49427Fd4D87472D28"},
+    "weth-cbbtc-10-v3": {"token0": "0x4200000000000000000000000000000000000006",  # WETH
+                         "token1": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",  # cbBTC
+                         "tickSpacing": 10, "symbol0": "ETH", "symbol1": "cbBTC",
+                         "decimals0": 18, "decimals1": 8, "gauge_alive": True,
+                         "slipstreamVersion": 1,
+                         "pool": "0x42d4a22CaD0F5a49681a5715cE994Af73A43B76b",
+                         "gauge": "0x61E0B10423a0009C3f83ab4313813d29437d0817"},
+    "usdc-cbbtc-50-v3": {"token0": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",  # USDC
+                         "token1": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",  # cbBTC
+                         "tickSpacing": 50, "symbol0": "USDC", "symbol1": "cbBTC",
+                         "decimals0": 6, "decimals1": 8, "gauge_alive": True,
+                         "slipstreamVersion": 1,
+                         "pool": "0x160D7E9d948B16c163332a277b393c288408eb12",
+                         "gauge": "0x7B0f1103746648FBfce9222f1266f79B934E16b2"},
 }
 
 # ParaSwap v6 / Velora aggregator on Base. The Degen Account's ParaSwapFacet.paraSwapV6

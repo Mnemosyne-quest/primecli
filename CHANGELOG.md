@@ -4,6 +4,18 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.14.1] - 2026-07-21
+
+### Added
+- **3 new Aerodrome Slipstream Gauges-V3 pools in the `degenprime` `AERODROME_POOLS`
+  registry**: `weth-usdc-50-v3` (ETH/USDC, tickSpacing 50), `weth-cbbtc-10-v3` (ETH/cbBTC,
+  tickSpacing 10), `usdc-cbbtc-50-v3` (USDC/cbBTC, tickSpacing 50). Confirmed live on
+  app.degenprime.io's own "Total Balance" LP-token list (V3 + tick-spacing badges), then
+  independently verified on-chain via `AERODROME_CL_FACTORY_V3.getPool()` /
+  `Voter.gauges()` / `gauge.rewardRate()` — the resulting AERO/week for the ETH/cbBTC and
+  USDC/cbBTC pools (212843.76 and 113682.63) match Aerodrome's own vote-page emissions
+  numbers to the token. Purely additive: no existing registry entries changed.
+
 ## [0.14.0] - 2026-07-20
 
 ### Fixed
