@@ -165,6 +165,20 @@ def test_post_mint_no_topup_when_residual_is_dust(monkeypatch):
     assert rec["increase"] == []
 
 
+def test_post_mint_no_topup_when_legs_are_unpriced(monkeypatch):
+    """Both legs unpriced (no RedStone feed, no stable) -> conservative no-fire:
+    the top-up must never guess amounts without a price basis."""
+    rec = _rig_mint(monkeypatch, residual_bals={"TKA": 10 ** 16, "USDC": 0})
+    monkeypatch.setattr(dp, "_read_prices_usd",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no feed")))
+    # Break the stable-leg fallback: pretend the pool's sym1 is NOT a stable.
+    _cfg = dict(SYNTH_POOL, symbol1="TKB", token1="0x" + "f" * 40)
+    monkeypatch.setitem(dp.AERODROME_POOLS, SYNTH_POOL_KEY, _cfg)
+    dp._cmd_aero_add_liquidity_all_available(
+        SYNTH_POOL_KEY, 1.0, execute=True, width_pct=4.6, reserve=None)
+    assert rec["increase"] == []
+
+
 # ─────────────────────── _aero_precision_balance stale guard ───────────────────
 
 def _wire_scripted(monkeypatch, queue, swaps):
