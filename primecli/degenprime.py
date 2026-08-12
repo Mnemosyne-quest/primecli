@@ -205,7 +205,7 @@ _CLI_KEY = None  # set by the --key CLI flag in main()
 # The map and its readers live in primecli._wallets as the single source of
 # truth; re-exported here so existing references (degenprime.AGENTS, etc.) and
 # resolve_private_key() below keep working unchanged.
-from primecli._wallets import _agent_key  # noqa: E402
+from primecli._wallets import AGENTS, _agent_key  # noqa: E402
 from primecli import _flowledger  # noqa: E402
 _SELECTED_AGENT = None        # set by the --as CLI flag in main()
 
@@ -5372,9 +5372,14 @@ def _aero_precision_balance(w3, account, pool_cfg, tick_lower, tick_upper, pool_
     """
     from decimal import localcontext as _lc
     import json as _json
+    import time
     sym0, sym1 = pool_cfg["symbol0"], pool_cfg["symbol1"]
     dec0, dec1 = pool_cfg["decimals0"], pool_cfg["decimals1"]
     _MAX_PRECISION_PASSES = 3
+    # Stale-read guard state: the previous pass's swap (sold symbol, wei amount,
+    # raw pre-swap balance of the sold leg), so the next pass can verify the
+    # swap actually landed in its read before issuing another one.
+    _prev_swap = None
 
     # Snapshot the held-back (reserved) wei per pool leg ONCE from the entry balance,
     # reusing the same subtraction helper the non-pool sweep uses. Fixing it here means
@@ -5416,6 +5421,28 @@ def _aero_precision_balance(w3, account, pool_cfg, tick_lower, tick_upper, pool_
 
         _bal0 = _aero_in_account_balance(account, sym0)
         _bal1 = _aero_in_account_balance(account, sym1)
+        # Stale-read guard: a lagging RPC can return the PRE-swap balance on the
+        # pass after a broadcast, which would recompute the same excess and issue
+        # a DUPLICATE swap. Verify the previous swap landed in this read; retry
+        # the read briefly, and stop rather than double-swap. (The 2026-08-11
+        # VIRTUAL/ETH rebuild strand came from exactly this class of stale read.)
+        if _prev_swap is not None:
+            _fsym, _fwei, _pre_bal = _prev_swap
+            _cur = _bal0 if _fsym == sym0 else _bal1
+            for _rtry in range(3):
+                if _cur <= _pre_bal - int(_fwei * 0.5):
+                    break
+                time.sleep(2)
+                _bal0 = _aero_in_account_balance(account, sym0)
+                _bal1 = _aero_in_account_balance(account, sym1)
+                _cur = _bal0 if _fsym == sym0 else _bal1
+            else:
+                print(f"  Precision pass {_pass+1}: previous {_fsym} swap "
+                      f"({fmt_token_amount(_fwei, dec0 if _fsym == sym0 else dec1)}) not "
+                      "reflected in the balance read (stale RPC?) — stopping to avoid a "
+                      "duplicate swap; the post-mint residual top-up will redeploy leftovers.")
+                break
+        _raw0, _raw1 = _bal0, _bal1
         # Exclude any reserved pool-leg fraction from what balancing may spend.
         if reserve:
             _bal0 = _bal0 - _reserved0 if _bal0 > _reserved0 else 0
@@ -5503,8 +5530,38 @@ def _aero_precision_balance(w3, account, pool_cfg, tick_lower, tick_upper, pool_
             print(f"  Precision swap pass {_pass+1} failed (direct + USDC 2-hop). "
                   f"Continuing with current balances.")
             break
+        # Record the swap for the stale-read guard on the next pass (sold leg's
+        # RAW pre-swap balance, not the reserve-subtracted view).
+        _prev_swap = (_from_sym, int(_s_pool),
+                      int(_raw0 if _from_sym == sym0 else _raw1))
 
     return tick_lower, tick_upper, pool_tick
+
+
+def _aero_read_pool_legs_stable(account, sym0, sym1, attempts=3, delay=2.0):
+    """Read both pool-leg balances, retrying until two consecutive reads agree.
+
+    RPC/indexer lag right after a broadcast can return PRE-swap balances (the
+    2026-08-11 VIRTUAL/ETH rebuild stranded ~$39 because the mint's final
+    balance read saw pre-swap values and the fit under-deployed both legs).
+    Two fresh reads agree; a lagging read disagrees with the next one.
+    Returns (bal0_wei, bal1_wei, stable: bool).
+    """
+    import time
+    b0 = _aero_in_account_balance(account, sym0)
+    b1 = _aero_in_account_balance(account, sym1)
+
+    def _close(a, b):
+        return a == b or abs(a - b) <= max(1, int(abs(a) * 0.005))
+
+    for _ in range(max(1, attempts) - 1):
+        time.sleep(delay)
+        n0 = _aero_in_account_balance(account, sym0)
+        n1 = _aero_in_account_balance(account, sym1)
+        if _close(b0, n0) and _close(b1, n1):
+            return n0, n1, True
+        b0, b1 = n0, n1
+    return b0, b1, False
 
 
 def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width_pct,
@@ -5583,9 +5640,14 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
         slippage_pct, execute, width_pct=width_pct, reserve=reserve,
     )
 
-    # Re-read balances and mint
-    in_acct0 = _aero_in_account_balance(account, sym0)
-    in_acct1 = _aero_in_account_balance(account, sym1)
+    # Re-read balances and mint. Use the stable read: a single read right after
+    # the balancing swaps can be stale (RPC/indexer lag — see the 2026-08-11
+    # VIRTUAL/ETH rebuild), which made the fit under-deploy and stranded ~$39.
+    in_acct0, in_acct1, _stable = _aero_read_pool_legs_stable(account, sym0, sym1)
+    if not _stable:
+        print("  WARNING: balance reads unstable after balancing swaps (RPC lag?). "
+              "Minting from the latest read; the post-mint residual top-up will "
+              "redeploy anything left loose.")
     amt0, amt1 = in_acct0, in_acct1
     if amt0 == 0 and amt1 == 0:
         print("  Nothing in account after swaps.")
@@ -5665,6 +5727,72 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
         print(f"  ✓ Mint confirmed. tokenId: {real_token_id}")
     else:
         print("  ✓ Mint confirmed. (could not decode tokenId from receipt logs)")
+
+    # ── Post-mint residual top-up ──────────────────────────────────────────
+    # A stale balance read before the mint (RPC/indexer lag) can leave pool-leg
+    # tokens undeployed even with the stable read above. Re-read after the mint
+    # and top the fresh NFT up via the increase path whenever >$5 of a leg
+    # remains. Reserved symbols are held at 100% here: after the mint, whatever
+    # remains of a reserved asset IS the protected pile, so the reward-hold
+    # piles are never swept by the top-up. The top-up is best-effort — a
+    # failure must never turn a successful mint into a reported failure.
+    if real_token_id is not None:
+        try:
+            _res0 = _aero_in_account_balance(account, sym0)
+            _res1 = _aero_in_account_balance(account, sym1)
+            _top0 = _top1 = None
+            if _res0 > 0 or _res1 > 0:
+                _usd0 = _usd1 = 0.0
+                _pool_price_0_in_1 = None
+                try:
+                    _pool_addr = _aero_pool_address(pool_cfg)
+                    _pool_c = w3.eth.contract(address=_pool_addr, abi=json.loads(SLOT0_ABI))
+                    _tick = int(_pool_c.functions.slot0().call()[1])
+                    # Normalized sqrt from the tick (NOT the X96 form): price =
+                    # 1.0001**tick, no 2**96 factor (the slot0 sqrtPriceX96 variant
+                    # divides by q96; the tick form is already normalized).
+                    _sqrt_p = Decimal("1.0001") ** (Decimal(_tick) / Decimal(2))
+                    _pool_price_0_in_1 = float(_sqrt_p * _sqrt_p * (10 ** (dec0 - dec1)))
+                except Exception:
+                    pass
+                _price0 = _price1 = None
+                try:
+                    _priced_syms = [s for s in (sym0, sym1) if s in REDSTONE_AVAILABLE_FEEDS]
+                    if _priced_syms:
+                        _prices = _read_prices_usd(
+                            w3, account, _priced_syms, build_redstone_payload(sorted(REDSTONE_AVAILABLE_FEEDS)))
+                        _pmap = dict(zip(_priced_syms, _prices))
+                        _price0 = float(_pmap[sym0]) / 1e18 if sym0 in _pmap else None
+                        _price1 = float(_pmap[sym1]) / 1e18 if sym1 in _pmap else None
+                except Exception:
+                    pass
+                if _price1 is None and sym1 in ("USDC", "EURC", "DAI"):
+                    _price1 = 1.0  # stable leg
+                if _price1 is not None and _pool_price_0_in_1:
+                    _price0 = _price1 * _pool_price_0_in_1
+                if _price0 is not None and _pool_price_0_in_1:
+                    _price1 = _price0 / _pool_price_0_in_1
+                if _price0 is not None:
+                    _usd0 = _res0 / (10 ** dec0) * _price0
+                if _price1 is not None:
+                    _usd1 = _res1 / (10 ** dec1) * _price1
+                if _usd0 > 5.0 or _usd1 > 5.0:
+                    _top0 = _res0 / (10 ** dec0) if _usd0 > 5.0 else 0.0
+                    _top1 = _res1 / (10 ** dec1) if _usd1 > 5.0 else 0.0
+                    print(f"  Post-mint residual: {sym0} ${_usd0:.2f} / {sym1} ${_usd1:.2f} — "
+                          f"topping up tokenId {real_token_id}...")
+                    _top_reserve = {_k: 1.0 for _k in (reserve or {})}
+                    try:
+                        cmd_aero_increase_liquidity(
+                            pool_key, int(real_token_id),
+                            amount0=_top0 or None, amount1=_top1 or None,
+                            slippage_pct=slippage_pct, execute=True,
+                            reserve=_top_reserve)
+                    except SystemExit as _se:
+                        print(f"  WARNING: post-mint top-up exited (code {_se.code}); "
+                              "the mint itself succeeded, residual may remain loose.")
+        except Exception as _e:  # never fail a successful mint over the top-up
+            print(f"  WARNING: post-mint residual check failed ({_e}).")
 
 
 def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float = 1.0,

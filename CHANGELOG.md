@@ -4,6 +4,25 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.14.2] - 2026-08-12
+
+### Fixed
+- **Stale-RPC-read race in `aero-add-liquidity --use-all-available`** (live incident
+  2026-08-11, parakletos-2 VIRTUAL/ETH rebuild): the mint's final balance read could
+  return PRE-swap balances under RPC/indexer lag, so `_aero_fit_amounts_to_range`
+  under-deployed BOTH legs (~94.5% each) and ~$39 of VIRTUAL+ETH stayed loose.
+  - New `_aero_read_pool_legs_stable()`: re-reads pool-leg balances until two
+    consecutive reads agree before fitting/minting (a lagging read disagrees with
+    the next one; two fresh reads agree).
+  - **Post-mint residual top-up**: after the mint, any remaining pool-leg value
+    > $5 is redeployed into the fresh NFT via the increase path (best-effort;
+    reserved symbols are held at 100% so reward-hold piles are never swept).
+  - **Stale-read guard in `_aero_precision_balance`**: each pass verifies the
+    previous pass's swap actually landed in its read (retries briefly, then stops)
+    so a lagging read can never issue a duplicate swap.
+- **`degenprime.AGENTS` re-export restored** (missing `AGENTS` import broke
+  `test_siblings_share_the_registry` and any consumer of `degenprime.AGENTS`).
+
 ## [0.14.1] - 2026-07-21
 
 ### Added
