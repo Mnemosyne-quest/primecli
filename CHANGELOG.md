@@ -4,6 +4,27 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.14.3] - 2026-08-12
+
+### Fixed
+- **Receipt-wait crash on transient RPC errors after a landed broadcast** (live
+  incident 2026-08-12, parakletos-2 VIRTUAL/ETH converge): `_sign_and_send`'s
+  `wait_for_transaction_receipt` could raise on a flaky provider (connection
+  reset / 429 / request timeout) AFTER the tx had been broadcast — the CLI then
+  crashed, the orchestrator dropped the traceback, and a swap that had LANDED
+  on-chain (nonce 352, status 1) was treated as failed: abort, unwind, and a
+  half-unwound position. New `_wait_for_receipt_stable()` retries the wait (3
+  attempts, short backoff) on transient provider errors. Re-waiting is
+  idempotent and safe — the tx is in flight; the broadcast itself is never
+  retried (stale-nonce guard unchanged). Wired into both `deltaprime` and
+  `degenprime` `_sign_and_send` paths, including the OOG-retry wait.
+- **`PARASWAP_EXECUTORS` now lists the Velora rotation executor
+  `0x006d0e0d006109f0020f3050000a713780b7b000`** (seen live 2026-08-12 and
+  verified accepted on-chain — the same address appears in confirmed swap txs,
+  status 1). The set is cosmetic since the 2026-06-04 facet fix (the real gate
+  is eth_call simulation of the exact tx), but labelling it stops the misleading
+  "not in the KNOWN whitelist" warning for a known-valid executor.
+
 ## [0.14.2] - 2026-08-12
 
 ### Fixed

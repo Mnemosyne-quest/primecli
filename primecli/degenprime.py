@@ -690,6 +690,38 @@ def _send_raw_with_nonce_retry(w3, acct, tx, label):
         return w3.eth.send_raw_transaction(signed.raw_transaction)
 
 
+def _wait_for_receipt_stable(w3, tx_hash, timeout, label, attempts=3):
+    """Wait for a tx receipt, retrying TRANSIENT provider errors.
+
+    The tx is already broadcast; re-waiting is idempotent and safe. A flaky
+    public RPC can raise mid-wait (connection reset, 429, request timeout)
+    AFTER the tx landed — without this, the caller would treat a landed
+    broadcast as a failure (real incident 2026-08-12: a converge's precision
+    swap confirmed on-chain while the CLI crashed on the receipt wait, the
+    traceback was dropped by the orchestrator, and the whole converge aborted
+    + unwound as if the swap had failed).
+
+    Only the WAIT is retried, never the broadcast (the tx is in flight; a
+    duplicate broadcast is the one thing that must never happen). A revert is
+    NOT an exception — it returns a status-0 receipt and the caller handles
+    it. Bounded retries with short backoff; the last error propagates if the
+    provider stays broken.
+    """
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        except Exception as e:  # noqa: BLE001 — transient RPC errors are broad
+            last = e
+            if attempt < attempts:
+                print(f"  {label}: receipt wait failed ({e}) — retrying "
+                      f"({attempt}/{attempts - 1})...")
+                time.sleep(2 * attempt)
+    if last is not None:
+        raise last
+    raise RuntimeError(f"{label}: receipt wait failed with no captured error")
+
+
 def _sign_and_send(w3, acct, tx, label, timeout=180, fallback_gas=3000000, buffer_bps=1250, gas_price_fn=None):
     """Sign, send, wait for a tx with gas estimation + OOG retry + error surfacing.
 
@@ -717,7 +749,7 @@ def _sign_and_send(w3, acct, tx, label, timeout=180, fallback_gas=3000000, buffe
     else:
         _set_gas_price(w3, tx)
     tx_hash = _send_raw_with_nonce_retry(w3, acct, tx, label)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+    receipt = _wait_for_receipt_stable(w3, tx_hash, timeout, label)
     ok = receipt["status"] == 1
     if ok:
         print(f"{'✓'} {label} confirmed")
@@ -736,7 +768,7 @@ def _sign_and_send(w3, acct, tx, label, timeout=180, fallback_gas=3000000, buffe
         tx.pop("gas", None)
         tx["gas"] = _estimate_gas_limit(w3, tx, int(fallback_gas * 1.5), new_bps)
         tx_hash = _send_raw_with_nonce_retry(w3, acct, tx, label)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        receipt = _wait_for_receipt_stable(w3, tx_hash, timeout, label)
         ok = receipt["status"] == 1
         if ok:
             print(f"{'✓'} {label} confirmed on retry")
