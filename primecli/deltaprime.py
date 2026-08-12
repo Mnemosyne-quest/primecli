@@ -209,7 +209,13 @@ Only depositPrime (inside prime-activate --amount) is solvency-gated -> RedStone
 prime-* write is onlyOwner and needs no payload. All prime-* views are oracle-free. Preview by default; --execute broadcasts.
 """
 
-import json, os, sys, time, re, random, base64, struct
+import json
+import os
+import sys
+import time
+import random
+import base64
+import struct
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 import requests
@@ -678,7 +684,13 @@ def get_w3():
     global _W3
     if _W3 is not None:
         return _W3
-    candidates = [AVALANCHE_RPC] + [u for u in _AVALANCHE_RPC_FALLBACKS if u != AVALANCHE_RPC]
+    # When routing through the local RPC proxy (127.0.0.1:8545), fail closed —
+    # don't fall back to hardcoded public endpoints. The proxy handles upstream
+    # rotation (Alchemy -> DRPC key-gated -> publicnode) with health tracking.
+    _proxy_rpc = "127.0.0.1" in AVALANCHE_RPC or "localhost" in AVALANCHE_RPC
+    candidates = [AVALANCHE_RPC]
+    if not _proxy_rpc:
+        candidates += [u for u in _AVALANCHE_RPC_FALLBACKS if u != AVALANCHE_RPC]
     last_exc = None
     for attempt, url in enumerate(candidates * 2):  # At most 2 rounds through the list
         try:
@@ -1700,7 +1712,7 @@ def cmd_withdraw(pool_name: str, amount: float, execute: bool = False):
     print("  Delayed flow: becomes executable ~24h later, then has a 48h window (24h-72h total).")
     print(f"  Run `execute-withdrawal-request --pool {pool_name}` after maturity to pull the funds to the wallet.")
     if amount_wei == 0:
-        print(f"  ✗ Amount must be greater than zero. Refusing.")
+        print("  ✗ Amount must be greater than zero. Refusing.")
         return
     if amount_wei > balance:
         print(f"  ✗ Requested {amount} {cfg['symbol']} exceeds current pool deposit. Refusing.")
@@ -2472,7 +2484,7 @@ def cmd_prime_summary():
             print(f"  Health (0-100%): {hp['health_pct']:.1f}%")
             print(f"    (supplied=${hp['supplied_usd']:.2f}, debt=${hp['debt_usd']:.2f},"
                   f" equity=${hp['equity']:.2f}, max_debt=${hp['max_debt']:.2f}, {hp['tier']})")
-            print(f"    0%=liquidation  50%=half borrowing power used  100%=no debt")
+            print("    0%=liquidation  50%=half borrowing power used  100%=no debt")
         else:
             print(f"  Health (0-100%): N/A ({hp['error']})")
         print(f"  Solvent:            {'yes' if data['solvent'] else 'NO — liquidatable'}")
@@ -2817,7 +2829,7 @@ def _paraswap_decode_and_check(selector_hex, data_bytes, src_token, dest_token, 
         fee_bps = partner_and_fee & 0x3FFF
         if executor.lower() not in PARASWAP_EXECUTORS:
             print(f"  ⚠ ParaSwap executor {executor} not in the KNOWN whitelist — the on-chain facet")
-            print(f"    may reject it with InvalidExecutor(). Proceeding anyway; verify on-chain.")
+            print("    may reject it with InvalidExecutor(). Proceeding anyway; verify on-chain.")
         if partner != 0 or fee_bps != 0:
             raise RuntimeError(f"ParaSwap calldata carries a non-zero partner/fee "
                                f"(partner={hex(partner)}, feeBps={fee_bps}); the facet would revert. Refusing.")
@@ -3149,14 +3161,14 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
             print(f"  Intermediate:     {intermediate_health:.4f}  (after borrow but before repay)")
             if intermediate_health < 1.1:
                 print(f"  ✗✗✗ REFUSING: intermediate health {intermediate_health:.2f} < 1.1 —")
-                print(f"    account would be liquidatable during the intermediate state.")
-                print(f"    Reduce the swap amount or add collateral first.")
+                print("    account would be liquidatable during the intermediate state.")
+                print("    Reduce the swap amount or add collateral first.")
                 return
             if intermediate_health < 1.5:
                 print(f"  ⚠ WARNING: intermediate health {intermediate_health:.2f} < 1.5 —")
-                print(f"    dangerously close to liquidation. Proceed with extreme caution.")
+                print("    dangerously close to liquidation. Proceed with extreme caution.")
         else:
-            print(f"  ⚠ Could not read current health — proceeding without intermediate check.")
+            print("  ⚠ Could not read current health — proceeding without intermediate check.")
 
         # Preview the swap leg.
         amounts, adapters, path = _yak_find_best_path(w3, borrow_amount, to_cfg["token"], from_cfg["token"])
@@ -3172,7 +3184,7 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         if not_whitelisted:
             print(f"  ✗ Non-whitelisted adapter(s): {', '.join(not_whitelisted)}. yakSwap would revert. Refusing.")
             return
-        print(f"  All adapters whitelisted.")
+        print("  All adapters whitelisted.")
 
         if not execute:
             print("Run with --execute to broadcast the 3-tx fallback sequence.")
@@ -3196,7 +3208,7 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         }
         receipt = _sign_and_send(w3, acct, tx, "Borrow (swap-debt fallback)", fallback_gas=4000000)
         if receipt["status"] != 1:
-            print(f"  ✗ Borrow failed — aborting fallback sequence.")
+            print("  ✗ Borrow failed — aborting fallback sequence.")
             return
 
 
@@ -3207,7 +3219,7 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
             post_borrow_h = tv / td
             print(f"  Health after borrow: {post_borrow_h:.4f}")
             if post_borrow_h < 1.0:
-                print(f"  ⚠ Account is now insolvent! Repay or add collateral immediately.")
+                print("  ⚠ Account is now insolvent! Repay or add collateral immediately.")
 
         # Step 2: Swap to_sym -> from_sym via yak
         print("── Step 2/3: Swap (yak) ──")
@@ -3219,7 +3231,7 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
                                 Web3.to_checksum_address(a)).call()]
         if not_whitelisted2:
             print(f"  ✗ Route changed — adapters now non-whitelisted: {', '.join(not_whitelisted2)}. Aborting.")
-            print(f"    Steps completed: 1 (borrow). You may need to manually swap & repay.")
+            print("    Steps completed: 1 (borrow). You may need to manually swap & repay.")
             return
         swap_payload2 = build_redstone_payload(prime_account_price_feeds(account))
         base_swap = account.encode_abi("yakSwap", args=[
@@ -3234,8 +3246,8 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         }
         receipt2 = _sign_and_send(w3, acct, tx2, "Swap (swap-debt fallback)", fallback_gas=3000000)
         if receipt2["status"] != 1:
-            print(f"  ✗ Swap failed — aborting fallback sequence.")
-            print(f"  Steps completed: 1 (borrow). You may need to manually swap & repay.")
+            print("  ✗ Swap failed — aborting fallback sequence.")
+            print("  Steps completed: 1 (borrow). You may need to manually swap & repay.")
             return
         print(f"  ✓ Swapped {to_sym} -> {from_sym}")
         print(f"  Tx: {EXPLORER}/tx/{tx_hash2.hex()}")
@@ -3249,7 +3261,7 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
         if actual_reply == 0:
             print(f"  ✗ No {from_sym} available to repay (balance={in_acct_wei/10**from_cfg['decimals']:.6f}, "
                   f"debt={debt_wei/10**from_cfg['decimals']:.6f}). Swap output may have been below debt.")
-            print(f"  Steps completed: 1 (borrow), 2 (swap).")
+            print("  Steps completed: 1 (borrow), 2 (swap).")
             return
         cap_notes = []
         if actual_reply < repay_amount:
@@ -3266,10 +3278,10 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
             "nonce": w3.eth.get_transaction_count(acct.address),
             "chainId": CHAIN_ID,
         }
-        receipt3 = _sign_and_send(w3, acct, tx3, f"Repaid (swap-debt fallback)", fallback_gas=4000000)
+        receipt3 = _sign_and_send(w3, acct, tx3, "Repaid (swap-debt fallback)", fallback_gas=4000000)
         ok3 = receipt3["status"] == 1
         if not ok3:
-            print(f"  Steps completed: 1 (borrow), 2 (swap). Repay failed — check manually.")
+            print("  Steps completed: 1 (borrow), 2 (swap). Repay failed — check manually.")
         else:
             print(f"\n✓ All 3 steps completed. {from_sym} debt refinanced to {to_sym}.")
         return
@@ -4417,10 +4429,10 @@ def cmd_lb_add(pair_key: str, amount_x: float, amount_y: float, shape: str = "sp
     # Distribution summary: show the non-zero weighting per side as percentages.
     if has_x:
         xs = [(active_id + d, dist_x[i] / LB_ONE * 100) for i, d in enumerate(deltas) if dist_x[i] > 0]
-        print(f"    distributionX: " + ", ".join(f"{bid}:{pct:.1f}%" for bid, pct in xs))
+        print("    distributionX: " + ", ".join(f"{bid}:{pct:.1f}%" for bid, pct in xs))
     if has_y:
         ys = [(active_id + d, dist_y[i] / LB_ONE * 100) for i, d in enumerate(deltas) if dist_y[i] > 0]
-        print(f"    distributionY: " + ", ".join(f"{bid}:{pct:.1f}%" for bid, pct in ys))
+        print("    distributionY: " + ", ".join(f"{bid}:{pct:.1f}%" for bid, pct in ys))
     print(f"  Bins: {len(owned_here)} already owned on this pair, {new_bins} net-new "
           f"-> projected total {projected} / {TJ_MAX_BINS}")
     if projected > TJ_MAX_BINS:
@@ -4904,16 +4916,16 @@ def cmd_prime_activate(amount: float = None, execute: bool = False):
     if deposit_wei:
         print(f"  Step 1: approve + depositPrime({deposit_wei}) "
               f"({deposit_wei / 10**PRIME_TOKEN['decimals']:,.6f} PRIME from wallet, RedStone-gated)")
-        print(f"  Step 2: stakePrimeAndActivatePremium()")
+        print("  Step 2: stakePrimeAndActivatePremium()")
     else:
-        print(f"  Step 1: stakePrimeAndActivatePremium() (stakes from in-account PRIME; no deposit)")
+        print("  Step 1: stakePrimeAndActivatePremium() (stakes from in-account PRIME; no deposit)")
 
     if required is not None and projected_in_acct < required:
         print(f"  ✗ Projected in-account PRIME "
               f"({projected_in_acct / 10**PRIME_TOKEN['decimals']:,.6f}) is below the required stake "
               f"({required / 10**PRIME_TOKEN['decimals']:,.6f}). stakePrimeAndActivatePremium would "
               "revert 'Insufficient PRIME balance'.")
-        print(f"  Deposit more PRIME first: deltaprime.py prime-activate --amount <N> --execute")
+        print("  Deposit more PRIME first: deltaprime.py prime-activate --amount <N> --execute")
         return
 
     if not execute:
@@ -5134,10 +5146,10 @@ def cmd_prime_bridge(from_chain: str = "arb", amount: float = None, execute: boo
     print(f"  LZ fee:    {w3.from_wei(native_fee, 'ether')} {src_cfg['native']}")
 
     if not execute:
-        print(f"\n  Steps:")
+        print("\n  Steps:")
         print(f"    1. approve bridge target ({src_cfg['bridge_target'][:12]}...) for {amount} PRIME")
         print(f"    2. sendFrom() via LZ to chain {dst_cfg['lz_chain_id']}")
-        print(f"  Run with --execute to broadcast")
+        print("  Run with --execute to broadcast")
         return
 
     if bal < amount_wei:
@@ -5174,7 +5186,7 @@ def cmd_prime_bridge(from_chain: str = "arb", amount: float = None, execute: boo
         [wallet, dst_cfg["lz_chain_id"],
          bytes.fromhex(wallet.lower()[2:].rjust(64, "0")), amount_wei, call_params]).hex()
 
-    print(f"  sendFrom() via LayerZero...")
+    print("  sendFrom() via LayerZero...")
     tx = {"from": wallet, "to": bridge_target, "data": bytes.fromhex(calldata_hex),
           "gas": 500000, "value": native_fee,
           "nonce": w3.eth.get_transaction_count(wallet), "chainId": src_chain_id}
@@ -5489,7 +5501,7 @@ def cmd_zap(market: str, collateral_pool: str, collateral_amount: float, borrow_
           f"{swap_note}")
     print(f"  {len(legs)} tx(s). Optimal path: auto-selected side={side}"
           + (f" (match collateral {collateral_sym}). No swap needed." if not needs_swap
-             else f" (swapping only the long-leg portion)."))
+             else " (swapping only the long-leg portion)."))
     print("  Ordered plan:")
     for label, _fn, gated, note in legs:
         print(f"    {label}   [{'RedStone-gated' if gated else 'not gated'}]")

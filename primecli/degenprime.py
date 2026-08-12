@@ -126,7 +126,12 @@ position (a NEW tokenId) when price drifts past the trigger. Subcommands:
             primitive; not solvency-gated (no RedStone).
 """
 
-import json, os, sys, time, random, base64
+import json
+import os
+import sys
+import time
+import random
+import base64
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from pathlib import Path
 import requests
@@ -200,7 +205,7 @@ _CLI_KEY = None  # set by the --key CLI flag in main()
 # The map and its readers live in primecli._wallets as the single source of
 # truth; re-exported here so existing references (degenprime.AGENTS, etc.) and
 # resolve_private_key() below keep working unchanged.
-from primecli._wallets import AGENTS, _read_env_var, _agent_key  # noqa: E402
+from primecli._wallets import _agent_key  # noqa: E402
 from primecli import _flowledger  # noqa: E402
 _SELECTED_AGENT = None        # set by the --as CLI flag in main()
 
@@ -571,7 +576,14 @@ def get_w3():
     global _W3
     if _W3 is not None:
         return _W3
-    candidates = [BASE_RPC] + [u for u in _BASE_RPC_FALLBACKS if u != BASE_RPC]
+    # When routing through the local RPC proxy (127.0.0.1:8545), fail closed —
+    # don't fall back to hardcoded public endpoints. The proxy handles upstream
+    # rotation (Alchemy -> DRPC key-gated -> publicnode) with health tracking.
+    # Bypassing it would hit public 429s instead of our paid fallback.
+    _proxy_rpc = "127.0.0.1" in BASE_RPC or "localhost" in BASE_RPC
+    candidates = [BASE_RPC]
+    if not _proxy_rpc:
+        candidates += [u for u in _BASE_RPC_FALLBACKS if u != BASE_RPC]
     last_exc = None
     for attempt, url in enumerate(candidates * 2):  # At most 2 rounds through the list
         try:
@@ -3037,12 +3049,12 @@ def cmd_summary(as_json: bool = False):
             print(f"  Health (0-100%): {_hp['health_pct']:.1f}%")
             print(f"    (supplied=${_hp['supplied_usd']:.2f}, debt=${_hp['debt_usd']:.2f},"
                   f" equity=${_hp['equity']:.2f}, max_debt=${_hp['max_debt']:.2f}, {_hp.get('tier','')})")
-            print(f"    0%=liquidation  50%=half borrowing power used  100%=no debt")
+            print("    0%=liquidation  50%=half borrowing power used  100%=no debt")
         elif solvency["ratio"] is not None:
             r = solvency["ratio"]
             print(f"  Collateral/Debt:   {r:.4f}x  (chain ratio; 1.0 = liquidation)")
         else:
-            print(f"  Health:            N/A (RedStone unavailable)")
+            print("  Health:            N/A (RedStone unavailable)")
         # An account with no debt cannot be liquidated. isSolvent() can come back
         # None on a no-debt account (empty multicall leg), which used to render a
         # misleading "NO - liquidatable" despite ratio >1000 and ~$0 debt. Treat
@@ -3502,7 +3514,7 @@ def _paraswap_decode_and_check(selector_hex, data_bytes, src_token, dest_token, 
         fee_bps = partner_and_fee & 0x3FFF
         if executor.lower() not in PARASWAP_EXECUTORS:
             print(f"  ⚠ ParaSwap executor {executor} not in the KNOWN whitelist - the on-chain facet")
-            print(f"    may reject it with InvalidExecutor(). Proceeding anyway; verify on-chain.")
+            print("    may reject it with InvalidExecutor(). Proceeding anyway; verify on-chain.")
         if partner != 0 or fee_bps != 0:
             raise RuntimeError(f"ParaSwap calldata carries a non-zero partner/fee "
                                f"(partner={hex(partner)}, feeBps={fee_bps}); the facet would revert. Refusing.")
@@ -5042,7 +5054,7 @@ def _aero_use_all_available(
 
     # 7. Report non-pool sweeps
     if sweeps:
-        print(f"\n  Non-pool assets with >$5 value to sweep:")
+        print("\n  Non-pool assets with >$5 value to sweep:")
         for sym, bal in sorted(sweeps.items()):
             meta = _swap_asset_meta(w3, sym)
             if meta:
@@ -5063,7 +5075,7 @@ def _aero_use_all_available(
     # exactly as it does for RedStone-priced ones.
     _bal0_now = pool0_bal_wei
     _bal1_now = pool1_bal_wei
-    print(f"\n  Pool-token balancing (computed from on-chain pool tick, no oracle):")
+    print("\n  Pool-token balancing (computed from on-chain pool tick, no oracle):")
     print(f"    current : {sym0} {_bal0_now / 10**dec0:.6f}  {sym1} {_bal1_now / 10**dec1:.6f}")
     print(f"    target  : {sym0} {total0_wei / 10**dec0:.6f}  {sym1} {total1_wei / 10**dec1:.6f}")
     _bswap0 = total0_wei - _bal0_now
@@ -5075,7 +5087,7 @@ def _aero_use_all_available(
         print(f"    swap    : sell {abs(_bswap0) / 10**dec0:.6f} {sym0} -> {sym1} "
               f"(toward the range ratio)")
     else:
-        print(f"    swap    : none (already within range ratio)")
+        print("    swap    : none (already within range ratio)")
 
     # 8. Execute swaps if requested
     if execute and sweeps:
@@ -5188,11 +5200,11 @@ def cmd_aero_add_liquidity(pool_key: str, amount0: float = None,
                               f"'{pool_key}' (tokenId {_ids}). `aero-add-liquidity --use-all-available` "
                               f"mints a SEPARATE, DUPLICATE NFT instead of growing it (only one of which "
                               f"the auto-rebalancer would be armed on).")
-                        print(f"   To ADD to the existing position, use:")
+                        print("   To ADD to the existing position, use:")
                         print(f"     degenprime aero-increase-liquidity --pool {pool_key} "
                               f"--token-id {_existing[0]} --amount-token0 X --amount-token1 Y [--execute]")
-                        print(f"   To intentionally open a SECOND position anyway, re-run with "
-                              f"--allow-duplicate.")
+                        print("   To intentionally open a SECOND position anyway, re-run with "
+                              "--allow-duplicate.")
                         sys.exit(2)
             except SystemExit:
                 raise
@@ -5280,7 +5292,7 @@ def _cmd_aero_add_liquidity_manual(pool_key, amount0, amount1, slippage_pct, exe
         print(f"  Tick range: [{tick_lower}, {tick_upper}]")
         print(f"  Width: +/-{width_pct}%")
     else:
-        print(f"  Full-range position (no price data available)")
+        print("  Full-range position (no price data available)")
     print(f"  {sym0}: {fmt_token_amount(amt0, pool_cfg['decimals0'])}  "
           f"{sym1}: {fmt_token_amount(amt1, pool_cfg['decimals1'])}")
 
@@ -5538,7 +5550,7 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
         return
 
     print(f"\n  {"=" * 60}")
-    print(f"  DEPLOY PLAN")
+    print("  DEPLOY PLAN")
     print(f"  {"=" * 60}")
     print(f"  Pool: {sym0}/{sym1} (tickSpacing={pool_cfg['tickSpacing']})")
     print(f"  Tick range: [{tick_lower}, {tick_upper}] (width: +/-{width_pct}%)")
@@ -5546,7 +5558,7 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
     print(f"  {sym1}: {fmt_token_amount(amt1, dec1)}")
 
     if not execute:
-        print(f"\n  Preview only. Run with --execute to broadcast swaps + mint.")
+        print("\n  Preview only. Run with --execute to broadcast swaps + mint.")
         return
 
     # Execute: run swaps then mint
@@ -5613,7 +5625,7 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
     params = _aero_mint_params(pool_cfg, amt0, amt1, tick_lower, tick_upper,
                                pool_tick, slippage_pct)
 
-    print(f"\n  Minting position:")
+    print("\n  Minting position:")
     print(f"    {sym0}: {fmt_token_amount(amt0, dec0)}")
     print(f"    {sym1}: {fmt_token_amount(amt1, dec1)}")
 
@@ -5727,7 +5739,7 @@ def cmd_aero_rebuild(token_id: int, width_pct: float = 2.0, slippage_pct: float 
     # withdraw by the same address. Sleep 14s to ensure the cooldown has elapsed
     # before the mint+stake in Step 3, even when the sweep step has no swaps.
     if pool_cfg.get("slipstreamVersion", 0) >= 1 and execute:
-        print(f"  V3 gauge anti-sniping: waiting 14s before re-staking...")
+        print("  V3 gauge anti-sniping: waiting 14s before re-staking...")
         import time
         time.sleep(14)
 
@@ -5923,21 +5935,21 @@ def cmd_aero_increase_liquidity(pool_key: str, token_id: int,
     sim_ok, sim_info = _aero_simulate_call(w3, acct.address, account.address, calldata)
     if not sim_ok:
         err_str = str(sim_info)
-        print(f"  Simulation reverted — aborting before broadcast.")
+        print("  Simulation reverted — aborting before broadcast.")
         # Decode common revert reasons for actionable guidance
         if "PSC" in err_str or "08c379a0" in err_str:
-            print(f"  → Reason: Price Slippage Control (PSC).")
-            print(f"    This means the amounts consumed by the NPM fell below the mínimums.")
-            print(f"    Common causes:")
-            print(f"    1. One side's fitted amount is tiny (< 100 wei) — NPM rounding consumes less.")
-            print(f"       Fix: use aero-rebuild to open a fresh position with more balanced amounts.")
-            print(f"    2. Pool tick moved between preview and execution.")
-            print(f"       Fix: re-run the command for fresh fitted amounts.")
-            print(f"    3. Slippage too tight. Try --slippage 2 or higher.")
+            print("  → Reason: Price Slippage Control (PSC).")
+            print("    This means the amounts consumed by the NPM fell below the mínimums.")
+            print("    Common causes:")
+            print("    1. One side's fitted amount is tiny (< 100 wei) — NPM rounding consumes less.")
+            print("       Fix: use aero-rebuild to open a fresh position with more balanced amounts.")
+            print("    2. Pool tick moved between preview and execution.")
+            print("       Fix: re-run the command for fresh fitted amounts.")
+            print("    3. Slippage too tight. Try --slippage 2 or higher.")
         elif "no data" in err_str.lower() or "0x" in err_str:
-            print(f"  → The Aerodrome NPM rejected the call (usually single-sided increase")
-            print(f"    while the position is in-range, requiring both token sides).")
-            print(f"    Use aero-rebuild to remove and re-deploy the position instead.")
+            print("  → The Aerodrome NPM rejected the call (usually single-sided increase")
+            print("    while the position is in-range, requiring both token sides).")
+            print("    Use aero-rebuild to remove and re-deploy the position instead.")
         else:
             print(f"  → Error: {sim_info}")
         sys.exit(2)
@@ -6166,9 +6178,9 @@ def cmd_aero_collect_fees(token_id: int, execute: bool = False):
         if owed0 > 0 or owed1 > 0:
             print(f"  Uncollected fees: {owed0} ({sym0}) + {owed1} ({sym1})")
         else:
-            print(f"  No uncollected fees.")
+            print("  No uncollected fees.")
     except Exception:
-        print(f"  (Cannot fetch uncollected fees from NPM directly)")
+        print("  (Cannot fetch uncollected fees from NPM directly)")
 
     if not execute:
         print("Preview only. Run with --execute to broadcast.")
@@ -6769,8 +6781,8 @@ def cmd_aero_rebalance_create(token_id: int, width_pct: float, mode: str = "outs
                 _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, execute=execute, reserve=reserve)
                 if pool_key.endswith("-v3"):
                     print(f"  (Note: {pool_key} is a Gauges-V3 pool with a 10-second")
-                    print(f"  anti-sniping cooldown. The protocol's executor should handle")
-                    print(f"  this; off-chain rebuilds via `aero-rebuild` also respect it.")
+                    print("  anti-sniping cooldown. The protocol's executor should handle")
+                    print("  this; off-chain rebuilds via `aero-rebuild` also respect it.")
 
     try:
         params, preview = _build_rebalance_order_params(

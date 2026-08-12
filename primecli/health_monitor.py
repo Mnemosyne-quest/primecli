@@ -30,7 +30,6 @@ Strategy config (JSON):
 
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -433,6 +432,34 @@ def save_stop_loss_streak(state_dir: str, n: int):
     path = Path(state_dir) / "stop-loss-streak"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(n))
+
+
+# ── Rebalance convergence: continue acting until close to center ──────────
+_REBALANCE_CONVERGE_TOLERANCE = 10  # pp from center before we declare "converged"
+
+
+def _write_rebalance_converge(state_dir: str, target_pct: float):
+    """Write marker: a rebalance action was taken, continue converging to target_pct."""
+    path = Path(state_dir) / "rebalance-converge"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(target_pct))
+
+
+def _load_rebalance_converge(state_dir: str) -> float | None:
+    """Load the convergence target, or None if no active convergence."""
+    path = Path(state_dir) / "rebalance-converge"
+    if path.exists():
+        try:
+            return float(path.read_text().strip())
+        except (ValueError, OSError):
+            path.unlink(missing_ok=True)
+            return None
+    return None
+
+
+def _clear_rebalance_converge(state_dir: str):
+    """Clear the convergence marker (converged or no longer needed)."""
+    Path(state_dir / "rebalance-converge").unlink(missing_ok=True)
 
 
 
@@ -956,7 +983,7 @@ def run_tick(
         Dict with tick result.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
-    result = {"ts": now_iso, "label": label, "mode": "observer"}
+    result = {"ts": now_iso, "label": label, "mode": "rebalance"}
 
     # 1. Fetch account state
     try:
@@ -998,7 +1025,7 @@ def run_tick(
 
     # 4. Load strategy (do this early so rebalance mode is known before equity checks)
     strategy = load_strategy(strategy_path)
-    mode = strategy.get("mode", "observer")
+    mode = strategy.get("mode", "rebalance")
     health["mode"] = mode
     result.update(health)
     result["mode"] = mode
@@ -1234,10 +1261,30 @@ def run_tick(
         target_debt = max(health["max_debt"], 0) * (1 - center / 100.0)
         delta = target_debt - debt
 
-        # ── In range → no action ──────────────────────────────────────
+        # ── In range → no action, UNLESS rebalance convergence is active ──
+        _converge_target = _load_rebalance_converge(state_dir)
         if low <= pct <= high:
-            result["action"] = "none"
-            return result
+            if _converge_target is not None and abs(pct - _converge_target) > _REBALANCE_CONVERGE_TOLERANCE:
+                result["converge"] = f"continuing toward {_converge_target:.0f}% (at {pct:.1f}%)"
+                result["converge_marker_active"] = True
+                result["converge_direction"] = "lever_up" if pct > _converge_target else "delever"
+                # Fall through: if above center, the lever-up logic (pct > high) fires.
+                # If below center, the de-lever logic (pct < low) fires.
+                # Neither condition is met (we're in [low, high]), so route manually.
+                # We need to borrow (lever-up) to bring health DOWN toward center.
+                # OR repay (delever) to bring health UP toward center.
+                if pct > _converge_target:
+                    # Health too high (under-levered) -> borrow more
+                    result["converge_direction"] = "lever_up"
+                else:
+                    # Health too low (over-levered) -> repay more
+                    result["converge_direction"] = "delever"
+            else:
+                if _converge_target is not None:
+                    _clear_rebalance_converge(state_dir)
+                    result["converge"] = "converged to target"
+                result["action"] = "none"
+                return result
 
 # ── De-lever ───────────────────────────────────────────────────
         # ── Hard floor: escalate immediately if critically low ──────────
@@ -1457,8 +1504,10 @@ def run_tick(
                             result["action"] = "escalate (debt remains after LP close)"
                             return result
 
-                        # Successful real de-lever (at least partial) — record cooldown.
+                        # Successful real de-lever (at least partial) — record cooldown
+                        # AND set convergence marker so subsequent ticks continue to center.
                         cooldown_file.write_text(str(int(time.time())))
+                        _write_rebalance_converge(state_dir, float(center))
 
                         # If pass-1 covered the need (or there's no USDC-pool shortfall to
                         # swap for), we're done.
