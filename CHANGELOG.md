@@ -4,6 +4,17 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.14.7] - 2026-08-13
+
+### Added
+- **Health-monitor defers its de-lever/lever action while the autofarm holds
+  its per-position lock** (2026-08-13 p2 dual de-lever collision: the
+  monitor's swap ran inside the converge's LP-removal window). When
+  `strategy.json` sets `defer_lock` (the autofarm's flock path), the monitor
+  tests the lock with `flock -n` before acting and skips to the next tick
+  when it is held. Fail-open on lock-check errors. Tests:
+  `tests/test_autofarm_lock.py`.
+
 ## [0.14.6] - 2026-08-13
 
 ### Fixed

@@ -963,6 +963,28 @@ def _check_pending_gmx_delever(state_dir: str, defi_data: dict, label: str) -> d
 # ════════════════════════════════════════════════════════════════════
 
 
+def _autofarm_lock_held(lock_path: str | None) -> bool:
+    """True when the autofarm holds its per-position flock (dispatcher mid-tick).
+
+    The account-health monitor and the defisims autofarm both act on the same
+    accounts; without this handshake they can fire de-lever/lever actions in
+    the same window (2026-08-13 p2: the monitor's swap collided with the
+    converge's LP removal). Deferring is safe — the autofarm re-evaluates
+    every 10 min. Configured per-account via `strategy.json` key
+    `defer_lock` (absolute path to the autofarm's flock file); None/absent
+    keeps the legacy behaviour. Fail-open on any error (never block a
+    critical action on a lock-check bug).
+    """
+    if not lock_path:
+        return False
+    try:
+        r = subprocess.run(["flock", "-n", lock_path, "-c", "true"],
+                           capture_output=True, text=True, timeout=15)
+        return r.returncode != 0
+    except Exception:
+        return False
+
+
 def run_tick(
     tool_path: str,
     strategy_path: str,
@@ -1298,6 +1320,12 @@ def run_tick(
             return result
 
         if pct < low:
+            # Defer to the autofarm when it holds its per-position lock (2026-08-13
+            # p2: the monitor's de-lever swap collided with the converge's LP
+            # removal in the same window). The autofarm re-evaluates every 10 min.
+            if _autofarm_lock_held(strategy.get("defer_lock")):
+                result["action"] = "deferred (autofarm lock held)"
+                return result
             repay_amt = abs(delta)
             if repay_amt < 1:
                 result["action"] = "none (repay too small)"
@@ -1676,6 +1704,11 @@ def run_tick(
 
         # ── Lever-up ───────────────────────────────────────────────────
         elif pct > high:
+            # Defer to the autofarm when it holds its per-position lock (2026-08-13
+            # p2 dual de-lever collision).
+            if _autofarm_lock_held(strategy.get("defer_lock")):
+                result["action"] = "deferred (autofarm lock held)"
+                return result
             if not lever_up_enabled:
                 result["action"] = "observe (lever-up disabled; strategy automation owns leverage)"
                 return result
