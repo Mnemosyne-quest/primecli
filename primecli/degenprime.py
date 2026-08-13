@@ -5004,6 +5004,15 @@ def _aero_use_all_available(
         if not valuable:
             print("  No available assets to deploy after reserve.")
             return False
+        # Re-apply the $5 dust floor: a reserve carve-out can leave a sub-$5
+        # non-pool remainder, and sweeping dust makes ParaSwap refuse the route
+        # (2026-08-13 p2 incident). Pool legs are exempt (they go into the LP).
+        valuable = _aero_resweep_dust_floor(
+            valuable, inventory,
+            {_account_asset_symbol(sym0), _account_asset_symbol(sym1)})
+        if not valuable:
+            print("  No available assets to deploy after reserve + dust floor.")
+            return False
 
     # 5. Identify non-pool assets (to sweep) and pool-token balances. Alias-aware
     # (EURC/EUROC) so the same underlying is never both a pool leg and a sweep
@@ -6784,6 +6793,38 @@ def _aero_rebalance_write(fn_name: str, params: tuple, preview: dict, label: str
 
 
 
+def _aero_resweep_dust_floor(valuable: dict, inventory: dict, pool_syms: set,
+                             min_usd: float = 5.0) -> dict:
+    """Re-apply the $5 dust floor AFTER a reserve carve-out.
+
+    `--reserve SYMBOL:FRACTION` keeps a fraction of an asset loose; the
+    REMAINDER can be dust (a ledger-derived AERO:0.999968 leaves $0.0004 of
+    AERO). Sweeping dust makes ParaSwap refuse the route ("Can't process
+    priceRoute with max impact reached") and aborts the WHOLE increase/mint
+    after the borrow+balance steps (live incident 2026-08-13 p2: the lever-up
+    borrowed $92, the increase failed on a $0.0004 AERO sweep, the unwind
+    left ~$46 of WETH debt half-repaid). Pool legs are exempt — they go
+    straight into the LP without a swap. Pure; returns the filtered dict.
+    """
+    out = {}
+    for sym, bal_wei in valuable.items():
+        if _account_asset_symbol(sym) in pool_syms:
+            out[sym] = bal_wei
+            continue
+        _inv = inventory.get(sym)
+        if not _inv:
+            out[sym] = bal_wei
+            continue
+        _total_wei = float(_inv[0]) or 0.0
+        if _total_wei <= 0:
+            out[sym] = bal_wei
+            continue
+        _usd_left = float(_inv[2] or 0.0) * (float(bal_wei) / _total_wei)
+        if _usd_left >= min_usd:
+            out[sym] = bal_wei
+    return out
+
+
 def _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg=None, execute=False, reserve=None):
     """Sweep idle assets >$5 into the pool's bottleneck token. Called by rebalance
     and rebuild paths so idle funds get deployed alongside the position.
@@ -6835,6 +6876,13 @@ def _aero_rebuild_sweep(w3, acct, account, pa_cs, pool_key, pool_cfg=None, execu
     # from this sweep, same as _aero_use_all_available's identical guard.
     if reserve:
         valuable = _aero_apply_reserve(valuable, reserve)
+        if not valuable:
+            return
+        # Re-apply the $5 dust floor: a reserve carve-out can leave a sub-$5
+        # remainder (AERO:0.999968 -> $0.0004), and sweeping dust makes ParaSwap
+        # refuse the route, aborting the whole increase (2026-08-13 p2 incident).
+        _pool_norm = {_account_asset_symbol(sym0), _account_asset_symbol(sym1)}
+        valuable = _aero_resweep_dust_floor(valuable, inventory, _pool_norm)
         if not valuable:
             return
 

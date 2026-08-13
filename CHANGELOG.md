@@ -4,6 +4,20 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.14.6] - 2026-08-13
+
+### Fixed
+- **Post-reserve dust sweeps abort the whole increase/mint** (live incident
+  2026-08-13, parakletos-2): the ledger-derived `--reserve AERO:0.999968`
+  left a 0.000947 AERO (~$0.0004) remainder that the sweep still tried to
+  swap — ParaSwap refused ("Can't process priceRoute with max impact
+  reached") and the entire lever-up increase aborted after the borrow +
+  balance steps, leaving ~$46 of WETH debt half-unwound and ~$45 of VIRTUAL
+  loose. `_aero_resweep_dust_floor` now re-applies the $5 dust floor AFTER
+  the reserve carve-out in both `_aero_rebuild_sweep` and
+  `_aero_build_deploy_plan` (pool legs exempt — they go into the LP without
+  a swap). Regression tests: `tests/test_aero_dust_floor.py`.
+
 ## [0.14.5] - 2026-08-13
 
 ### Fixed
