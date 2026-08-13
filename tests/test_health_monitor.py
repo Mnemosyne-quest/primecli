@@ -964,3 +964,31 @@ def test_stop_loss_defers_on_untrusted_deflation(tmp_path, monkeypatch):
     r2 = _tick(tmp_path, monkeypatch, _priced(1500, 1400, 15.0), strat, sd)
     assert r2.get("escalation") != "stop_loss", r2
     assert "deferred" in r2.get("action", ""), r2
+
+
+def test_clear_rebalance_converge_accepts_str_state_dir(tmp_path):
+    """v0.14.4 regression: _clear_rebalance_converge must accept a str state_dir
+    (2026-08-12 parakletos-2 incident — `Path(state_dir / ...)` raised
+    `TypeError: unsupported operand type(s) for /: 'str' and 'str'` on the
+    converged-in-range branch, leaving the marker stuck and every in-range
+    tick aborting for hours)."""
+    sd = tmp_path / "state"
+    sd.mkdir()
+    marker = sd / "rebalance-converge"
+    marker.write_text("50.0")
+    hm._clear_rebalance_converge(str(sd))  # str dir (what run_tick passes)
+    assert not marker.exists()
+    marker.write_text("50.0")
+    hm._clear_rebalance_converge(sd)  # Path dir also works
+    assert not marker.exists()
+    hm._clear_rebalance_converge(str(sd))  # missing_ok: absent marker is fine
+
+
+def test_rebalance_converge_write_load_clear_roundtrip(tmp_path):
+    """Write -> load -> clear roundtrip through the real helpers (str dir)."""
+    sd = tmp_path / "state"
+    sd.mkdir()
+    hm._write_rebalance_converge(str(sd), 50.0)
+    assert hm._load_rebalance_converge(str(sd)) == 50.0
+    hm._clear_rebalance_converge(str(sd))
+    assert hm._load_rebalance_converge(str(sd)) is None

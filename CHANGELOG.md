@@ -4,6 +4,19 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.14.4] - 2026-08-13
+
+### Fixed
+- **Health monitor crash on the converged-in-range branch** (live incident
+  2026-08-12, parakletos-2): `_clear_rebalance_converge` did
+  `Path(state_dir / "rebalance-converge")` where `state_dir` is a `str` —
+  `TypeError: unsupported operand type(s) for /: 'str' and 'str'`. Any tick
+  that reached "converged to target" aborted, the marker was never cleared,
+  and every subsequent in-range tick crashed the same way (71 failures in the
+  account-health log before the fix). Now `Path(state_dir) / ...` like its
+  sibling `_load_rebalance_converge`. Regression tests added for the str/Path
+  dir and the write/load/clear roundtrip.
+
 ## [0.14.3] - 2026-08-12
 
 ### Fixed

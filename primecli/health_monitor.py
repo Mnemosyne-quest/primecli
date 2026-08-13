@@ -459,7 +459,7 @@ def _load_rebalance_converge(state_dir: str) -> float | None:
 
 def _clear_rebalance_converge(state_dir: str):
     """Clear the convergence marker (converged or no longer needed)."""
-    Path(state_dir / "rebalance-converge").unlink(missing_ok=True)
+    (Path(state_dir) / "rebalance-converge").unlink(missing_ok=True)
 
 
 
