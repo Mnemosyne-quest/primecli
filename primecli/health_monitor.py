@@ -1630,14 +1630,43 @@ def run_tick(
                 )
                 if r.returncode == 0:
                     cooldown_file.write_text(str(int(time.time())))
-                    result["action"] = f"repaid ${repay_amt:.2f}"
-                    new_debt_after = max(0.0, debt - repay_amt)
+                    # Report the ACTUAL execution, not the request (2026-08-13 p2:
+                    # the notify claimed $248.14 repaid "from raw USDC, no swap"
+                    # while the chain shows a VIRTUAL swap and only $143.11 landed
+                    # — the repay is capped by the available USDC balance). Re-read
+                    # the debt and reconcile; also reflect any swap run this tick.
+                    debt_actual = None
+                    try:
+                        raw4 = subprocess.run(
+                            [sys.executable, tool_path, "defi", "--json"],
+                            capture_output=True, text=True, timeout=90,
+                        )
+                        if raw4.returncode == 0:
+                            borrowed4 = _gather_borrow_rows(json.loads(raw4.stdout))
+                            debt_actual = sum((b.get("usd", 0) or 0) for b in borrowed4)
+                    except Exception:
+                        pass
+                    if debt_actual is not None:
+                        repaid_actual = max(0.0, debt - debt_actual)
+                        new_debt_after = max(0.0, debt_actual)
+                    else:
+                        repaid_actual = repay_amt
+                        new_debt_after = max(0.0, debt - repay_amt)
+                    capped = repaid_actual < repay_amt - 0.5
+                    swap_note = result.get("swap")
+                    source_note = (f"swapped {swap_note} + raw USDC"
+                                   if swap_note else "raw USDC balance")
                     new_health_pct = min(100.0, max(0.0, 100 * (1 - new_debt_after / (max_mult * equity)))) if max_mult > 0 and equity > 0.01 else 0.0
+                    result["action"] = (f"repaid ${repaid_actual:.2f}"
+                                        + (f" of ${repay_amt:.2f} (capped by available USDC)"
+                                           if capped else ""))
                     _notify(
                         f"✅ DE-LEVER — {label}:\n"
-                        f"  Repaid: ${repay_amt:.2f} USDC\n"
+                        f"  Repaid: ${repaid_actual:.2f} USDC"
+                        + (f" of ${repay_amt:.2f} requested — shortfall re-evaluated next tick"
+                           if capped else "") + "\n"
                         f"  Pre-health: {pct}% → {new_health_pct:.1f}%\n"
-                        f"  Source: raw USDC balance (no swap needed)\n"
+                        f"  Source: {source_note}\n"
                         f"  Debt reduced: ${debt:.2f} → ${new_debt_after:.2f}"
                     )
                 else:

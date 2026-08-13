@@ -4,6 +4,19 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.14.5] - 2026-08-13
+
+### Fixed
+- **Health-monitor DE-LEVER notification reported the plan, not the execution**
+  (live incident 2026-08-13, parakletos-2): the notify claimed "Repaid:
+  $248.14 USDC / Source: raw USDC balance (no swap needed) / Debt reduced:
+  $723.51 → $475.37" while the chain shows a VIRTUAL→USDC swap and only
+  $143.11 landed (the repay is capped by the available USDC). The monitor now
+  re-reads the on-chain debt after the repay, reports the ACTUAL amount (with
+  an explicit "of $X requested — shortfall re-evaluated next tick" when
+  capped), the actual post-debt, and reflects any swap run this tick in the
+  source line. `result["action"]` carries the actual amount too.
+
 ## [0.14.4] - 2026-08-13
 
 ### Fixed
