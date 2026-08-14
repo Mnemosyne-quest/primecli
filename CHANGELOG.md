@@ -4,6 +4,30 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.14.8] - 2026-08-14
+
+### Fixed
+- **Health-monitor DE-LEVER notification projected post-repay health with
+  the TIER_MAX table constant (basic=5) instead of the on-chain meter**
+  (live incident 2026-08-14, parakletos-2: the message read "Pre-health
+  29.5% -> 15.2%" while the real meter read 29.5 -> 30.3). The notification
+  now reports the post-repay `defi --json` health read, falling back to the
+  meter-derived `max_debt` — never the tier constant.
+- **Health-monitor swap passed a USD value as `swap --amount` (SOURCE TOKEN
+  units)** (live incident 2026-08-14, parakletos-2: "$11.44 AERO -> USDC"
+  swapped 11.44 AERO *tokens* (~$4.81) of a $182 de-lever need, and re-fired
+  three times, consuming ~$9.45 of AERO). The USD->token conversion now
+  uses the candidate's own usd/raw ratio in both the raw-asset swap path
+  and the pass-2 LP-close swap path.
+- **Dropped the double "swapped " prefix** in the DE-LEVER source note
+  (the swap note already contained "swapped ...").
+- **Health-monitor nibbles dust instead of de-levering when an autofarm is
+  wired** (2026-08-14): when the swappable raw-asset pile is < 25% of the
+  shortfall and health is >= 15%, the monitor now defers the LP-collateral
+  de-lever to the autofarm converge (via `defer_lock`) instead of running
+  token-sized swaps. Critical health (<15%) and no-autofarm setups still
+  action locally. Controlled by `strategy.lp_close_defer_to_autofarm`.
+
 ## [0.14.7] - 2026-08-13
 
 ### Added
