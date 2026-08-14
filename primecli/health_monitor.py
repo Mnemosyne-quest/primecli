@@ -1382,6 +1382,8 @@ def run_tick(
 
                 swap_source = None
                 swap_amt_usd = 0.0
+                swap_tokens = 0.0
+                swap_unit_usd = 0.0
                 need_usd = repay_amt - raw_usdc
                 # Prefer swap_target if set, otherwise largest supplied asset
                 if swap_target:
@@ -1389,10 +1391,35 @@ def run_tick(
                         if sym.upper() == swap_target.upper():
                             swap_source = sym
                             swap_amt_usd = min(usd_val * 0.95, need_usd)
+                            swap_unit_usd = usd_val / raw_amt if raw_amt > 0 else 0.0
+                            swap_tokens = (swap_amt_usd / swap_unit_usd
+                                           if swap_unit_usd > 0 else 0.0)
                             break
                 if swap_source is None and swap_candidates:
-                    swap_source = swap_candidates[0][0]
-                    swap_amt_usd = min(swap_candidates[0][1] * 0.95, need_usd)
+                    _s0 = swap_candidates[0]
+                    swap_source = _s0[0]
+                    swap_amt_usd = min(_s0[1] * 0.95, need_usd)
+                    swap_unit_usd = _s0[1] / _s0[2] if _s0[2] > 0 else 0.0
+                    swap_tokens = (swap_amt_usd / swap_unit_usd
+                                   if swap_unit_usd > 0 else 0.0)
+
+                # ── Defer to the autofarm when the de-lever really needs LP collateral ──
+                # (2026-08-14 p2): a dust raw-asset pile (swappable USD far below the
+                # shortfall) must not trigger a token-sized swap that "repays" $4.81 of a
+                # $182 need while the collateral is locked in the LP NFT. When an autofarm
+                # is wired (defer_lock) and health is not critical, the LP-freeing de-lever
+                # is the autofarm converge's job (it frees LP collateral, repays AND
+                # re-mints). The monitor still acts itself on critical health (<15%) or
+                # when no autofarm exists (strategy.lp_close_defer_to_autofarm=false).
+                _swappable_usd = sum(u for _, u, _ in swap_candidates)
+                if (_swappable_usd < 0.25 * need_usd and pct is not None and pct >= 15.0
+                        and strategy.get("lp_close_defer_to_autofarm", True)
+                        and strategy.get("defer_lock")):
+                    result["action"] = (
+                        f"deferring LP-close de-lever to the autofarm converge "
+                        f"(swappable raw ${_swappable_usd:.2f} < 25% of the ${need_usd:.2f} "
+                        f"shortfall; LP collateral freeing is the converge's path)")
+                    return result
 
                 if swap_source and swap_amt_usd >= 0.50 and dry_run:
                     # Dry-run must broadcast NOTHING — report the swap+repay it WOULD do.
@@ -1407,7 +1434,7 @@ def run_tick(
                         sr = subprocess.run(
                             [sys.executable, tool_path, "swap",
                              "--from", swap_source, "--to", "USDC",
-                             "--amount", f"{swap_amt_usd:.2f}",
+                             "--amount", f"{swap_tokens:.6f}",
                              "--slippage", "1.0", "--execute"],
                             capture_output=True, text=True, timeout=180,
                         )
@@ -1568,6 +1595,9 @@ def run_tick(
                             return result
                         src2 = swap_candidates2[0][0]
                         amt2 = min(swap_candidates2[0][1] * 0.95, usdc_shortfall)
+                        amt2_tokens = (amt2 / (swap_candidates2[0][1] / swap_candidates2[0][2])
+                                       if swap_candidates2[0][1] > 0
+                                       and swap_candidates2[0][2] > 0 else 0.0)
                         if amt2 < 0.50:
                             result["action"] = (
                                 f"repaid ${repaid_usd:.2f}; ${usdc_shortfall:.2f} USDC shortfall "
@@ -1578,7 +1608,7 @@ def run_tick(
                             sr2 = subprocess.run(
                                 [sys.executable, tool_path, "swap",
                                  "--from", src2, "--to", "USDC",
-                                 "--amount", f"{amt2:.2f}",
+                                 "--amount", f"{amt2_tokens:.6f}",
                                  "--slippage", "1.0", "--execute"],
                                 capture_output=True, text=True, timeout=180,
                             )
@@ -1664,14 +1694,20 @@ def run_tick(
                     # — the repay is capped by the available USDC balance). Re-read
                     # the debt and reconcile; also reflect any swap run this tick.
                     debt_actual = None
+                    post_health = None
                     try:
                         raw4 = subprocess.run(
                             [sys.executable, tool_path, "defi", "--json"],
                             capture_output=True, text=True, timeout=90,
                         )
                         if raw4.returncode == 0:
-                            borrowed4 = _gather_borrow_rows(json.loads(raw4.stdout))
+                            defi4 = json.loads(raw4.stdout)
+                            borrowed4 = _gather_borrow_rows(defi4)
                             debt_actual = sum((b.get("usd", 0) or 0) for b in borrowed4)
+                            try:
+                                post_health = float(defi4.get("health_pct"))
+                            except (TypeError, ValueError):
+                                post_health = None
                     except Exception:
                         pass
                     if debt_actual is not None:
@@ -1682,9 +1718,20 @@ def run_tick(
                         new_debt_after = max(0.0, debt - repay_amt)
                     capped = repaid_actual < repay_amt - 0.5
                     swap_note = result.get("swap")
-                    source_note = (f"swapped {swap_note} + raw USDC"
+                    source_note = (f"{swap_note} + raw USDC"
                                    if swap_note else "raw USDC balance")
-                    new_health_pct = min(100.0, max(0.0, 100 * (1 - new_debt_after / (max_mult * equity)))) if max_mult > 0 and equity > 0.01 else 0.0
+                    # Post-repay health: report the REAL meter read, never the
+                    # tier-table model projection. The decision math above uses
+                    # max_debt = debt/(1-pct/100) (meter-derived); projecting
+                    # with TIER_MAX max_mult (basic=5) contradicts it
+                    # (p2 2026-08-14: projected 15.2% while the meter read
+                    # 29.5 -> 30.3). Fallback: the same meter-derived max_debt.
+                    if post_health is not None:
+                        new_health_pct = min(100.0, max(0.0, post_health))
+                    elif result.get("max_debt"):
+                        new_health_pct = min(100.0, max(0.0, 100 * (1 - new_debt_after / result["max_debt"])))
+                    else:
+                        new_health_pct = None
                     result["action"] = (f"repaid ${repaid_actual:.2f}"
                                         + (f" of ${repay_amt:.2f} (capped by available USDC)"
                                            if capped else ""))
@@ -1693,7 +1740,9 @@ def run_tick(
                         f"  Repaid: ${repaid_actual:.2f} USDC"
                         + (f" of ${repay_amt:.2f} requested — shortfall re-evaluated next tick"
                            if capped else "") + "\n"
-                        f"  Pre-health: {pct}% → {new_health_pct:.1f}%\n"
+                        f"  Pre-health: {pct}%"
+                        + (f" → {new_health_pct:.1f}%" if new_health_pct is not None
+                           else " → n/a (post-repay re-read failed)") + "\n"
                         f"  Source: {source_note}\n"
                         f"  Debt reduced: ${debt:.2f} → ${new_debt_after:.2f}"
                     )
