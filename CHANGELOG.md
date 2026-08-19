@@ -4,6 +4,31 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.15.0] - 2026-08-19
+
+### Added
+- **`degenprime send --asset <a> --amount <n> --to 0x.. [--all] [--gas-reserve 0.0002] [--execute]`**
+  — EOA-to-EOA transfer of any pool asset (ERC20 or native ETH) on Base, signed
+  by the `--as`-selected wallet. `--all` sends the full ERC20 balance, or the
+  native balance minus `--gas-reserve` (default 0.0002 ETH) so the sender keeps
+  fuel. Preview by default; verifies the actual Transfer event from the receipt.
+  (Requested after the 2026-08-19 p2->p4 relocation required hand-rolled web3
+  transfer scripts.)
+- **`degenprime move --from <wallet> --to <wallet> --asset <a> [--gas-reserve 0.0002] [--execute]`**
+  — one-command position relocation: (1) execute matured withdrawal intents on
+  the FROM wallet's Degen Account, (2) send the full asset balance FROM EOA ->
+  TO EOA, (3) fund the TO EOA's Degen Account with it (approve + fund). Nothing
+  is rebuilt or re-levered. Preview by default; every broadcast gated by
+  `--execute`.
+
+### Fixed
+- **Broadcast retry now bump-and-replaces stale pending txs** — `_send_raw_with_nonce_retry`
+  handles `replacement transaction underpriced` (live 2026-08-19: deposit/fund
+  loops against a mempool tx invisible to the pending-block view on the local
+  RPC proxy) by raising fees ~50% on the SAME nonce and re-broadcasting,
+  bounded to 3 attempts with backoff. The `nonce too low` stale-read path is
+  unchanged.
+
 ## [0.14.8] - 2026-08-14
 
 ### Fixed

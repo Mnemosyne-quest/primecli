@@ -26,6 +26,8 @@ Usage:
   degenprime withdrawal-intents
   degenprime execute-withdrawal --pool usdc [--index N] [--execute]
   degenprime cancel-withdrawal --pool usdc --index N [--execute]
+  degenprime send --asset usdc --amount 100 --to 0x.. [--all] [--gas-reserve 0.0002] [--execute]
+  degenprime move --from parakletos-2 --to parakletos-4 --asset usdc [--gas-reserve 0.0002] [--execute]
   degenprime aerodrome-positions
   degenprime aero-add-liquidity --pool weth-usdc-100 --amount-token0 0.05 --amount-token1 100 [--slippage 1] [--execute]
   degenprime aero-add-liquidity --pool virtual-weth-50-v3 --amount-token0 100 --amount-token1 0.05 [--slippage 1] [--execute]
@@ -660,8 +662,8 @@ def _estimate_gas_limit(w3, tx_dict, fallback_gas: int, buffer_bps: int = 1250) 
     except Exception:
         return int(fallback_gas)
 
-def _send_raw_with_nonce_retry(w3, acct, tx, label):
-    """Sign + broadcast `tx`, retrying ONCE on a stale-nonce rejection.
+def _send_raw_with_nonce_retry(w3, acct, tx, label, max_attempts=3):
+    """Sign + broadcast `tx`, retrying on the two well-understood rejections.
 
     `get_w3()` caches a single RPC endpoint for the process lifetime, but public
     multi-node providers (publicnode, drpc — the ones in _BASE_RPC_FALLBACKS) often
@@ -673,21 +675,47 @@ def _send_raw_with_nonce_retry(w3, acct, tx, label):
     `aero-add-liquidity --use-all-available` sequence (swap confirms, then the
     immediately-following mint's broadcast rejects with exactly this error).
 
-    On that specific rejection: wait 3s for the lagging backend to catch up,
-    re-fetch the nonce, re-sign, and retry the broadcast once. Any other exception,
-    or a second failure, propagates unchanged — this is not a general retry-on-
-    any-error wrapper, only the one well-understood race. Returns the tx_hash."""
-    try:
-        signed = acct.sign_transaction(tx)
-        return w3.eth.send_raw_transaction(signed.raw_transaction)
-    except Exception as e:
-        if "nonce too low" not in str(e).lower():
-            raise
-        print(f"  {label}: stale nonce ({e}) — waiting for RPC to catch up, retrying once...")
-        time.sleep(3)
-        tx["nonce"] = w3.eth.get_transaction_count(acct.address)
-        signed = acct.sign_transaction(tx)
-        return w3.eth.send_raw_transaction(signed.raw_transaction)
+    A STALE PENDING tx at the next nonce (dropped from the node's pending-block
+    view but still in the mempool, e.g. after a slow receipt wait aborted an
+    earlier broadcast of the same logical op) rejects the replacement with
+    "replacement transaction underpriced" (2026-08-19: deposit/fund loops on the
+    local RPC proxy). The fix is a bump-and-replace: SAME nonce, fees raised
+    ~50%, rebroadcast — the replacement either displaces the stale tx or both
+    are the same logical op, so nothing is lost. Bounded retries with backoff;
+    any other exception, or the last failure, propagates unchanged — this is not
+    a general retry-on-any-error wrapper, only the two understood races.
+    Returns the tx_hash.
+    """
+    attempt = 0
+    # The nonce-too-low path keeps its historic 1-retry contract (initial +
+    # one retry); only the underpriced bump-and-replace gets the full budget.
+    nonce_attempts = min(max_attempts, 2)
+    while True:
+        attempt += 1
+        try:
+            signed = acct.sign_transaction(tx)
+            return w3.eth.send_raw_transaction(signed.raw_transaction)
+        except Exception as e:
+            msg = str(e).lower()
+            if "nonce too low" in msg and attempt < nonce_attempts:
+                print(f"  {label}: stale nonce ({e}) — waiting for RPC to catch up, retrying once...")
+                time.sleep(3)
+                tx["nonce"] = w3.eth.get_transaction_count(acct.address)
+            elif "replacement transaction underpriced" in msg and attempt < max_attempts:
+                if "maxFeePerGas" in tx:
+                    tx["maxFeePerGas"] = int(tx["maxFeePerGas"] * 1.5)
+                    tx["maxPriorityFeePerGas"] = max(
+                        int(tx.get("maxPriorityFeePerGas", 0) * 1.5), 1
+                    )
+                    fee_str = f"{tx['maxFeePerGas'] / 1e9:.4f} gwei"
+                else:
+                    tx["gasPrice"] = int(tx.get("gasPrice", w3.eth.gas_price) * 1.5)
+                    fee_str = f"{tx['gasPrice'] / 1e9:.4f} gwei"
+                print(f"  {label}: replacement underpriced — bumping fees to {fee_str} and "
+                      f"re-broadcasting same nonce ({attempt}/{max_attempts - 1})...")
+                time.sleep(2 * attempt)
+            else:
+                raise
 
 
 def _wait_for_receipt_stable(w3, tx_hash, timeout, label, attempts=3):
@@ -1132,10 +1160,12 @@ TOKEN_MANAGER_ABI = [
      "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
 ]
 
-# Minimal ERC20 ABI - balanceOf + approve + decimals. Used for wallet token reads,
-# pool deposits, and TokenManager-discovered non-pool collateral metadata.
+# Minimal ERC20 ABI - balanceOf + allowance + approve + decimals. Used for wallet
+# token reads, pool deposits, send/move flows (allowance read added 2026-08-19),
+# and TokenManager-discovered non-pool collateral metadata.
 ERC20_ABI = json.loads(
     '[{"constant":true,"inputs":[{"name":"a","type":"address"}],"name":"balanceOf","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
+    '{"constant":true,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},'
     '{"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},'
     '{"constant":true,"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function"}]'
 )
@@ -4113,6 +4143,223 @@ def cmd_execute_withdrawal(pool_name: str, index: int = None, execute: bool = Fa
             token_addr=(None if cfg["native"] else cfg["token"]),
             to_addr=acct.address, decimals=cfg["decimals"],
         )
+
+def _resolve_asset(pool_or_symbol: str) -> tuple[str, dict]:
+    """Resolve a pool name or display symbol (USDC, ETH, AERO...) to (pool_key, cfg)."""
+    key = pool_or_symbol.strip().lower()
+    if key in POOLS:
+        return key, POOLS[key]
+    for pool_key, cfg in POOLS.items():
+        if cfg["symbol"].lower() == key:
+            return pool_key, cfg
+    raise RuntimeError(
+        f"Unknown asset '{pool_or_symbol}'. Choose from: {', '.join(POOLS)} "
+        f"(or symbols: {', '.join(c['symbol'] for c in POOLS.values())})"
+    )
+
+
+def _decode_transfer_amount(rcpt, token: "Contract", sender: str, recipient: str) -> int | None:
+    """Return the ACTUAL Transfer(sender->recipient) amount from a receipt, or None.
+
+    The broadcast amount can differ from the logged one for some flows; the
+    receipt log is the on-chain truth (same pattern as arbprime's flow ledgers).
+    """
+    try:
+        events = token.events.Transfer().process_receipt(rcpt)
+    except Exception:
+        return None
+    for ev in events:
+        if ev["args"]["from"].lower() == sender.lower() and ev["args"]["to"].lower() == recipient.lower():
+            return ev["args"]["value"]
+    return None
+
+
+def cmd_send(asset: str, amount: float, to_addr: str, execute: bool = False,
+             send_all: bool = False, gas_reserve: float = 0.0002):
+    """Transfer an asset (ERC20 or native ETH) between EOAs on Base.
+
+    Signer is the --as-selected wallet (or the key env chain). --all sends the
+    full ERC20 balance, or the native balance minus --gas-reserve (default
+    0.0002 ETH) so the sender keeps fuel for future txs. Preview by default.
+    """
+    pool_key, cfg = _resolve_asset(asset)
+    symbol = cfg["symbol"]
+    w3 = get_w3()
+    acct = get_account()
+    try:
+        to_cs = Web3.to_checksum_address(to_addr)
+    except Exception:
+        raise RuntimeError(f"Invalid --to address: {to_addr}")
+    if to_cs == acct.address:
+        raise RuntimeError("--to is the sender wallet itself — refusing a self-send.")
+
+    if send_all and amount is not None:
+        raise RuntimeError("Pass either --amount or --all, not both.")
+
+    if send_all and cfg["native"]:
+        bal = w3.eth.get_balance(acct.address)
+        reserve = int(gas_reserve * 1e18)
+        amount_wei = bal - reserve
+        if amount_wei <= 21000 * w3.eth.gas_price:
+            raise RuntimeError(
+                f"Native --all: balance {bal / 1e18:.6f} ETH minus gas reserve "
+                f"{gas_reserve} leaves nothing sendable. Use --amount instead."
+            )
+        amount = amount_wei / 1e18
+    elif send_all:
+        token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]), abi=ERC20_ABI)
+        amount_wei = token.functions.balanceOf(acct.address).call()
+        amount = amount_wei / 10 ** cfg["decimals"]
+    else:
+        amount_wei = to_wei_units(amount, cfg["decimals"])
+
+    print(f"Wallet: {acct.address}")
+    print(f"Send {amount:,.6f} {symbol} -> {to_cs}")
+    if not execute:
+        print("Run with --execute to broadcast")
+        return
+
+    if cfg["native"]:
+        tx = {
+            "from": acct.address, "to": to_cs, "value": amount_wei,
+            "nonce": w3.eth.get_transaction_count(acct.address),
+            "gas": 21000, "chainId": CHAIN_ID,
+        }
+        receipt = _sign_and_send(w3, acct, tx, f"Send {amount:,.6f} {symbol}", fallback_gas=21000, buffer_bps=1000)
+        actual = amount_wei
+    else:
+        token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]), abi=ERC20_ABI)
+        tx = token.functions.transfer(to_cs, amount_wei).build_transaction({
+            "from": acct.address, "nonce": w3.eth.get_transaction_count(acct.address),
+            "gas": 100000, "chainId": CHAIN_ID,
+        })
+        receipt = _sign_and_send(w3, acct, tx, f"Send {amount:,.6f} {symbol}", fallback_gas=100000)
+        actual = _decode_transfer_amount(receipt, token, acct.address, to_cs)
+        if actual is not None:
+            print(f"  Transfer event: {actual / 10 ** cfg['decimals']:,.6f} {symbol}")
+    return receipt["status"] == 1
+
+
+def cmd_move(from_agent: str, to_agent: str, asset: str, execute: bool = False,
+             gas_reserve: float = 0.0002):
+    """Relocate a whole position's asset between fleet wallets in one command.
+
+    Flow: (1) execute any matured withdrawal intents on the FROM wallet's Degen
+    Account, (2) send the full asset balance from the FROM EOA to the TO EOA,
+    (3) fund the TO EOA's Degen Account with it (approve + fund). All three
+    steps preview by default; --execute gates the broadcasts. Intended for
+    wind-down/relocation tasks (e.g. p2 -> p4 2026-08-19). Native ETH keeps a
+    --gas-reserve on the sender. Nothing is rebuilt or re-levered.
+    """
+    pool_key, cfg = _resolve_asset(asset)
+    symbol = cfg["symbol"]
+    w3 = get_w3()
+    if from_agent not in AGENTS:
+        raise RuntimeError(f"Unknown --from agent '{from_agent}'.")
+    if to_agent not in AGENTS:
+        raise RuntimeError(f"Unknown --to agent '{to_agent}'.")
+    from_acct = w3.eth.account.from_key(_agent_key(from_agent))
+    to_acct = w3.eth.account.from_key(_agent_key(to_agent))
+    print(f"From: {from_agent} {from_acct.address}")
+    print(f"To:   {to_agent} {to_acct.address}")
+    pa_to = get_prime_account(w3, to_acct.address)
+    if not pa_to:
+        raise RuntimeError(f"Wallet {to_agent} has no Degen Account — nothing to fund.")
+    pa_to_cs = Web3.to_checksum_address(pa_to)
+    print(f"To account: {pa_to_cs}")
+
+    executed = 0.0
+    # Step 1 — execute matured withdrawal intents on the FROM account
+    pa_from = get_prime_account(w3, from_acct.address)
+    if pa_from:
+        from_acct_c = w3.eth.contract(address=Web3.to_checksum_address(pa_from), abi=PRIME_ACCOUNT_ABI)
+        intents = from_acct_c.functions.getUserIntents(asset_b32(symbol)).call()
+        ready = [i for i, it in enumerate(intents) if it[4] and not it[5]]
+        if ready:
+            amt_ready = sum(intents[i][0] for i in ready) / 10 ** cfg["decimals"]
+            print(f"Step 1: execute matured withdrawal intent(s) {ready} "
+                  f"({amt_ready:,.6f} {symbol}) on {from_agent}")
+            if execute:
+                feeds = sorted(REDSTONE_AVAILABLE_FEEDS)
+                payload = build_redstone_payload(feeds)
+                base_calldata = from_acct_c.encode_abi("executeWithdrawalIntent", args=[asset_b32(symbol), ready])
+                tx = {
+                    "from": from_acct.address, "to": Web3.to_checksum_address(pa_from),
+                    "data": base_calldata + payload.hex(),
+                    "nonce": w3.eth.get_transaction_count(from_acct.address),
+                    "gas": 3000000, "chainId": CHAIN_ID,
+                }
+                receipt = _sign_and_send(w3, from_acct, tx, "Execute withdrawal", fallback_gas=3000000)
+                if receipt["status"] == 1:
+                    executed = amt_ready
+        else:
+            print(f"Step 1: no matured non-expired intents on {from_agent} — skipping")
+    else:
+        print(f"Step 1: {from_agent} has no Degen Account — skipping intents")
+
+    # Step 2 — send the full balance FROM EOA -> TO EOA
+    if cfg["native"]:
+        bal = w3.eth.get_balance(from_acct.address)
+        amount_wei = bal - int(gas_reserve * 1e18)
+        if amount_wei <= 21000 * w3.eth.gas_price:
+            raise RuntimeError(f"{from_agent} native balance {bal / 1e18:.6f} ETH has nothing "
+                               f"sendable after the {gas_reserve} gas reserve.")
+    else:
+        token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]), abi=ERC20_ABI)
+        amount_wei = token.functions.balanceOf(from_acct.address).call()
+    amount = amount_wei / 10 ** cfg["decimals"]
+    print(f"Step 2: send {amount:,.6f} {symbol} {from_agent} EOA -> {to_agent} EOA")
+    if execute:
+        if cfg["native"]:
+            tx = {
+                "from": from_acct.address, "to": to_acct.address, "value": amount_wei,
+                "nonce": w3.eth.get_transaction_count(from_acct.address),
+                "gas": 21000, "chainId": CHAIN_ID,
+            }
+            receipt = _sign_and_send(w3, from_acct, tx, f"Send {amount:,.6f} {symbol}",
+                                     fallback_gas=21000, buffer_bps=1000)
+        else:
+            tx = token.functions.transfer(to_acct.address, amount_wei).build_transaction({
+                "from": from_acct.address, "nonce": w3.eth.get_transaction_count(from_acct.address),
+                "gas": 100000, "chainId": CHAIN_ID,
+            })
+            receipt = _sign_and_send(w3, from_acct, tx, f"Send {amount:,.6f} {symbol}", fallback_gas=100000)
+
+    # Step 3 — fund the TO Degen Account with what arrived
+    if cfg["native"]:
+        print(f"Step 3: funding native ETH into {to_agent} Degen Account "
+              f"(depositNativeToken, value={amount:,.6f})")
+        if execute:
+            account_c = w3.eth.contract(address=pa_to_cs, abi=PRIME_ACCOUNT_ABI)
+            fund_tx = account_c.functions.depositNativeToken().build_transaction({
+                "from": to_acct.address, "nonce": w3.eth.get_transaction_count(to_acct.address),
+                "gas": 3000000, "chainId": CHAIN_ID, "value": amount_wei,
+            })
+            _sign_and_send(w3, to_acct, fund_tx, f"Fund {amount:,.6f} {symbol}", fallback_gas=3000000)
+    else:
+        token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]), abi=ERC20_ABI)
+        allowance = token.functions.allowance(to_acct.address, pa_to_cs).call()
+        print(f"Step 3: fund {amount:,.6f} {symbol} into {to_agent} Degen Account")
+        if execute:
+            if allowance < amount_wei:
+                app_tx = token.functions.approve(pa_to_cs, amount_wei).build_transaction({
+                    "from": to_acct.address, "nonce": w3.eth.get_transaction_count(to_acct.address),
+                    "gas": 100000, "chainId": CHAIN_ID,
+                })
+                _sign_and_send(w3, to_acct, app_tx, "Approve account", fallback_gas=100000)
+            account_c = w3.eth.contract(address=pa_to_cs, abi=PRIME_ACCOUNT_ABI)
+            fund_tx = account_c.functions.fund(asset_b32(symbol), amount_wei).build_transaction({
+                "from": to_acct.address, "nonce": w3.eth.get_transaction_count(to_acct.address),
+                "gas": 3000000, "chainId": CHAIN_ID,
+            })
+            _sign_and_send(w3, to_acct, fund_tx, f"Fund {amount:,.6f} {symbol}", fallback_gas=3000000)
+
+    if not execute:
+        print("Run with --execute to broadcast all steps")
+        return
+    print(f"Done. Withdrawal executed: {executed:,.6f} {symbol}; funded {amount:,.6f} {symbol} "
+          f"into {to_agent}'s Degen Account.")
+
 
 def _log_withdraw_flow(account_addr: str, symbol: str, amount: float, receipt,
                        token_addr: str = None, to_addr: str = None,
@@ -7240,6 +7487,33 @@ def _dispatch():
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
             return
         cmd_execute_withdrawal(pool, index, execute)
+    elif cmd == "send":
+        asset, amount, to_addr = None, None, None
+        execute = "--execute" in args
+        send_all = "--all" in args
+        gas_reserve = 0.0002
+        for i, a in enumerate(args):
+            if a == "--asset" and i + 1 < len(args): asset = args[i + 1]
+            if a == "--amount" and i + 1 < len(args): amount = float(args[i + 1])
+            if a == "--to" and i + 1 < len(args): to_addr = args[i + 1]
+            if a == "--gas-reserve" and i + 1 < len(args): gas_reserve = float(args[i + 1])
+        if not asset or not to_addr:
+            print("Usage: degenprime send --asset usdc --amount 100 --to 0x.. [--all] [--gas-reserve 0.0002] [--execute]")
+            return
+        cmd_send(asset, amount, to_addr, execute, send_all, gas_reserve)
+    elif cmd == "move":
+        from_agent, to_agent, asset = None, None, None
+        execute = "--execute" in args
+        gas_reserve = 0.0002
+        for i, a in enumerate(args):
+            if a == "--from" and i + 1 < len(args): from_agent = args[i + 1]
+            if a == "--to" and i + 1 < len(args): to_agent = args[i + 1]
+            if a == "--asset" and i + 1 < len(args): asset = args[i + 1]
+            if a == "--gas-reserve" and i + 1 < len(args): gas_reserve = float(args[i + 1])
+        if not from_agent or not to_agent or not asset:
+            print("Usage: degenprime move --from parakletos-2 --to parakletos-4 --asset usdc [--gas-reserve 0.0002] [--execute]")
+            return
+        cmd_move(from_agent, to_agent, asset, execute, gas_reserve)
     elif cmd == "cancel-withdrawal":
         pool, index = None, None
         execute = "--execute" in args
