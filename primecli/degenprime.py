@@ -4335,7 +4335,9 @@ def cmd_move(from_agent: str, to_agent: str, asset: str, execute: bool = False,
                 "from": to_acct.address, "nonce": w3.eth.get_transaction_count(to_acct.address),
                 "gas": 3000000, "chainId": CHAIN_ID, "value": amount_wei,
             })
-            _sign_and_send(w3, to_acct, fund_tx, f"Fund {amount:,.6f} {symbol}", fallback_gas=3000000)
+            receipt = _sign_and_send(w3, to_acct, fund_tx, f"Fund {amount:,.6f} {symbol}", fallback_gas=3000000)
+            _log_fund_flow(pa_to_cs, symbol, amount, receipt,
+                           token_addr=None, from_addr=to_acct.address, decimals=cfg["decimals"])
     else:
         token = w3.eth.contract(address=Web3.to_checksum_address(cfg["token"]), abi=ERC20_ABI)
         allowance = token.functions.allowance(to_acct.address, pa_to_cs).call()
@@ -4352,7 +4354,13 @@ def cmd_move(from_agent: str, to_agent: str, asset: str, execute: bool = False,
                 "from": to_acct.address, "nonce": w3.eth.get_transaction_count(to_acct.address),
                 "gas": 3000000, "chainId": CHAIN_ID,
             })
-            _sign_and_send(w3, to_acct, fund_tx, f"Fund {amount:,.6f} {symbol}", fallback_gas=3000000)
+            receipt = _sign_and_send(w3, to_acct, fund_tx, f"Fund {amount:,.6f} {symbol}", fallback_gas=3000000)
+            # Log the deposit flow exactly like cmd_fund does — without the record,
+            # pnlctl counts the equity jump as profit (miss 2026-08-19: the p2->p4
+            # fund was broadcast out-of-CLI and showed as +$150 PnL on the dashboard).
+            _log_fund_flow(pa_to_cs, symbol, amount, receipt,
+                           token_addr=cfg["token"], from_addr=to_acct.address,
+                           decimals=cfg["decimals"])
 
     if not execute:
         print("Run with --execute to broadcast all steps")

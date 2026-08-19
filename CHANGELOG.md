@@ -4,6 +4,18 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.15.1] - 2026-08-19
+
+### Fixed
+- **`move` now logs the fund step to the PnL flow ledger** — `cmd_move`'s Step 3
+  (fund the target Degen Account) broadcast the fund without calling
+  `_log_fund_flow`, so a relocation via `move` would show the deposited equity
+  as profit on the portfolio dashboard. Same miss hit live on 2026-08-19 when
+  the p2->p4 fund was broadcast out-of-CLI (the CLI's broadcast path was
+  failing) — the dashboard showed +$150 phantom PnL until the deposit record
+  was backfilled. `cmd_move` now logs the flow exactly like `cmd_fund` does
+  (native and ERC20 paths).
+
 ## [0.15.0] - 2026-08-19
 
 ### Added
