@@ -2888,9 +2888,35 @@ def _swap_via_paraswap(w3, acct, pa_cs, account, from_sym, to_sym, from_cfg, to_
         "nonce": w3.eth.get_transaction_count(acct.address),
         "chainId": CHAIN_ID,
     }
+    try:
+        _to_before = account.functions.getBalance(asset_b32(to_sym)).call()
+    except Exception:
+        _to_before = 0
     receipt = _sign_and_send(w3, acct, tx, f"Swap {amount} {from_sym} -> {to_sym}", fallback_gas=3000000)
     ok = receipt["status"] == 1
+    if ok and not _swap_dest_arrived(account, to_sym, _to_before):
+        print(f"✗ Swap tx landed but the {to_sym} balance did not increase "
+              f"(wrong delivery?) — treating the swap as FAILED.")
+        return False
     return ok
+
+
+def _swap_dest_arrived(account, to_sym: str, to_before: int) -> bool:
+    """C1 dest-leg verification (2026-09-07 core1): a route can land status-1
+    while delivering a DIFFERENT asset than requested. Re-read the in-account
+    dest balance (retrying briefly against local-proxy indexer lag) and require
+    an increase vs the pre-broadcast read. Unreadable views fail closed."""
+    import time as _t
+    for _i in range(4):
+        try:
+            _after = account.functions.getBalance(asset_b32(to_sym)).call()
+        except Exception:
+            _after = 0
+        if _after - to_before > 0:
+            return True
+        _t.sleep(2)
+    return False
+
 
 def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.0,
              via: str = "yak", execute: bool = False):
@@ -2991,8 +3017,17 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
         "nonce": w3.eth.get_transaction_count(acct.address),
         "chainId": CHAIN_ID,
     }
+    # C1 dest-leg verification (2026-09-07): see _swap_via_paraswap.
+    try:
+        _to_before = account.functions.getBalance(asset_b32(to_sym)).call()
+    except Exception:
+        _to_before = 0
     receipt = _sign_and_send(w3, acct, tx, f"Swap {amount} {from_sym} -> {to_sym}", fallback_gas=3000000)
     ok = receipt["status"] == 1
+    if ok and not _swap_dest_arrived(account, to_sym, _to_before):
+        print(f"✗ Swap tx landed but the {to_sym} balance did not increase "
+              f"(wrong delivery?) — treating the swap as FAILED.")
+        return False
     return ok
 
 # ─── Swap debt / refinance (SwapDebtFacet) ───────────────────────────────────
@@ -6072,7 +6107,9 @@ def main():
         if not from_sym or not to_sym or amount is None:
             print("Usage: arbprime swap --from USDC --to ETH --amount 10 [--via yak|paraswap] [--slippage 0.5] [--execute]")
             return
-        cmd_swap(from_sym, to_sym, amount, slippage, via, execute)
+        _ret = cmd_swap(from_sym, to_sym, amount, slippage, via, execute)
+        if execute and not _ret:
+            sys.exit(2)
     elif cmd == "swap-debt":
         from_sym, to_sym, amount, slippage = None, None, None, 1.0
         execute = "--execute" in args

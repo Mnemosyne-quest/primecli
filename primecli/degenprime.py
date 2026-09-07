@@ -3429,6 +3429,7 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     ok = receipt["status"] == 1
     if not ok:
         _print_revert_reason(w3, tx, receipt)
+    return ok
 
 def _print_revert_reason(w3, tx, receipt):
     """Try to decode and print the revert reason from a failed tx."""
@@ -3782,8 +3783,26 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
         "nonce": w3.eth.get_transaction_count(acct.address),
         "chainId": CHAIN_ID,
     }
+    # DEST-LEG VERIFICATION (2026-09-07 core1): a ParaSwap route can land
+    # status-1 while delivering a DIFFERENT asset than requested. The receipt
+    # proves the tx landed, not WHAT landed — capture the dest balance BEFORE
+    # the broadcast and require an increase afterwards. A lagging balance read
+    # (local-proxy indexer lag) retries briefly; a dest that never arrives
+    # fails the swap loudly instead of reporting OK.
+    _to_before = _aero_in_account_balance(account, to_asset_sym)
     receipt = _sign_and_send(w3, acct, tx, f"Swap {amount} {from_asset_sym} -> {to_asset_sym}", fallback_gas=1200000)
     ok = receipt["status"] == 1
+    if ok:
+        _arrived = _aero_in_account_balance(account, to_asset_sym) - _to_before
+        for _i in range(4):
+            if _arrived > 0:
+                break
+            time.sleep(2)
+            _arrived = _aero_in_account_balance(account, to_asset_sym) - _to_before
+        if _arrived <= 0:
+            print(f"✗ Swap tx landed but the {to_asset_sym} balance did not increase "
+                  f"(wrong delivery?) — treating the swap as FAILED.")
+            return False
     return ok
 
 # ─── Swap debt / refinance (SwapDebtFacet) ───────────────────────────────────
@@ -3940,6 +3959,7 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     }
     receipt = _sign_and_send(w3, acct, tx, f"Swap debt {from_sym} -> {to_sym}", fallback_gas=4000000)
     ok = receipt["status"] == 1
+    return ok
 
 # ─── Collateral withdrawal (WithdrawalIntentFacet, Degen Account) ───────────
 # Universal 24h time-lock on the Degen Account - NOT just risky assets. On the Account,
@@ -5942,6 +5962,12 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
         width_pct, slippage_pct, execute=False, reserve=reserve
     )
     if not plan:
+        # C2 silent-no-op class (2026-09-07): an empty plan on the EXECUTE path
+        # means the mint will NOT happen — exit loudly so the caller unwinds
+        # instead of reading rc 0 as a successful mint.
+        print("  Nothing to deploy: empty plan from the use-all-available preview.")
+        if execute:
+            sys.exit(2)
         return
     total0_wei, total1_wei, tick_lower, tick_upper, pool_tick = plan
 
@@ -5951,6 +5977,8 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
     )
     if amt0 == 0 and amt1 == 0:
         print("  Nothing to deposit after fitting amounts to range.")
+        if execute:
+            sys.exit(2)
         return
 
     print(f"\n  {"=" * 60}")
@@ -5998,14 +6026,14 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
     amt0, amt1 = in_acct0, in_acct1
     if amt0 == 0 and amt1 == 0:
         print("  Nothing in account after swaps.")
-        return
+        sys.exit(2)
 
     amt0, amt1, _ = _aero_fit_amounts_to_range(
         pool_cfg, amt0, amt1, tick_lower, tick_upper, pool_tick
     )
     if amt0 == 0 and amt1 == 0:
         print("  Nothing to deposit after fitting to range.")
-        return
+        sys.exit(2)
 
     # Pre-mint self-borrow guard: when price is in-range, the fit derives a
     # matching amount for whichever leg is missing from the pool ratio. If that
@@ -6054,7 +6082,7 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
     sim_ok, sim_info = _aero_simulate_mint(w3, acct.address, account.address, mint_calldata)
     if not sim_ok:
         print(f"  Simulation reverted -- aborting: {sim_info}")
-        return
+        sys.exit(2)
     if sim_info is not None:
         print(f"  Simulation passed -- would-be tokenId: {sim_info}")
     else:
@@ -7484,7 +7512,12 @@ def _dispatch():
         if pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
             return
-        cmd_fund(pool, amount, execute)
+        # C2 (2026-09-07): a broadcast command that aborts before its artifact
+        # must NOT exit 0 — a falsy return with --execute is a silent no-op
+        # (the defisims converge reads rc and would report the step OK).
+        _ret = cmd_fund(pool, amount, execute)
+        if execute and not _ret:
+            sys.exit(2)
     elif cmd in ("borrow", "repay"):
         pool, amount = None, None
         execute = "--execute" in args
@@ -7497,7 +7530,9 @@ def _dispatch():
         if pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
             return
-        (cmd_borrow if cmd == "borrow" else cmd_repay)(pool, amount, execute)
+        _ret = (cmd_borrow if cmd == "borrow" else cmd_repay)(pool, amount, execute)
+        if execute and not _ret:
+            sys.exit(2)
     elif cmd == "swap":
         from_sym, to_sym, amount, slippage = None, None, None, 1.0
         execute = "--execute" in args
@@ -7509,7 +7544,9 @@ def _dispatch():
         if not from_sym or not to_sym or amount is None:
             print("Usage: degenprime swap --from USDC --to ETH --amount 10 [--slippage 0.5] [--execute]")
             return
-        cmd_swap(from_sym, to_sym, amount, slippage, execute)
+        _ret = cmd_swap(from_sym, to_sym, amount, slippage, execute)
+        if execute and not _ret:
+            sys.exit(2)
     elif cmd == "swap-debt":
         from_sym, to_sym, amount, slippage = None, None, None, 1.0
         execute = "--execute" in args
@@ -7521,7 +7558,9 @@ def _dispatch():
         if not from_sym or not to_sym or amount is None:
             print("Usage: degenprime swap-debt --from ETH --to USDC --amount 100 [--slippage 0.5] [--execute]")
             return
-        cmd_swap_debt(from_sym, to_sym, amount, slippage, execute)
+        _ret = cmd_swap_debt(from_sym, to_sym, amount, slippage, execute)
+        if execute and not _ret:
+            sys.exit(2)
     elif cmd == "withdraw-collateral":
         pool, amount = None, None
         execute = "--execute" in args

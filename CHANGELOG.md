@@ -4,6 +4,28 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.15.3] - 2026-09-07
+
+### Fixed
+- **Every swap path now verifies the DEST leg arrived (C1)**: `cmd_swap` in all
+  three CLIs (degenprime/deltaprime/arbprime — both the ParaSwap and the
+  YieldYak routes) previously reported success on the tx receipt alone. A route
+  can land status-1 while delivering a DIFFERENT asset than requested (the
+  2026-09-07 core1 AERO→cbBTC wrong-delivery: the route settled as USDC and the
+  caller believed the requested dest had arrived). Now the in-account dest
+  balance is read BEFORE the broadcast and re-read after (4 tries against
+  local-proxy indexer lag); a dest that never increases fails the swap loudly
+  instead of reporting OK. Unreadable views fail closed.
+- **Broadcast commands can no longer exit 0 without producing their artifact
+  (C2)**: `cmd_repay` and `cmd_swap_debt` returned None even when the broadcast
+  reverted, so the CLI exited 0 and a caller reading rc believed the step
+  worked. Both now return the receipt's ok, and the CLI dispatch exits rc 2
+  when an `--execute` run of swap/swap-debt/borrow/repay/fund returns falsy.
+  The `aero-add-liquidity --use-all-available` mint path now exits rc 2 on
+  EVERY abort-before-mint (empty plan, nothing-to-deposit after fit,
+  simulation reverted) instead of silently exiting 0 without an NFT — the
+  silent-no-op class that hid the core1 mint abort for hours.
+
 ## [0.15.2] - 2026-09-07
 
 ### Fixed
