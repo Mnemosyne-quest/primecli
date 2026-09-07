@@ -121,6 +121,35 @@ def test_no_reserve_is_strict_noop_no_extra_reads(monkeypatch):
     assert apply_calls == []
 
 
+def test_wrong_delivery_stops_convergence(monkeypatch, capsys):
+    """A swap that reports success but does NOT deliver the dest leg must stop the
+    convergence instead of continuing on a false premise (2026-09-07 core1: the
+    USDC 2-hop delivered USDC instead of cbBTC and the next pass recomputed on the
+    wrong balances)."""
+    bals = {"TKA": 1_000 * 10 ** 6, "TKB": 0}
+    calls = []
+
+    def _broken_swap(account, from_sym, to_sym, amount_human, slippage_pct, execute=False):
+        calls.append((from_sym, to_sym, amount_human))
+        return True  # claims success but delivers nothing
+
+    monkeypatch.setattr(dp, "_aero_in_account_balance",
+                        lambda account, sym: int(bals.get(sym, 0)))
+    monkeypatch.setattr(dp, "_swap_with_usdc_fallback", _broken_swap)
+    monkeypatch.setattr(dp, "_aero_pool_address", lambda cfg: "0x" + "c" * 40)
+    monkeypatch.setattr(dp.time, "sleep", lambda _s: None)
+    w3 = _mock_w3(tick=0)
+
+    dp._aero_precision_balance(
+        w3, MagicMock(), _pool_cfg(), -10, 10, 0,
+        slippage_pct=1.0, execute=True, width_pct=None, reserve=None,
+    )
+
+    # Stopped after the first non-delivering swap (no further passes).
+    assert len(calls) == 1
+    assert "did not increase" in capsys.readouterr().out
+
+
 # ─────────────────────── helper: pool-leg reserve ───────────────────────
 
 def test_pool_leg_reserve_is_held_out_of_balancing(monkeypatch, capsys):
@@ -310,3 +339,36 @@ def test_add_liquidity_all_available_delegates_with_width_and_reserve(monkeypatc
     _, k = balance_calls[0]
     assert k["width_pct"] == 7.5
     assert k["reserve"] == {"WETH": 0.3}
+
+
+def test_add_liquidity_guard_underdelivery_exits_nonzero(monkeypatch, capsys):
+    """2026-09-07 core1: the pre-mint self-borrow guard used a bare return, so a
+    balancing swap that underdelivered the dest leg made the WHOLE rebuild a
+    silent no-op (primecli rc 0, no mint; the caller only found out via the
+    post-mint tokenId poll). The guard must exit NONZERO so the caller's failure
+    handling (abort/unwind or retry) engages instead of polling for a mint that
+    never happened."""
+    pool_key = "weth-usdc-100"
+    fits = [(100, 200, []), (100, 200, [])]
+
+    monkeypatch.setattr(dp, "get_w3", lambda: _mock_w3(tick=0))
+    monkeypatch.setattr(dp, "get_account", lambda: MagicMock(address="0x" + "1" * 40))
+    monkeypatch.setattr(dp, "get_prime_account", lambda w3, addr: "0x" + "2" * 40)
+    monkeypatch.setattr(dp.Web3, "to_checksum_address", staticmethod(lambda a: a))
+    monkeypatch.setattr(dp, "_aero_use_all_available",
+                        lambda *a, **k: (10 ** 18, 10 ** 6, -100, 100, 0))
+    monkeypatch.setattr(dp, "_aero_fit_amounts_to_range",
+                        lambda cfg, a0, a1, tl, tu, pt: fits.pop(0))
+    monkeypatch.setattr(dp, "_aero_precision_balance",
+                        lambda *a, **k: (a[3], a[4], a[5]))
+    # The balancing swap underdelivered: the account holds NO WETH (leg 0), but
+    # the in-range fit needs 100 wei of it.
+    monkeypatch.setattr(dp, "_aero_read_pool_legs_stable",
+                        lambda account, s0, s1: (0, 50, True))
+
+    with pytest.raises(SystemExit) as excinfo:
+        dp._cmd_aero_add_liquidity_all_available(
+            pool_key, slippage_pct=1.0, execute=True, width_pct=7.5,
+        )
+    assert excinfo.value.code == 2
+    assert "underdelivered" in capsys.readouterr().out

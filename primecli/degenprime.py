@@ -5014,20 +5014,54 @@ def _swap_with_usdc_fallback(account, from_sym, to_sym, amount_human,
         return ok  # already a USDC leg — no intermediary to fall back to
     print(f"  Direct {from_sym} -> {to_sym} swap failed; trying 2-hop via USDC...")
     usdc_before = _aero_in_account_balance(account, "USDC")
+    to_before = _aero_in_account_balance(account, to_sym)
     if not cmd_swap(from_sym, "USDC", amount_human, slippage_pct, execute=True):
         print(f"  2-hop fallback: {from_sym} -> USDC also failed. "
               f"Leaving {from_sym} in-account.")
         return False
-    produced = _aero_in_account_balance(account, "USDC") - usdc_before
+    # Hop 1 just landed: the balance read right after the receipt can be STALE
+    # (the local proxy's documented indexer lag — the 2026-09-07 core1 incident
+    # stranded ~$605 of AERO as USDC exactly here: the stale delta read made the
+    # helper bail between hops, delivering USDC instead of the requested cbBTC).
+    # Keep reading the USDC delta until it is positive (up to 6 tries); a delta
+    # that never appears aborts BEFORE hop 2 so the requested dest is never
+    # silently skipped.
+    produced = 0
+    for _i in range(6):
+        _delta = _aero_in_account_balance(account, "USDC") - usdc_before
+        if _delta > 0:
+            produced = _delta
+            break
+        time.sleep(2)
     usdc_human = produced / 1e6  # USDC has 6 decimals
     if usdc_human <= 1.0:
         print(f"  2-hop fallback: only {usdc_human:.4f} USDC produced by hop 1; "
               f"too small for hop 2.")
         return False
     # Spend 99% to stay under the second hop's min-out / slippage floor.
-    if not cmd_swap("USDC", to_sym, usdc_human * 0.99, slippage_pct, execute=True):
+    _hop2_ok = cmd_swap("USDC", to_sym, usdc_human * 0.99, slippage_pct, execute=True)
+    if not _hop2_ok:
+        # One retry: hop 2's own in-balance check can hit the same lagging read
+        # and refuse although the USDC is there. Safe to retry once — a falsy
+        # cmd_swap return means NO broadcast landed (status-0 reverts roll back
+        # in full; an ambiguous receipt wait raises instead of returning falsy).
+        time.sleep(3)
+        _hop2_ok = cmd_swap("USDC", to_sym, usdc_human * 0.99, slippage_pct, execute=True)
+    if not _hop2_ok:
         print(f"  2-hop fallback: USDC -> {to_sym} failed; "
               f"{from_sym} is now USDC in-account.")
+        return False
+    # Verify the requested dest actually arrived before reporting success — a
+    # swap must NEVER report OK to a different asset than requested.
+    _dest_arrived = _aero_in_account_balance(account, to_sym) - to_before
+    for _i in range(4):
+        if _dest_arrived > 0:
+            break
+        time.sleep(2)
+        _dest_arrived = _aero_in_account_balance(account, to_sym) - to_before
+    if _dest_arrived <= 0:
+        print(f"  2-hop fallback: {to_sym} balance did not increase after "
+              f"USDC -> {to_sym} (stale read?) — treating the 2-hop as failed.")
         return False
     print(f"  ✓ 2-hop swap {from_sym} -> USDC -> {to_sym} completed.")
     return True
@@ -5820,11 +5854,28 @@ def _aero_precision_balance(w3, account, pool_cfg, tick_lower, tick_upper, pool_
 
         print(f"\n  Precision swap pass {_pass+1}: selling {_swap_human:.6f} {_from_sym} -> {_to_sym}"
               f"  (residual ~${_usd_est:.2f})")
+        _dest_before = _aero_in_account_balance(account, _to_sym)
         _ok = _swap_with_usdc_fallback(account, _from_sym, _to_sym, _swap_human,
                                        slippage_pct, execute=execute)
         if not _ok:
             print(f"  Precision swap pass {_pass+1} failed (direct + USDC 2-hop). "
                   f"Continuing with current balances.")
+            break
+        # Verify the DEST leg actually arrived (the helper reports success, but a
+        # wrong-delivery route — e.g. the USDC 2-hop stranding the swap between
+        # hops — can leave the dest unchanged; 2026-09-07 core1 AERO->USDC). A
+        # lagging balance read retries briefly; a dest that never arrives stops
+        # the convergence instead of continuing on a false premise.
+        _dest_arrived = _aero_in_account_balance(account, _to_sym) - _dest_before
+        for _dretry in range(3):
+            if _dest_arrived > 0:
+                break
+            time.sleep(2)
+            _dest_arrived = _aero_in_account_balance(account, _to_sym) - _dest_before
+        if _dest_arrived <= 0:
+            print(f"  Precision swap pass {_pass+1}: {_to_sym} balance did not increase "
+                  f"after the {_from_sym} swap (wrong delivery?) — stopping to avoid "
+                  f"continuing on a false premise.")
             break
         # Record the swap for the stale-read guard on the next pass (sold leg's
         # RAW pre-swap balance, not the reserve-subtracted view).
@@ -5973,12 +6024,16 @@ def _cmd_aero_add_liquidity_all_available(pool_key, slippage_pct, execute, width
         ):
             if fitted > have + 1:  # +1 wei for display round-up margin
                 print(
-                    f"  Balancing swap underdelivered {sym}: mint needs "
+                    f"  ABORT: balancing swap underdelivered {sym}: mint needs "
                     f"{fmt_token_amount(fitted, dec)} but only "
                     f"{fmt_token_amount(have, dec)} is in-account. The mint would "
-                    f"self-borrow the shortfall (BorrowingNotAllowed) -- aborting."
+                    f"self-borrow the shortfall (BorrowingNotAllowed)."
                 )
-                return
+                # Loud, nonzero exit: a bare return here made the whole rebuild a
+                # SILENT no-op (rc 0, no mint) and the caller only discovered it via
+                # the post-mint tokenId poll (2026-09-07 core1). rc=2 routes the
+                # caller into its normal failure handling (abort/unwind or retry).
+                sys.exit(2)
 
     params = _aero_mint_params(pool_cfg, amt0, amt1, tick_lower, tick_upper,
                                pool_tick, slippage_pct)

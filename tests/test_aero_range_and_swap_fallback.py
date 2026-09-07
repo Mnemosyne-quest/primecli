@@ -73,9 +73,11 @@ def test_preview_does_not_trigger_fallback(monkeypatch):
 
 def test_two_hop_fallback_sizes_hop2_from_delta(monkeypatch):
     # Direct AERO->cbBTC fails; hop1 AERO->USDC succeeds producing 142 USDC;
-    # hop2 USDC->cbBTC spends 99% of the *delta*.
+    # hop2 USDC->cbBTC spends 99% of the *delta*. The balance reads are (in
+    # order): USDC before hop1, cbBTC before hop1 (dest baseline), USDC after
+    # hop1 (delta read), cbBTC after hop2 (dest-arrival check).
     rec = _patch_swap(monkeypatch, [None, True, True])  # direct fail, hop1 ok, hop2 ok
-    _patch_balance(monkeypatch, [10_000_000, 152_000_000])  # before 10 USDC, after 152
+    _patch_balance(monkeypatch, [10_000_000, 0, 152_000_000, 142_000_000])
     ok = dp._swap_with_usdc_fallback(ACCT, "AERO", "cbBTC", 120.0, 1.0, execute=True)
     assert ok is True
     assert len(rec.calls) == 3
@@ -103,10 +105,48 @@ def test_hop1_failure_aborts(monkeypatch):
 def test_tiny_usdc_delta_aborts_before_hop2(monkeypatch):
     # hop1 succeeds but produces < $1 of USDC delta -> don't attempt hop2.
     rec = _patch_swap(monkeypatch, [None, True])  # direct fail, hop1 ok
-    _patch_balance(monkeypatch, [5_000_000, 5_500_000])  # delta 0.5 USDC
+    _patch_balance(monkeypatch, [5_000_000, 0, 5_500_000])  # delta 0.5 USDC
     ok = dp._swap_with_usdc_fallback(ACCT, "AERO", "cbBTC", 100.0, 1.0, execute=True)
     assert ok is False
     assert len(rec.calls) == 2  # no hop2
+
+
+def test_stale_usdc_delta_reads_abort_before_hop2(monkeypatch):
+    # 2026-09-07 core1 incident: hop1 landed but every post-broadcast USDC read
+    # was stale (delta 0). The helper must NOT silently skip the requested dest;
+    # it keeps re-reading and aborts the 2-hop when the delta never appears.
+    rec = _patch_swap(monkeypatch, [None, True])  # direct fail, hop1 ok
+    _patch_balance(monkeypatch, [0, 0, 0, 0, 0, 0, 0, 0])  # usdc_before, to_before, 6x stale delta
+    monkeypatch.setattr(dp.time, "sleep", lambda _s: None)
+    ok = dp._swap_with_usdc_fallback(ACCT, "AERO", "cbBTC", 100.0, 1.0, execute=True)
+    assert ok is False
+    assert len(rec.calls) == 2  # hop2 never attempted
+
+
+def test_hop2_retried_once_after_refusal(monkeypatch):
+    # Hop 2's own in-balance check can read the same lagging balance and refuse
+    # although the USDC is there. One retry is safe (no broadcast landed) and
+    # lets the 2-hop complete.
+    rec = _patch_swap(monkeypatch, [None, True, None, True])  # direct fail, hop1 ok, hop2 refused, retry ok
+    _patch_balance(monkeypatch, [0, 0, 152_000_000, 142_000_000])
+    monkeypatch.setattr(dp.time, "sleep", lambda _s: None)
+    ok = dp._swap_with_usdc_fallback(ACCT, "AERO", "cbBTC", 120.0, 1.0, execute=True)
+    assert ok is True
+    assert len(rec.calls) == 4
+    assert (rec.calls[2]["from"], rec.calls[2]["to"]) == ("USDC", "cbBTC")
+    assert (rec.calls[3]["from"], rec.calls[3]["to"]) == ("USDC", "cbBTC")
+
+
+def test_dest_never_arrives_reports_failure(monkeypatch):
+    # Both swap legs "landed" but the dest balance never increased (wrong
+    # delivery). The helper must report failure — never True for a swap that
+    # delivered a different asset than requested.
+    rec = _patch_swap(monkeypatch, [None, True, True])  # direct fail, hop1 ok, hop2 "ok"
+    _patch_balance(monkeypatch, [0, 0, 152_000_000, 0, 0, 0, 0, 0])  # dest reads all stale/0
+    monkeypatch.setattr(dp.time, "sleep", lambda _s: None)
+    ok = dp._swap_with_usdc_fallback(ACCT, "AERO", "cbBTC", 120.0, 1.0, execute=True)
+    assert ok is False
+    assert len(rec.calls) == 3
 
 
 # ─────────────────────────── _aero_range_metrics ───────────────────────────

@@ -4,6 +4,32 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.15.2] - 2026-09-07
+
+### Fixed
+- **`_swap_with_usdc_fallback` can no longer deliver a different asset than
+  requested** — the USDC 2-hop (used when a thin pair like AERO↔cbBTC has no
+  direct ParaSwap route) read the hop-1 USDC delta with a SINGLE balance read
+  right after the broadcast; the local proxy's indexer lag made that read stale
+  (delta 0), so the helper bailed between hops and left the from-asset as USDC
+  in-account while the requested dest never arrived. Live incident 2026-09-07
+  (core1 AERO/cbBTC rebuild): ~$605 of AERO was swapped to USDC and the rebuild
+  mint silently aborted. Now: the produced-USDC delta is re-read until positive
+  (up to 6 tries); hop 2 is retried once on a falsy return (safe — a falsy
+  `cmd_swap` means no broadcast landed); and the helper VERIFIES the requested
+  dest balance actually increased before reporting success.
+- **`_aero_precision_balance` verifies the DEST leg arrived after each swap** —
+  its stale-read guard previously checked only that the SOLD leg decreased,
+  never that the dest leg increased, so a wrong-delivery swap let the next pass
+  recompute on false premises. A dest that never arrives now stops the
+  convergence with a clear message.
+- **The pre-mint self-borrow guard now exits nonzero (rc 2)** — a bare `return`
+  made the whole rebuild a SILENT no-op (primecli rc 0, no mint, no error), so
+  the caller only discovered the failure via the post-mint tokenId poll and
+  wrote a rebuild cooldown for a position that was never actually rebuilt.
+  rc 2 routes the caller into its normal failure handling (abort/unwind or the
+  1.5x-slippage retry) instead of a false "OK".
+
 ## [0.15.1] - 2026-08-19
 
 ### Fixed
