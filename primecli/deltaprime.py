@@ -2721,6 +2721,8 @@ def cmd_repay(pool_name: str, amount: float, execute: bool = False):
     repaid = amount_wei / 10**cfg['decimals']
     if not ok:
         _print_revert_reason(w3, tx, receipt)
+    return ok
+
 
 def _print_revert_reason(w3, tx, receipt):
     """Try to decode and print the revert reason from a failed tx."""
@@ -2961,10 +2963,11 @@ def _swap_via_paraswap(w3, acct, pa_cs, account, from_sym, to_sym, from_cfg, to_
     }
     # C1: capture the dest balance BEFORE the broadcast so the post-broadcast
     # verification compares against the true pre-swap state.
-    try:
-        _to_before = account.functions.getBalance(asset_b32(to_sym)).call()
-    except Exception:
-        _to_before = 0
+    _to_before = _swap_pre_read_balance(account, to_sym)
+    if _to_before is None:
+        print(f"✗ Cannot read the {to_sym} balance before broadcast (RPC unreadable) — "
+              f"refusing the swap: dest verification would be unreliable (fail-closed).")
+        return False
     receipt = _sign_and_send(w3, acct, tx, f"Swap {amount} {from_sym} -> {to_sym}", fallback_gas=3000000)
     ok = receipt["status"] == 1
     if ok and not _swap_dest_arrived(account, to_sym, _to_before):
@@ -2972,6 +2975,20 @@ def _swap_via_paraswap(w3, acct, pa_cs, account, from_sym, to_sym, from_cfg, to_
               f"(wrong delivery?) — treating the swap as FAILED.")
         return False
     return ok
+
+
+def _swap_pre_read_balance(account, to_sym: str, retries: int = 3):
+    """C1 pre-broadcast dest read (2026-09-07): unlike the legacy one-shot
+    try/except that defaulted to 0, this returns None when the view is
+    unreadable after retries - callers must fail the swap CLOSED instead of
+    degrading the verification to "dest balance > 0" (a failed pre-read would
+    otherwise pass on any pre-existing dest balance)."""
+    for _ in range(max(1, int(retries))):
+        try:
+            return account.functions.getBalance(asset_b32(to_sym)).call()
+        except Exception:
+            time.sleep(2)
+    return None
 
 
 def _swap_dest_arrived(account, to_sym: str, to_before: int) -> bool:
@@ -3091,10 +3108,11 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
         "chainId": CHAIN_ID,
     }
     # C1 dest-leg verification (2026-09-07): see _swap_via_paraswap.
-    try:
-        _to_before = account.functions.getBalance(asset_b32(to_sym)).call()
-    except Exception:
-        _to_before = 0
+    _to_before = _swap_pre_read_balance(account, to_sym)
+    if _to_before is None:
+        print(f"✗ Cannot read the {to_sym} balance before broadcast (RPC unreadable) — "
+              f"refusing the swap: dest verification would be unreliable (fail-closed).")
+        return False
     receipt = _sign_and_send(w3, acct, tx, f"Swap {amount} {from_sym} -> {to_sym}", fallback_gas=3000000)
     ok = receipt["status"] == 1
     if ok and not _swap_dest_arrived(account, to_sym, _to_before):
@@ -3325,7 +3343,6 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
             print("  Steps completed: 1 (borrow). You may need to manually swap & repay.")
             return
         print(f"  ✓ Swapped {to_sym} -> {from_sym}")
-        print(f"  Tx: {EXPLORER}/tx/{tx_hash2.hex()}")
 
         # Step 3: Repay from_sym (capped to min(requested, debt, in-account))
         print("── Step 3/3: Repay ──")
@@ -3359,7 +3376,7 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
             print("  Steps completed: 1 (borrow), 2 (swap). Repay failed — check manually.")
         else:
             print(f"\n✓ All 3 steps completed. {from_sym} debt refinanced to {to_sym}.")
-        return
+        return ok3
 
     # ─── One-tx ParaSwap path (original) ────────────────────────────────────
     diff_bps = (abs(repay_usd - borrow_usd) / max(repay_usd, borrow_usd)) * 10000 if max(repay_usd, borrow_usd) else 0
@@ -3457,6 +3474,7 @@ def cmd_swap_debt(from_sym: str, to_sym: str, amount: float, slippage_pct: float
     }
     receipt = _sign_and_send(w3, acct, tx, f"Swap debt {from_sym} -> {to_sym}", fallback_gas=4000000)
     ok = receipt["status"] == 1
+    return ok
 
 # ─── Collateral withdrawal (WithdrawalIntentFacet) ──────────────────────────
 # Pulling collateral out of the Prime Account to the EOA is a two-step, time-delayed
@@ -5925,7 +5943,11 @@ def main():
         if pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
             return
-        cmd_fund(pool, amount, execute)
+        # C2 (2026-09-07 review): a falsy return with --execute is a silent
+        # no-op — propagate to the exit code (parity with arbprime).
+        _ret = cmd_fund(pool, amount, execute)
+        if execute and not _ret:
+            sys.exit(2)
     elif cmd in ("borrow", "repay"):
         pool, amount = None, None
         execute = "--execute" in args
@@ -5938,7 +5960,11 @@ def main():
         if pool not in POOLS:
             print(f"Unknown pool '{pool}'. Choose from: {', '.join(POOLS)}")
             return
-        (cmd_borrow if cmd == "borrow" else cmd_repay)(pool, amount, execute)
+        # C2 (2026-09-07 review): a falsy return with --execute is a silent
+        # no-op — propagate to the exit code (parity with arbprime).
+        _ret = (cmd_borrow if cmd == "borrow" else cmd_repay)(pool, amount, execute)
+        if execute and not _ret:
+            sys.exit(2)
     elif cmd == "swap":
         from_sym, to_sym, amount, slippage, via = None, None, None, 1.0, "yak"
         execute = "--execute" in args
@@ -5966,7 +5992,11 @@ def main():
         if not from_sym or not to_sym or amount is None:
             print("Usage: deltaprime.py swap-debt --from AVAX --to USDC --amount 100 [--slippage 0.5] [--fallback] [--execute]")
             return
-        cmd_swap_debt(from_sym, to_sym, amount, slippage, execute, fallback)
+        # C2 (2026-09-07 review): swap-debt returns its step status (ok / ok3)
+        # — a falsy result with --execute is an incomplete refinance, not OK.
+        _ret = cmd_swap_debt(from_sym, to_sym, amount, slippage, execute, fallback)
+        if execute and not _ret:
+            sys.exit(2)
     elif cmd == "withdraw-collateral":
         pool, amount = None, None
         execute = "--execute" in args

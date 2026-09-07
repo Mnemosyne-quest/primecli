@@ -51,6 +51,10 @@ def _wire(monkeypatch, balances, w3):
         return balances.get(sym, 0)
 
     monkeypatch.setattr(dp, "_aero_in_account_balance", bal)
+    # cmd_swap's pre-broadcast dest read now uses the STRICT reader (returns
+    # None when the view is unreadable so the swap fails closed) — patch it
+    # with the same balance table.
+    monkeypatch.setattr(dp, "_aero_in_account_balance_strict", bal)
 
 
 def _mock_w3():
@@ -99,3 +103,22 @@ def test_swap_preview_not_verified(monkeypatch):
     _wire(monkeypatch, balances, w3)
     ok = dp.cmd_swap("USDC", "ETH", 100.0, 1.0, execute=False)
     assert ok is None
+
+
+def test_swap_fail_closed_on_unreadable_pre_read(monkeypatch):
+    # The strict pre-read returns None when the in-account view is unreadable
+    # (flaky proxy / indexer lag — the exact conditions of the core1 wrong-
+    # delivery). The swap must fail CLOSED: no broadcast, return False.
+    # A lenient pre-read that defaulted to 0 would degrade the whole check to
+    # "dest balance > 0" and pass on any pre-existing dest balance.
+    balances = {"USDC": 500_000_000, "ETH": 0}
+    w3 = _mock_w3()
+    _wire(monkeypatch, balances, w3)
+    monkeypatch.setattr(dp, "_aero_in_account_balance_strict",
+                        lambda _a, _s: None)
+    sent = []
+    monkeypatch.setattr(dp, "_sign_and_send",
+                        lambda *a, **k: sent.append(1) or {"status": 1})
+    ok = dp.cmd_swap("USDC", "ETH", 100.0, 1.0, execute=True)
+    assert ok is False
+    assert sent == [], "a fail-closed pre-read must never broadcast"

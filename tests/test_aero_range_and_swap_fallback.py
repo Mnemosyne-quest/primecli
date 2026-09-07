@@ -44,9 +44,17 @@ def _patch_swap(monkeypatch, returns):
 
 
 def _patch_balance(monkeypatch, usdc_wei_sequence):
-    """Stub _aero_in_account_balance: returns successive USDC balances (wei)."""
+    """Stub the balance readers: returns successive USDC balances (wei).
+
+    _swap_with_usdc_fallback's 2-hop path pre-reads USDC and the dest via the
+    STRICT reader (fail-closed since 2026-09-07) — both readers must be
+    stubbed so the sequence feeds the strict reads in call order.
+    """
     seq = list(usdc_wei_sequence)
-    monkeypatch.setattr(dp, "_aero_in_account_balance", lambda account, sym: seq.pop(0))
+    monkeypatch.setattr(dp, "_aero_in_account_balance",
+                        lambda account, sym: seq.pop(0))
+    monkeypatch.setattr(dp, "_aero_in_account_balance_strict",
+                        lambda account, sym: seq.pop(0))
 
 
 ACCT = object()  # opaque account handle (the stubs ignore it)
@@ -96,7 +104,11 @@ def test_usdc_leg_has_no_fallback(monkeypatch):
 
 
 def test_hop1_failure_aborts(monkeypatch):
+    # Direct AERO->cbBTC fails; hop1 AERO->USDC also fails -> abort, no hop2.
+    # (The two pre-read balances are readable — this exercises the hop-1
+    # failure path, not the fail-closed unreadable-RPC refusal.)
     rec = _patch_swap(monkeypatch, [None, None])  # direct fail, hop1 fail
+    _patch_balance(monkeypatch, [0, 0])  # usdc_before, to_before
     ok = dp._swap_with_usdc_fallback(ACCT, "AERO", "cbBTC", 100.0, 1.0, execute=True)
     assert ok is False
     assert len(rec.calls) == 2  # direct + hop1, no hop2

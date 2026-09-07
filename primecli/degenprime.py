@@ -3788,8 +3788,17 @@ def cmd_swap(from_sym: str, to_sym: str, amount: float, slippage_pct: float = 1.
     # proves the tx landed, not WHAT landed — capture the dest balance BEFORE
     # the broadcast and require an increase afterwards. A lagging balance read
     # (local-proxy indexer lag) retries briefly; a dest that never arrives
-    # fails the swap loudly instead of reporting OK.
-    _to_before = _aero_in_account_balance(account, to_asset_sym)
+    # fails the swap loudly instead of reporting OK. An UNREADABLE pre-read
+    # fails the swap CLOSED before any broadcast — degrading the check to
+    # "dest balance > 0" (the old except->0 default) would pass on any
+    # pre-existing dest balance exactly when the proxy is flaky, which is when
+    # wrong-delivery is most likely.
+    _to_before = _aero_in_account_balance_strict(account, to_asset_sym)
+    if _to_before is None:
+        print(f"✗ Cannot read the in-account {to_asset_sym} balance before broadcast "
+              f"(RPC unreadable) — refusing to swap: dest verification would be "
+              f"unreliable (fail-closed).")
+        return False
     receipt = _sign_and_send(w3, acct, tx, f"Swap {amount} {from_asset_sym} -> {to_asset_sym}", fallback_gas=1200000)
     ok = receipt["status"] == 1
     if ok:
@@ -4778,6 +4787,26 @@ def _aero_in_account_balance(account, symbol: str) -> int:
         locked = 0
     return bal - locked if bal > locked else 0
 
+
+def _aero_in_account_balance_strict(account, symbol: str, retries: int = 3) -> int | None:
+    """Strict in-account balance for the C1 dest-verification (2026-09-07).
+
+    _aero_in_account_balance returns 0 for BOTH a genuinely zero balance and
+    an unreadable view - fine for caps/fits, but a dest-verification built on
+    it degrades to "dest balance > 0" when the PRE-broadcast read fails (fails
+    OPEN: any pre-existing dest balance passes the check). This variant returns
+    None when the view is unreadable after retries, so callers can fail CLOSED
+    before broadcasting. Same intent-lock subtraction as the base reader."""
+    account_symbol = _account_asset_symbol(symbol)
+    for _ in range(max(1, int(retries))):
+        try:
+            bal = account.functions.getBalance(asset_b32(account_symbol)).call()
+            locked = account.functions.getTotalIntentAmount(asset_b32(account_symbol)).call()
+            return bal - locked if bal > locked else 0
+        except Exception:
+            time.sleep(2)
+    return None
+
 def _aero_cap_to_balance(account, pool_cfg: dict, amt0_wei: int, amt1_wei: int) -> tuple:
     """Cap each requested amount to what the account actually holds, minus a 1-wei
     margin so display round-up can never push the request past the real balance.
@@ -5033,8 +5062,13 @@ def _swap_with_usdc_fallback(account, from_sym, to_sym, amount_human,
     if from_sym.upper() == "USDC" or to_sym.upper() == "USDC":
         return ok  # already a USDC leg — no intermediary to fall back to
     print(f"  Direct {from_sym} -> {to_sym} swap failed; trying 2-hop via USDC...")
-    usdc_before = _aero_in_account_balance(account, "USDC")
-    to_before = _aero_in_account_balance(account, to_sym)
+    usdc_before = _aero_in_account_balance_strict(account, "USDC")
+    to_before = _aero_in_account_balance_strict(account, to_sym)
+    if usdc_before is None or to_before is None:
+        print(f"  2-hop fallback: cannot read in-account balances (RPC unreadable) — "
+              f"refusing the 2-hop: dest verification would be unreliable "
+              f"(fail-closed).")
+        return False
     if not cmd_swap(from_sym, "USDC", amount_human, slippage_pct, execute=True):
         print(f"  2-hop fallback: {from_sym} -> USDC also failed. "
               f"Leaving {from_sym} in-account.")
@@ -6564,6 +6598,7 @@ def cmd_aero_remove_liquidity(token_ids, percentage: float = 100.0,
     if ok:
         ids_str = ", ".join(str(t) for t in token_ids)
         print(f"  Fully closed (unstaked + removed + collected + burned): {ids_str}")
+    return ok
 
 
 
@@ -7712,7 +7747,15 @@ def _dispatch():
         except ValueError as e:
             print(f"Error: {e}")
             return
-        cmd_aero_increase_liquidity(pool_key, token_id, amt0, amt1, slippage, execute, reserve)
+        # C2 (2026-09-07 review): a reverted increase must NOT exit 0 — the
+        # function returns the receipt ok; propagate it to the exit code so
+        # rc-reading callers (and _emit's silent-no-op guard) see the failure.
+        # (Without this, the internal precision-balance swaps print their own
+        # "confirmed" lines, which would let a caller's artifact check
+        # false-pass on a reverted top-up.)
+        _ret = cmd_aero_increase_liquidity(pool_key, token_id, amt0, amt1, slippage, execute, reserve)
+        if execute and not _ret:
+            sys.exit(2)
     elif cmd == "aero-remove-liquidity":
         token_ids = []
         percentage = 100.0
@@ -7724,7 +7767,10 @@ def _dispatch():
             print("Usage: degenprime aero-remove-liquidity --token-id N [--token-id M ...] [--execute]")
             print("  Fully closes (unstake + remove + collect + burn) each staked position. Full close only.")
             return
-        cmd_aero_remove_liquidity(token_ids, percentage, execute)
+        # C2 (2026-09-07 review): same rc propagation as increase-liquidity.
+        _ret = cmd_aero_remove_liquidity(token_ids, percentage, execute)
+        if execute and not _ret:
+            sys.exit(2)
     elif cmd == "aero-collect-fees":
         token_id = None
         execute = "--execute" in args
