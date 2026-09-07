@@ -4,6 +4,36 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.15.4] - 2026-09-07
+
+### Fixed
+- **Dest-leg verification now fails CLOSED on an unreadable pre-broadcast read
+  (C1)**: v0.15.3's pre-read used a lenient `try/except -> 0`, which degraded
+  the whole check to "dest balance > 0" when the proxy was flaky — passing on
+  any pre-existing dest balance exactly in the conditions that produced the
+  core1 wrong-delivery. Strict readers (`_aero_in_account_balance_strict` in
+  degenprime, `_swap_pre_read_balance` in arbprime/deltaprime) return `None`
+  after retries and every swap path refuses to broadcast until the dest view
+  is readable.
+- **`deltaprime cmd_repay` returned nothing on success** (computed `ok` then
+  fell off the end) — now returns `ok`.
+- **`arbprime cmd_swap_debt` missing its `return ok`** (deltaprime had it,
+  arbprime was missed).
+- **`deltaprime` swap-debt 3-step fallback printed an undefined `tx_hash2`** —
+  a NameError after hop-2 landed but before step 3, stranding a
+  half-refinanced account; the redundant print is removed (`_sign_and_send`
+  already prints the explorer link).
+- **rc-2 propagation (C2)**: falsy results with `--execute` now exit 2 instead
+  of 0 in `arbprime` fund/borrow/repay/swap-debt, `deltaprime`
+  fund/borrow/repay/swap-debt, and `degenprime` aero-increase/remove-liquidity
+  — a reverted broadcast can no longer read as a clean step to rc-reading
+  callers (cron, `_emit`'s silent-no-op guard).
+
+### Tests
+- Balance-reader stubs updated for the strict reader; new
+  `test_swap_fail_closed_on_unreadable_pre_read` asserts no broadcast happens
+  on a `None` pre-read. 395 passed.
+
 ## [0.15.3] - 2026-09-07
 
 ### Fixed
