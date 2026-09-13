@@ -507,6 +507,86 @@ def test_run_tick_contradictory_read_skips_without_escalation(tmp_path, monkeypa
     )
 
 
+def test_compute_health_real_crash_not_marked_unreliable():
+    """Safety: a REAL crash (reported 0.0% with health_ratio <= 1.05, i.e. at or
+    near liquidation) must NOT be flagged unreliable — the guard only fires on
+    the solvent-ratio contradiction, so a genuine crash flows through and
+    escalates."""
+    h = hm.compute_health(
+        {
+            "health_pct": 0.0,
+            "health_ratio": 1.02,
+            "groups": [
+                {
+                    "supplied": [{"symbol": "USDC", "usd": 3000}],
+                    "borrowed": [{"symbol": "USDC", "usd": 2811.94}],
+                }
+            ],
+        },
+        max_mult=5,
+    )
+    assert h["unreliable_read"] is False
+    assert h["health_pct"] == 0.0
+
+
+def test_run_tick_real_crash_still_escalates(tmp_path, monkeypatch):
+    """Safety net control for the contradictory-read skip: a coherent crash read
+    (health 0.0% with health_ratio 1.02) must still write escalate.json and fire
+    the hard-critical path. The skip must never swallow a real crisis."""
+
+    def fake_run(cmd, **kwargs):
+        subcmd = cmd[2] if len(cmd) > 2 else ""
+        calls.append(subcmd)
+        if subcmd == "defi":
+            return _FakeCompleted(
+                stdout=json.dumps(
+                    {
+                        "health_pct": 0.0,
+                        "health_ratio": 1.02,
+                        "status": "ok",
+                        "solvent": True,
+                        "groups": [
+                            {
+                                "type": "Lending / Leverage",
+                                "supplied": [{"symbol": "AERO", "usd": 366.6}],
+                                "borrowed": [
+                                    {"symbol": "USDC", "usd": 2101.16},
+                                    {"symbol": "ETH", "usd": 710.6},
+                                ],
+                            },
+                            {
+                                "type": "Aerodrome",
+                                "items": [
+                                    {"symbol": "ETH/USDC", "usd": 2500.0}
+                                ],
+                            },
+                        ],
+                    }
+                )
+            )
+        if subcmd == "prime-tier":
+            return _FakeCompleted(stdout="basic")
+        return _FakeCompleted(stdout="done")
+
+    calls: list[str] = []
+    monkeypatch.setattr(hm.subprocess, "run", fake_run)
+    state_dir = tmp_path / "state"
+
+    result = hm.run_tick(
+        tool_path="/fake/degenprime.py",
+        strategy_path=_write_rebalance_strategy(tmp_path),
+        state_dir=str(state_dir),
+        label="parakletos-4",
+        dry_run=False,
+    )
+
+    assert result["action"] == "escalate (critical health)"
+    esc = state_dir / "escalate.json"
+    assert esc.exists()
+    payload = json.loads(esc.read_text())
+    assert payload["reason"] == "health_below_10_percent"
+
+
 def test_run_tick_action_fires_on_complete_data_positive_control(tmp_path, monkeypatch):
     """Positive control: the SAME low pct with fully-priced data DOES drive a repay.
     This proves the previous test's no-action is caused by the valuation gate, not by
