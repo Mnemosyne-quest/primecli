@@ -215,6 +215,50 @@ def test_compute_health_prefers_tool_reported_health_pct():
     assert h["health_ratio"] == 1.25
 
 
+def test_compute_health_contradictory_read_marks_unreliable():
+    """2026-09-13 parakletos-4 false escalation: defi transiently reports 0.0% while
+    health_ratio >1.05 and the local tier-basic calc also sits under the 15% trust
+    floor. The read is contradictory (both numbers come from the same valuation) —
+    flag unreliable instead of escalating."""
+    h = hm.compute_health(
+        {
+            "health_pct": 0.0,
+            "health_ratio": 1.1195,
+            "groups": [
+                {
+                    "supplied": [{"symbol": "AERO", "usd": 3462.69}],
+                    "borrowed": [{"symbol": "USDC", "usd": 2811.94}],
+                }
+            ],
+        },
+        max_mult=5,  # tier basic
+    )
+    assert h["unreliable_read"] is True
+    # Local tier-basic estimate: 100 * (1 - 2811.94/(5*650.75)) ≈ 13.6
+    assert h["health_pct"] == 13.6
+    assert h["max_debt"] == pytest.approx(3253.75, abs=0.01)
+
+
+def test_compute_health_contradictory_read_trusts_sane_local():
+    """Same glitch shape, but the local calc is clearly sane (>15%): trust it,
+    no unreliable flag."""
+    h = hm.compute_health(
+        {
+            "health_pct": 0.0,
+            "health_ratio": 1.25,
+            "groups": [
+                {
+                    "supplied": [{"symbol": "USDC", "usd": 11000}],
+                    "borrowed": [{"symbol": "USDC", "usd": 2000}],
+                }
+            ],
+        },
+        max_mult=5,
+    )
+    assert h["unreliable_read"] is False
+    assert h["health_pct"] == 95.6
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # valuation_complete — the auto-action gate
 
@@ -401,6 +445,65 @@ def test_run_tick_no_action_on_incomplete_valuation(tmp_path, monkeypatch):
     assert result["action"] == "observe (incomplete valuation)"
     assert not _ACTION_SUBCMDS.intersection(calls), (
         f"an action subcommand was invoked on incomplete data: {calls}"
+    )
+
+
+def test_run_tick_contradictory_read_skips_without_escalation(tmp_path, monkeypatch):
+    """2026-09-13 regression: defi reports 0.0% while health_ratio says solvent and
+    the tier-basic local calc is under the 15% trust floor. The tick must SKIP —
+    no escalation marker, no de-lever action — instead of firing the hard-critical
+    escalation (which spawns the destructive close-and-redeploy agent)."""
+
+    def fake_run(cmd, **kwargs):
+        subcmd = cmd[2] if len(cmd) > 2 else ""
+        calls.append(subcmd)
+        if subcmd == "defi":
+            return _FakeCompleted(
+                stdout=json.dumps(
+                    {
+                        "health_pct": 0.0,
+                        "health_ratio": 1.1195,
+                        "status": "ok",
+                        "solvent": True,
+                        "groups": [
+                            {
+                                "type": "Lending / Leverage",
+                                "supplied": [{"symbol": "AERO", "usd": 366.6}],
+                                "borrowed": [
+                                    {"symbol": "USDC", "usd": 2101.16},
+                                    {"symbol": "ETH", "usd": 710.6},
+                                ],
+                            },
+                            {
+                                "type": "Aerodrome",
+                                "items": [
+                                    {"symbol": "ETH/USDC", "usd": 3091.57}
+                                ],
+                            },
+                        ],
+                    }
+                )
+            )
+        if subcmd == "prime-tier":
+            return _FakeCompleted(stdout="basic")
+        return _FakeCompleted(stdout="done")
+
+    calls: list[str] = []
+    monkeypatch.setattr(hm.subprocess, "run", fake_run)
+    state_dir = tmp_path / "state"
+
+    result = hm.run_tick(
+        tool_path="/fake/degenprime.py",
+        strategy_path=_write_rebalance_strategy(tmp_path),
+        state_dir=str(state_dir),
+        label="parakletos-4",
+        dry_run=False,
+    )
+
+    assert result["action"] == "skip (unreliable health read)"
+    assert not (state_dir / "escalate.json").exists()
+    assert not _ACTION_SUBCMDS.intersection(calls), (
+        f"an action subcommand was invoked on a contradictory read: {calls}"
     )
 
 

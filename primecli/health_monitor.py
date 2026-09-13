@@ -200,6 +200,20 @@ def compute_health(
     # position is clearly solvent (>1.05). When the reported number is
     # suspiciously low (<10%) but the protocol says we're safe AND our
     # own equity-based computation says something sane, trust ourselves.
+    #
+    # 2026-09-13 (parakletos-4 false escalation): the else-branch used to
+    # defer to the glitched reported value when the local calc also sat
+    # under the 15% trust floor. For a tier-basic account the local calc
+    # (max_mult=5) understates the position-level meter (~10x) by ~2x, so
+    # a healthy ~57% position computed ~13.6% locally — below the floor —
+    # and one transient 0.0% read escalated as "health below 10%",
+    # spawning the destructive close-and-redeploy playbook against a
+    # healthy in-range LP. reported <10% with health_ratio >1.05 is
+    # impossible for one coherent valuation (both come from the same
+    # read): mark the tick unreliable instead — no escalation, no action,
+    # no baseline advance. A real crash reads coherently (hr <= 1.05) and
+    # escalates within the next tick.
+    unreliable_read = False
     _local_pct = health_pct
     if reported_pct is not None and reported_pct < 10.0 and health_ratio > 1.05 and equity > 10:
         if _local_pct is not None and _local_pct > 15.0:
@@ -212,9 +226,17 @@ def compute_health(
                 file=sys.stderr,
             )
         else:
-            # Local calc also looks bad — trust defi, let escalation fire.
-            # Use the lower (more conservative) value of the two.
-            health_pct = min(reported_pct, _local_pct) if _local_pct is not None else reported_pct
+            # Local calc also looks bad while the protocol ratio says solvent —
+            # the READ is contradictory, not the account. Carry the local value
+            # for the log but flag the tick unreliable; run_tick skips it.
+            health_pct = _local_pct if _local_pct is not None else 0.0
+            unreliable_read = True
+            print(
+                f"WARN: defi reported health={reported_pct:g}% but health_ratio={health_ratio} "
+                f"and local calc gives {health_pct:g}% — contradictory read, skipping tick "
+                f"(no escalation, no action)",
+                file=sys.stderr,
+            )
     else:
         health_pct = reported_pct if reported_pct is not None else health_pct
 
@@ -234,6 +256,7 @@ def compute_health(
         "has_gmx": has_gmx,
         "has_lb": has_lb,
         "has_aero": has_aero,
+        "unreliable_read": unreliable_read,
     }
 
 
@@ -1051,6 +1074,15 @@ def run_tick(
     health["mode"] = mode
     result.update(health)
     result["mode"] = mode
+
+    # 5b. Contradictory-read gate (2026-09-13 false escalation): reported <10%
+    # while health_ratio >1.05 is impossible for one coherent valuation — a
+    # transient defi --json glitch. Skip the WHOLE tick: no escalation, no
+    # de-lever, no baseline/streak advance (the next tick re-reads coherently;
+    # a real crash reads hr <=1.05 and escalates within that tick).
+    if health.get("unreliable_read"):
+        result["action"] = "skip (unreliable health read)"
+        return result
 
     # 5. Check for unfunded or unpriced accounts
     if health.get("error") == "equity near zero":

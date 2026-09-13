@@ -4,6 +4,28 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.15.5] - 2026-09-13
+
+### Fixed
+- **Contradictory health reads skip the tick instead of escalating
+  (false-escalation fix)**: when `defi --json` transiently reports
+  `health_pct < 10` while `health_ratio > 1.05` — impossible for one coherent
+  valuation — and the local tier-basic calc also sits under the 15% trust
+  floor, the old guard deferred to the glitched value and fired the
+  hard-critical escalation, spawning the destructive close-and-redeploy agent
+  against a healthy account (2026-09-13 parakletos-4: 0.0% reported at 56.8%
+  true health; the tier-basic local calc understates the ~10x position-level
+  meter by ~2x, so a healthy ~57% position computed ~13.6% locally). The tick
+  is now flagged `unreliable_read` and skipped — no escalation marker, no
+  de-lever action, no baseline/streak advance. A real crash reads coherently
+  (`health_ratio <= 1.05`) and escalates within the next tick.
+
+### Tests
+- New `test_compute_health_contradictory_read_marks_unreliable`,
+  `test_compute_health_contradictory_read_trusts_sane_local`, and
+  `test_run_tick_contradictory_read_skips_without_escalation` (the
+  parakletos-4 case, tier-basic `max_mult=5`). 398 passed.
+
 ## [0.15.4] - 2026-09-07
 
 ### Fixed
