@@ -1312,6 +1312,35 @@ REDSTONE_AUTHORISED_SIGNERS = {
 # RedStone ~3-minute staleness window. Mirrors degenprime's pattern.
 _redstone_gateway_cache = None
 
+# Authenticated RedStone gateways (2026-10 decommission ramp). RedStone is
+# switching the public gateways off; authenticated gateways are passed as
+# url + apiKey pairs - the key is sent as an x-api-key header, 1 req/s per key,
+# and a second pair serves as fallback. Configure with REDSTONE_AUTH_GATEWAYS:
+#   [{"url": "https://<gateway>", "apiKey": "<key>"}, ...]
+# Unset means the pre-migration behaviour (legacy public hosts only). A malformed
+# value is ignored rather than fatal: a bad env line must never take the fleet
+# down mid-window.
+def _redstone_gateway_candidates() -> list:
+    """Ordered fetch candidates: authenticated (url, apiKey) pairs first, then the
+    legacy public hosts while they still serve."""
+    candidates = []
+    raw = os.environ.get("REDSTONE_AUTH_GATEWAYS", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list):
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "").strip().rstrip("/")
+                if url:
+                    candidates.append((url, str(item.get("apiKey") or "")))
+    candidates.extend((gw, "") for gw in REDSTONE_GATEWAYS)
+    return candidates
+
+
 def _redstone_fetch_packages(use_cache: bool = True) -> dict:
     """Fetch the latest signed price packages from the RedStone gateway. Returns the
     per-feed map: {feedSymbol: [package, ...]} with one package per signer. The per-run
@@ -1322,9 +1351,11 @@ def _redstone_fetch_packages(use_cache: bool = True) -> dict:
     if use_cache and _redstone_gateway_cache is not None:
         return _redstone_gateway_cache
     last_err = None
-    for gw in REDSTONE_GATEWAYS:
+    for gw, api_key in _redstone_gateway_candidates():
         try:
-            r = requests.get(f"{gw}/data-packages/latest/{REDSTONE_DATA_SERVICE}", timeout=20)
+            headers = {"x-api-key": api_key} if api_key else None
+            r = requests.get(f"{gw}/data-packages/latest/{REDSTONE_DATA_SERVICE}",
+                             timeout=20, headers=headers)
             if r.status_code == 200:
                 _redstone_gateway_cache = r.json()
                 return _redstone_gateway_cache

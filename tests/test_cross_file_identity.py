@@ -41,6 +41,8 @@ SHARED_FUNCS = [
     "_redstone_scaled_value",
     "_redstone_encode_package",
     "_redstone_package_signer",
+    "_redstone_gateway_candidates",
+    "_redstone_fetch_packages",
     "build_redstone_payload",
     "to_wei_units",
     # Frontend-exact getHealthMeter core + its on-chain debtCoverage resolver. The math
