@@ -162,6 +162,13 @@ def test_aero_rebuild_sweep_applies_reserve_before_filtering(monkeypatch):
     monkeypatch.setattr(dp, "_aero_apply_reserve",
                         lambda valuable, reserve: calls.append(reserve) or valuable)
     monkeypatch.setattr(dp, "_aero_inventory_available", lambda w3, account, cfg: {})
+    # Hermetic (2026-10-17): without these the rebuild path fetches the LIVE RedStone
+    # gateway and reads live RPC prices — the test went red during the RedStone
+    # decommission ramp (HTTP 403) although nothing in the reserve wiring changed.
+    # Prices are WEI-scaled (the $ math divides by 1e18): 1.0 USD => 10**18.
+    monkeypatch.setattr(dp, "build_redstone_payload", lambda feeds: b"")
+    monkeypatch.setattr(dp, "_read_prices_usd",
+                        lambda w3, account, syms, payload: [Decimal(10 ** 18) for _ in syms])
 
     pool_cfg = {"symbol0": "ETH", "symbol1": "EURC"}
     dp._aero_rebuild_sweep("w3", None, None, "0xacct", "pool-key",
