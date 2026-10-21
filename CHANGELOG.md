@@ -4,6 +4,27 @@ All notable changes to `primecli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor versions may carry breaking changes).
 
+## [0.15.6] - 2026-10-21
+
+### Added
+- **Authenticated RedStone gateway support (decommission cutover)**: the public
+  gateways (`oracle-gateway-1/2.a.redstone.finance`) now answer HTTP 403, which
+  left every price-dependent path blind (deltaprime `defi --json` returned
+  balances with no USD values; autofarms skipped on a 0.00 equity read and the
+  GMX health monitor printed `?%`). `REDSTONE_AUTH_GATEWAYS` takes an ordered
+  JSON list of `{"url": ..., "apiKey": ...}` pairs; requests carry an
+  `x-api-key` header when a key is present, pairs are tried in order, and the
+  legacy public hosts remain the final fallback. Unset or malformed config
+  keeps the old behaviour byte-identical, so the cutover is opt-in.
+- Regression tests (`tests/test_redstone_auth_gateways.py`, 21 offline cases)
+  plus the cross-file identity guard extended to the two new shared functions
+  (`_redstone_gateway_sources`, `_redstone_fetch_packages`).
+
+### Fixed
+- `test_aero_rebuild_sweep_applies_reserve_before_filtering` no longer reaches
+  the live gateway; it mocks the payload and the price read with WEI-scaled
+  prices, so the suite stays hermetic while the public gateways are down.
+
 ## [0.15.5] - 2026-09-13
 
 ### Fixed
